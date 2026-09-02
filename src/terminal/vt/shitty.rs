@@ -66,7 +66,7 @@ impl ShittyEngine {
         let cell_size = term.memory_usage().cell_size as usize;
         term.set_save_lines(save_lines_for_budget(history_budget_bytes, cols, cell_size));
 
-        let (default_fg, default_bg) = default_colors(&term);
+        let (default_fg, default_bg) = default_colors(&mut term);
         ShittyEngine {
             term,
             resp_tx,
@@ -189,13 +189,19 @@ impl ShittyEngine {
     }
 }
 
-/// Reads what an untouched grid resolves to, so [`map_color`] has something to
-/// compare against. A blank cell carries the palette's defaults.
-fn default_colors(term: &Terminal) -> ((u8, u8, u8), (u8, u8, u8)) {
+/// Reads what a cell written under `SGR 0` resolves to, so [`map_color`] has
+/// something to compare against.
+///
+/// It has to be a *written* cell: an undrawn one reports the palette's blank
+/// colours, which are not the same values the terminal resolves default
+/// foreground to, and calibrating on those left every unstyled character
+/// painted an explicit white instead of the host terminal's own text colour.
+fn default_colors(term: &mut Terminal) -> ((u8, u8, u8), (u8, u8, u8)) {
+    term.feed(b"\x1b[0m ");
     let mut result = ((229, 229, 229), (0, 0, 0));
     let mut seen = false;
-    term.for_each_cell(|_, _, cell| {
-        if !seen {
+    term.for_each_cell(|_, column, cell| {
+        if column == 0 && !seen {
             seen = true;
             result = (
                 (cell.foreground.r, cell.foreground.g, cell.foreground.b),
@@ -203,6 +209,9 @@ fn default_colors(term: &Terminal) -> ((u8, u8, u8), (u8, u8, u8)) {
             );
         }
     });
+    // Leave no trace of the probe: the child has not written anything yet.
+    term.feed(b"\x1b[2J\x1b[H");
+    let _ = term.take_replies();
     result
 }
 
