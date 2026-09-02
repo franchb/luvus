@@ -477,7 +477,7 @@ impl Pane {
         // to a single writer thread — keeps ordering correct, needs no mutex.
         let (input_tx, input_rx) = mpsc::channel::<InputAction>();
         let engine = create_engine(
-            VtEngineKind::default(),
+            VtEngineKind::configured(),
             cols,
             rows,
             input_tx.clone(),
@@ -553,7 +553,7 @@ impl Pane {
         // (pane.read, detection, rendering) and the input queue.
         let (input_tx, input_rx) = mpsc::channel::<InputAction>();
         let engine = create_engine(
-            VtEngineKind::default(),
+            VtEngineKind::configured(),
             cols,
             rows,
             input_tx.clone(),

@@ -4,6 +4,8 @@
 //! touching the app. See docs/05-pty-and-terminal.md.
 
 pub mod alacritty;
+#[cfg(feature = "shitty-engine")]
+pub mod shitty;
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -14,13 +16,38 @@ use crate::terminal::pty::InputAction;
 
 /// Which terminal engine backs a pane.
 ///
-/// One variant today. It exists so that the choice of engine is a named
-/// decision with one home, rather than a concrete type spelled out at each
-/// construction site.
+/// The choice of engine is a named decision with one home, rather than a
+/// concrete type spelled out at each construction site.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum VtEngineKind {
     #[default]
     Alacritty,
+    /// The shitty VT core through its C facade. Built only with the
+    /// `shitty-engine` feature, which links a library `cargo install` cannot
+    /// assume is present.
+    #[cfg(feature = "shitty-engine")]
+    Shitty,
+}
+
+impl VtEngineKind {
+    /// The engine a new pane should use.
+    ///
+    /// `LUVUS_VT_ENGINE=shitty` selects the shitty core when it was compiled
+    /// in; every other value, and every build without the feature, gets the
+    /// default. An environment variable rather than a config key while the
+    /// second engine is a spike: whether it exists at all is decided at build
+    /// time, so it is not yet a setting a user can be offered.
+    pub(crate) fn configured() -> Self {
+        #[cfg(feature = "shitty-engine")]
+        {
+            if std::env::var("LUVUS_VT_ENGINE")
+                .is_ok_and(|name| name.eq_ignore_ascii_case("shitty"))
+            {
+                return VtEngineKind::Shitty;
+            }
+        }
+        VtEngineKind::default()
+    }
 }
 
 /// Build the engine backing one pane.
@@ -37,6 +64,13 @@ pub(crate) fn create_engine(
 ) -> Arc<Mutex<dyn VtEngine>> {
     match kind {
         VtEngineKind::Alacritty => Arc::new(Mutex::new(alacritty::AlacrittyEngine::new(
+            cols,
+            rows,
+            resp_tx,
+            history_budget_bytes,
+        ))),
+        #[cfg(feature = "shitty-engine")]
+        VtEngineKind::Shitty => Arc::new(Mutex::new(shitty::ShittyEngine::new(
             cols,
             rows,
             resp_tx,
@@ -267,8 +301,19 @@ mod conformance {
     /// row by row. Blank cells are omitted, so a token's column is the
     /// assertion: a cluster that grew wider shows up as a gap.
     fn cell_dump(input: &[u8], cols: u16, rows: u16) -> Vec<String> {
+        engine_cell_dump(VtEngineKind::default(), input, cols, rows)
+    }
+
+    /// The same dump for a named engine, so a second implementation can be
+    /// held to the same reading rather than a paraphrase of it.
+    pub(super) fn engine_cell_dump(
+        kind: VtEngineKind,
+        input: &[u8],
+        cols: u16,
+        rows: u16,
+    ) -> Vec<String> {
         let (tx, _rx) = mpsc::channel();
-        let engine = create_engine(VtEngineKind::default(), cols, rows, tx, 64 * 1024);
+        let engine = create_engine(kind, cols, rows, tx, 64 * 1024);
         let mut engine = engine.lock().expect("engine lock");
         engine.advance(input);
 
@@ -344,5 +389,81 @@ mod conformance {
         let dump = cell_dump(b"abcdefgh", 4, 3);
         assert_eq!(dump[0], "0:61 1:62 2:63 3:64");
         assert_eq!(dump[1], "0:65 1:66 2:67 3:68");
+    }
+}
+
+#[cfg(all(test, feature = "shitty-engine"))]
+mod shitty_conformance {
+    //! The same seven readings taken from the shitty engine.
+    //!
+    //! Four are identical to alacritty's. The three that differ are all the
+    //! same disagreement: whether an emoji sequence is one grapheme cluster in
+    //! one wide cell, or several. Shitty follows UTS #51 and keeps the cluster
+    //! whole; alacritty splits it. That difference moves every column after it
+    //! on the line, which is why the alacritty readings are pinned next door
+    //! rather than left implicit — swapping the engine under a pane is a
+    //! visible reflow of any line carrying emoji, in the direction of the
+    //! standard.
+
+    use super::conformance::engine_cell_dump;
+    use super::VtEngineKind;
+
+    fn dump(input: &[u8], cols: u16, rows: u16) -> Vec<String> {
+        engine_cell_dump(VtEngineKind::Shitty, input, cols, rows)
+    }
+
+    #[test]
+    fn ascii_lands_one_cell_per_column() {
+        assert_eq!(dump(b"ab", 4, 3)[0], "0:61 1:62");
+    }
+
+    #[test]
+    fn wide_characters_occupy_two_columns() {
+        assert_eq!(
+            dump("\u{65E5}\u{672C}".as_bytes(), 4, 3)[0],
+            "0:65E5 2:672C"
+        );
+    }
+
+    #[test]
+    fn combining_marks_stay_with_their_base_cell() {
+        assert_eq!(dump("e\u{301}x".as_bytes(), 4, 3)[0], "0:65+301 1:78");
+    }
+
+    #[test]
+    fn text_soft_wraps_at_the_right_margin() {
+        let dump = dump(b"abcdefgh", 4, 3);
+        assert_eq!(dump[0], "0:61 1:62 2:63 3:64");
+        assert_eq!(dump[1], "0:65 1:66 2:67 3:68");
+    }
+
+    #[test]
+    fn variation_selector_16_widens_the_cluster() {
+        // Diverges: alacritty keeps U+2764 U+FE0F narrow and puts "x" at
+        // column 1. VS16 asks for the emoji presentation, which is width 2,
+        // so here "x" starts at column 2.
+        assert_eq!(
+            dump("\u{2764}\u{FE0F}x".as_bytes(), 4, 3)[0],
+            "0:2764+FE0F 2:78"
+        );
+    }
+
+    #[test]
+    fn emoji_zwj_sequence_is_one_wide_cell() {
+        // Diverges: alacritty gives U+1F4BB its own wide cell, four columns in
+        // all, which fills this row and pushes "x" onto the next. One cluster
+        // in one width-2 cell leaves "x" at column 2 of the same row.
+        let dump = dump("\u{1F469}\u{200D}\u{1F4BB}x".as_bytes(), 4, 3);
+        assert_eq!(dump[0], "0:1F469+200D+1F4BB 2:78");
+        assert_eq!(dump[1], "");
+    }
+
+    #[test]
+    fn emoji_modifier_sequence_is_one_wide_cell() {
+        // Diverges, same shape: the skin-tone modifier joins the base cluster
+        // instead of taking a wide cell of its own.
+        let dump = dump("\u{1F44D}\u{1F3FD}x".as_bytes(), 4, 3);
+        assert_eq!(dump[0], "0:1F44D+1F3FD 2:78");
+        assert_eq!(dump[1], "");
     }
 }

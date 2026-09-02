@@ -901,6 +901,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shitty-vt",
  "toml",
  "toml_edit",
  "unicode-width",
@@ -1672,6 +1673,24 @@ name = "shell-words"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
+
+[[package]]
+name = "shitty-vt"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3afd931345988c98dfecf2933e7e7d405afa09cfcc97c0d971ddb101b9ea75e4"
+dependencies = [
+ "shitty-vt-sys",
+]
+
+[[package]]
+name = "shitty-vt-sys"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c38e719103dfda527ca3fc19e53bd23ef3876ede70a67f89555224e3926c39c6"
+dependencies = [
+ "pkg-config",
+]
 
 [[package]]
 name = "shlex"
