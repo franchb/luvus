@@ -4,27 +4,22 @@
 //! Opt-in (`--features shitty-engine`) because it links a library that has to
 //! exist at build time, which `cargo install luvus` cannot assume.
 //!
-//! Two things this engine cannot do as well as `alacritty` today, both because
-//! the facade resolves more than it reports:
+//! One thing this engine still cannot do as well as `alacritty`, because the
+//! facade resolves more than it reports:
 //!
-//! * **Colours arrive resolved.** A cell reports RGB, not whether the
-//!   application asked for "default", palette index 4, or a true-colour value.
-//!   Luvus draws inside someone else's terminal, so it needs `Color::Reset`
-//!   and `Color::Indexed` to inherit the host theme. [`map_color`] recovers the
-//!   default case by comparing against the palette's own default, which is a
-//!   guess a cell painted in exactly that colour gets wrong, and cannot recover
-//!   palette indices at all.
 //! * **Soft wrap is not reported per row.** `CaptureMode::RecentUnwrapped`
 //!   rejoins rows the terminal wrapped; without the flag every physical row
 //!   reads as its own logical line.
 //!
-//! Both are visible in the model and absent from the facade, like the input
-//! and preedit entry points before them.
+//! It is visible in the model and absent from the facade, like the input and
+//! preedit entry points before it - and like the cell colour sources, which
+//! this engine needed for the same reason and which landed upstream in
+//! pg83/shitty#112.
 
 use std::sync::mpsc::Sender;
 
 use ratatui::style::{Color, Modifier};
-use shitty_vt::{Cell as VtCell, Terminal};
+use shitty_vt::{Cell as VtCell, ColorSource, Rgb, Terminal};
 
 use super::{CodexComposerRegion, Cursor, HistoryMetrics, RenderCell, VtEngine};
 use crate::terminal::backend::{CaptureMode, CaptureResult};
@@ -41,10 +36,6 @@ pub struct ShittyEngine {
     rows: u16,
     history_budget_bytes: usize,
     output_generation: u64,
-    /// What this palette resolves an unstyled cell to. Anything matching it is
-    /// reported as `Color::Reset` so the host terminal's theme shows through.
-    default_fg: (u8, u8, u8),
-    default_bg: (u8, u8, u8),
 }
 
 impl ShittyEngine {
@@ -66,7 +57,6 @@ impl ShittyEngine {
         let cell_size = term.memory_usage().cell_size as usize;
         term.set_save_lines(save_lines_for_budget(history_budget_bytes, cols, cell_size));
 
-        let (default_fg, default_bg) = default_colors(&mut term);
         ShittyEngine {
             term,
             resp_tx,
@@ -74,8 +64,6 @@ impl ShittyEngine {
             rows,
             history_budget_bytes,
             output_generation: 0,
-            default_fg,
-            default_bg,
         }
     }
 
@@ -134,8 +122,8 @@ impl ShittyEngine {
         self.term.row_cells(index, |_, _, cell| {
             styled.push((
                 cluster_text(&cell),
-                self.foreground(&cell),
-                self.background(&cell),
+                foreground(&cell),
+                background(&cell),
                 modifiers(&cell),
             ));
         });
@@ -169,50 +157,15 @@ impl ShittyEngine {
         }
         true
     }
-
-    fn foreground(&self, cell: &VtCell<'_>) -> Color {
-        map_color(
-            cell.foreground.r,
-            cell.foreground.g,
-            cell.foreground.b,
-            self.default_fg,
-        )
-    }
-
-    fn background(&self, cell: &VtCell<'_>) -> Color {
-        map_color(
-            cell.background.r,
-            cell.background.g,
-            cell.background.b,
-            self.default_bg,
-        )
-    }
 }
 
-/// Reads what a cell written under `SGR 0` resolves to, so [`map_color`] has
-/// something to compare against.
-///
-/// It has to be a *written* cell: an undrawn one reports the palette's blank
-/// colours, which are not the same values the terminal resolves default
-/// foreground to, and calibrating on those left every unstyled character
-/// painted an explicit white instead of the host terminal's own text colour.
-fn default_colors(term: &mut Terminal) -> ((u8, u8, u8), (u8, u8, u8)) {
-    term.feed(b"\x1b[0m ");
-    let mut result = ((229, 229, 229), (0, 0, 0));
-    let mut seen = false;
-    term.for_each_cell(|_, column, cell| {
-        if column == 0 && !seen {
-            seen = true;
-            result = (
-                (cell.foreground.r, cell.foreground.g, cell.foreground.b),
-                (cell.background.r, cell.background.g, cell.background.b),
-            );
-        }
-    });
-    // Leave no trace of the probe: the child has not written anything yet.
-    term.feed(b"\x1b[2J\x1b[H");
-    let _ = term.take_replies();
-    result
+/// The cell's foreground as the application asked for it.
+fn foreground(cell: &VtCell<'_>) -> Color {
+    map_color(cell.foreground_source, cell.foreground)
+}
+
+fn background(cell: &VtCell<'_>) -> Color {
+    map_color(cell.background_source, cell.background)
 }
 
 fn save_lines_for_budget(bytes: usize, cols: u16, cell_size: usize) -> u16 {
@@ -222,16 +175,20 @@ fn save_lines_for_budget(bytes: usize, cols: u16, cell_size: usize) -> u16 {
         .clamp(1, u16::MAX as usize) as u16
 }
 
-/// Resolved RGB back to a ratatui colour. A cell painted exactly the palette's
-/// default is reported as `Color::Reset` so the host terminal's own theme
-/// applies - the facade does not say whether the application asked for the
-/// default or named that colour, and a pane painted in shitty's palette
-/// instead of the user's is the more visible of the two errors.
-fn map_color(r: u8, g: u8, b: u8, default: (u8, u8, u8)) -> Color {
-    if (r, g, b) == default {
-        Color::Reset
-    } else {
-        Color::Rgb(r, g, b)
+/// A colour request as ratatui says it, so the host terminal keeps its theme.
+///
+/// Luvus draws inside someone else's terminal. A cell that asked for the
+/// default has to stay `Color::Reset` and one that asked for ANSI red has to
+/// stay `Color::Indexed(1)`, or every pane comes out painted in shitty's
+/// palette rather than the user's. The resolved RGB beside the source is what
+/// shitty would have drawn with its own configuration and is exactly what must
+/// not be forwarded - except for `Direct`, which is a colour the application
+/// named itself and has no palette to lose.
+fn map_color(source: ColorSource, resolved: Rgb) -> Color {
+    match source {
+        ColorSource::DefaultForeground | ColorSource::DefaultBackground => Color::Reset,
+        ColorSource::Indexed(entry) => Color::Indexed(entry),
+        ColorSource::Direct => Color::Rgb(resolved.r, resolved.g, resolved.b),
     }
 }
 
@@ -423,8 +380,8 @@ impl VtEngine for ShittyEngine {
                 column,
                 symbol,
                 RenderCell {
-                    fg: self.foreground(&cell),
-                    bg: self.background(&cell),
+                    fg: foreground(&cell),
+                    bg: background(&cell),
                     mods: modifiers(&cell),
                 },
             );
@@ -686,10 +643,68 @@ mod tests {
         ShittyEngine::new(cols, rows, tx, 256 * 1024)
     }
 
+    /// The rendered cell at `column` of the top row.
+    fn render_cell(engine: &ShittyEngine, column: u16) -> RenderCell {
+        let mut found = None;
+        engine.for_each_cell(&mut |row, at, _, cell| {
+            if row == 0 && at == column {
+                found = Some(cell);
+            }
+        });
+        found.expect("the cell just written should be visited")
+    }
+
     fn feed_lines(engine: &mut ShittyEngine, count: usize) {
         for index in 0..count {
             engine.advance(format!("line{index}\r\n").as_bytes());
         }
+    }
+
+    #[test]
+    fn plain_text_inherits_the_host_theme() {
+        // Nothing asked for a colour, so nothing may be sent: `Color::Reset`
+        // leaves the host terminal painting its own text. Reporting shitty's
+        // resolved white here is what painted every unstyled character white
+        // in a real session while the whole suite stayed green.
+        let mut engine = engine(20, 3);
+        engine.advance(b"hi");
+
+        let cell = render_cell(&engine, 0);
+        assert_eq!(cell.fg, Color::Reset);
+        assert_eq!(cell.bg, Color::Reset);
+    }
+
+    #[test]
+    fn an_ansi_request_stays_a_palette_index() {
+        // The host's palette, not shitty's: a user whose red is not
+        // 0xaa0000 gets their own.
+        let mut engine = engine(20, 3);
+        engine.advance(b"\x1b[31;44mr");
+
+        let cell = render_cell(&engine, 0);
+        assert_eq!(cell.fg, Color::Indexed(1));
+        assert_eq!(cell.bg, Color::Indexed(4));
+    }
+
+    #[test]
+    fn a_true_color_request_keeps_its_value() {
+        // Named outright, so there is no palette to lose and the value is
+        // forwarded as it arrived.
+        let mut engine = engine(20, 3);
+        engine.advance(b"\x1b[38;2;1;2;3mx");
+
+        assert_eq!(render_cell(&engine, 0).fg, Color::Rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn a_redefined_palette_entry_stays_an_index() {
+        // OSC 4 moves entry 1 in shitty's palette. What the application
+        // asked for did not move, and the host has a palette of its own to
+        // resolve it against, so the index is what travels.
+        let mut engine = engine(20, 3);
+        engine.advance(b"\x1b]4;1;rgb:00/00/ff\x07\x1b[31mr");
+
+        assert_eq!(render_cell(&engine, 0).fg, Color::Indexed(1));
     }
 
     #[test]
