@@ -8,6 +8,8 @@ use std::thread;
 use anyhow::{anyhow, Result};
 use ratatui::backend::Backend;
 use ratatui::buffer::Cell;
+#[cfg(windows)]
+use ratatui::crossterm::event::poll as poll_event;
 use ratatui::crossterm::event::{
     read as read_event, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
     EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event,
@@ -19,17 +21,79 @@ use ratatui::{DefaultTerminal, Terminal};
 use crate::ipc::protocol::{self, ClientMessage, FrameData, FrameDiff, ServerMessage};
 use crate::ipc::transport;
 
+#[derive(Debug)]
+struct HandshakeIoError(std::io::Error);
+
+impl std::fmt::Display for HandshakeIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "connection failed before the Luvus handshake: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for HandshakeIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+pub(crate) fn is_handshake_io_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<HandshakeIoError>().is_some()
+}
+
+fn read_handshake_message<R: Read>(reader: &mut R) -> Result<ServerMessage> {
+    protocol::read_message(reader).map_err(|error| HandshakeIoError(error).into())
+}
+
+fn write_handshake_message<W: Write>(writer: &mut W, message: &ClientMessage) -> Result<()> {
+    protocol::write_message(writer, message).map_err(|error| HandshakeIoError(error).into())
+}
+
 /// Attach to the local server over its Unix socket.
 pub fn run(sock: &Path) -> Result<()> {
-    let stream = transport::connect(sock).map_err(|_| anyhow!("cannot connect to luvus server"))?;
+    let _logging = crate::logging::init(crate::logging::Role::Client);
+    crate::logging::event(
+        crate::logging::EventKind::ClientStart,
+        &[crate::logging::Field::Role(crate::logging::Role::Client)],
+    );
+    let stream = match transport::connect(sock) {
+        Ok(stream) => stream,
+        Err(_) => {
+            crate::logging::event(
+                crate::logging::EventKind::ClientConnectFailed,
+                &[crate::logging::Field::ErrorCode(
+                    crate::logging::SafeId::new("io").expect("static id is valid"),
+                )],
+            );
+            return Err(anyhow!("cannot connect to luvus server"));
+        }
+    };
+    crate::logging::event(crate::logging::EventKind::ClientConnect, &[]);
     // `Conn` is a cloneable duplex handle: one clone reads, the other writes.
-    attach(stream.clone(), stream)
+    attach_inner(stream.clone(), stream)
 }
 
 /// Attach a thin client over **any** reader/writer carrying the binary frame
 /// protocol. The local path passes the two halves of a `Conn`; remote attach
 /// (docs/18 RA) passes an `ssh` child's stdout/stdin — the protocol is the same.
 pub fn attach<R, W>(reader: R, writer: W) -> Result<()>
+where
+    R: Read,
+    W: Write + Send + 'static,
+{
+    let _logging = crate::logging::init(crate::logging::Role::Client);
+    crate::logging::event(
+        crate::logging::EventKind::ClientStart,
+        &[crate::logging::Field::Role(crate::logging::Role::Client)],
+    );
+    crate::logging::event(crate::logging::EventKind::ClientConnect, &[]);
+    attach_inner(reader, writer)
+}
+
+fn attach_inner<R, W>(reader: R, writer: W) -> Result<()>
 where
     R: Read,
     W: Write + Send + 'static,
@@ -47,12 +111,28 @@ where
     ratatui::restore();
     match result? {
         ClientExit::Done => Ok(()),
+        ClientExit::Detached => {
+            crate::print_detached_status(crate::i18n::cli::Context::configured());
+            Ok(())
+        }
+        ClientExit::ServerStopped => {
+            let context = crate::i18n::cli::Context::configured();
+            let session = crate::session::display_name();
+            let rows = [
+                (context.text("status"), context.text("stopped")),
+                (context.text("session"), session.as_str()),
+            ];
+            crate::cli::print_status_card("Luvus session", &rows);
+            Ok(())
+        }
         ClientExit::SwitchSession(name) => switch_session_process(&name),
     }
 }
 
 enum ClientExit {
     Done,
+    Detached,
+    ServerStopped,
     SwitchSession(String),
 }
 
@@ -63,7 +143,7 @@ where
 {
     let truecolor = protocol::truecolor_supported();
     let size = terminal.size()?;
-    protocol::write_message(
+    write_handshake_message(
         &mut writer,
         &ClientMessage::Hello {
             version: protocol::PROTOCOL_VERSION,
@@ -73,20 +153,35 @@ where
     )?;
 
     let mut reader = BufReader::new(reader);
-    match protocol::read_message::<_, ServerMessage>(&mut reader)? {
+    match read_handshake_message(&mut reader)? {
         // The one user-facing handshake failure is an old server after an
         // upgrade — tell them the fix, not just the symptom.
         ServerMessage::Welcome { error: Some(e), .. } => {
+            crate::logging::event(
+                crate::logging::EventKind::ClientHandshakeRejected,
+                &[
+                    crate::logging::Field::Reason(crate::logging::Reason::VersionMismatch),
+                    crate::logging::Field::ProtocolVersion(u64::from(protocol::PROTOCOL_VERSION)),
+                ],
+            );
             return Err(anyhow!(
                 "server: {e}\nAn older luvus server is likely still running — \
                  run `luvus server restart` to load this version (your session is saved)."
-            ))
+            ));
         }
         ServerMessage::Welcome { .. } => {}
-        _ => return Err(anyhow!("unexpected handshake")),
+        _ => {
+            crate::logging::event(
+                crate::logging::EventKind::ClientHandshakeRejected,
+                &[crate::logging::Field::Reason(
+                    crate::logging::Reason::Handshake,
+                )],
+            );
+            return Err(anyhow!("unexpected handshake"));
+        }
     }
 
-    let probe_terminal = match protocol::read_message::<_, ServerMessage>(&mut reader)? {
+    let probe_terminal = match read_handshake_message(&mut reader)? {
         ServerMessage::Ready { probe_terminal } => probe_terminal,
         _ => return Err(anyhow!("unexpected handshake negotiation")),
     };
@@ -97,6 +192,14 @@ where
     } else {
         Vec::new()
     };
+    crate::logging::event(
+        crate::logging::EventKind::ClientHandshake,
+        &[
+            crate::logging::Field::ProtocolVersion(u64::from(protocol::PROTOCOL_VERSION)),
+            crate::logging::Field::Cols(u64::from(size.width)),
+            crate::logging::Field::Rows(u64::from(size.height)),
+        ],
+    );
 
     // Enable input protocols only after probing. That bounds the pending-input
     // decoder to ordinary terminal key sequences and avoids mouse/paste replies
@@ -121,6 +224,9 @@ where
     // Main thread: paint frames as they arrive. A full frame repaints the screen; a
     // diff writes only its changed cells straight to the terminal (no full re-blit,
     // no reconstructed frame) — so a busy session costs O(changed cells), not O(screen).
+    // `last_cursor` parks IME when this frame hid the PTY caret: CUP onto the
+    // pane even after `?25l`, so composition does not follow chrome.
+    let mut last_cursor = None;
     let exit = loop {
         match protocol::read_message::<_, ServerMessage>(&mut reader) {
             // A full frame repaints the whole screen; a diff writes *only its changed
@@ -132,27 +238,65 @@ where
                     terminal,
                     &frame_cells(&frame, truecolor),
                     frame.cursor,
+                    frame.cursor_visible,
                     true,
+                    &mut last_cursor,
                 );
                 sync_end();
+                if r.is_err() {
+                    crate::logging::event(
+                        crate::logging::EventKind::ClientRenderFailed,
+                        &[crate::logging::Field::ErrorCode(
+                            crate::logging::SafeId::new("io").expect("static id is valid"),
+                        )],
+                    );
+                }
                 r?;
             }
             Ok(ServerMessage::FrameDiff(diff)) => {
                 sync_begin();
-                let r = paint(terminal, &diff_cells(&diff, truecolor), diff.cursor, false);
+                let r = paint(
+                    terminal,
+                    &diff_cells(&diff, truecolor),
+                    diff.cursor,
+                    diff.cursor_visible,
+                    false,
+                    &mut last_cursor,
+                );
                 sync_end();
+                if r.is_err() {
+                    crate::logging::event(
+                        crate::logging::EventKind::ClientRenderFailed,
+                        &[crate::logging::Field::ErrorCode(
+                            crate::logging::SafeId::new("io").expect("static id is valid"),
+                        )],
+                    );
+                }
                 r?;
             }
             Ok(ServerMessage::Notify(msg)) => crate::emit_notification(&msg),
-            Ok(ServerMessage::Sound) => crate::emit_sound(),
+            Ok(ServerMessage::Sound(signal)) => crate::emit_sound(signal),
             Ok(ServerMessage::Clipboard(text)) => crate::emit_clipboard(&text),
             Ok(ServerMessage::OpenUrl(url)) => crate::platform::open_url(&url),
             Ok(ServerMessage::SwitchSession { name }) => break ClientExit::SwitchSession(name),
-            Ok(ServerMessage::Detach) | Ok(ServerMessage::ServerShutdown { .. }) => {
-                break ClientExit::Done
-            }
+            Ok(ServerMessage::Detach) => break ClientExit::Detached,
+            Ok(ServerMessage::ServerShutdown { .. }) => break ClientExit::ServerStopped,
             Ok(_) => {}
-            Err(_) => break ClientExit::Done, // server gone
+            Err(_) => {
+                crate::logging::event(
+                    crate::logging::EventKind::ClientFrameError,
+                    &[crate::logging::Field::ErrorCode(
+                        crate::logging::SafeId::new("protocol").expect("static id is valid"),
+                    )],
+                );
+                crate::logging::event(
+                    crate::logging::EventKind::ClientDisconnect,
+                    &[crate::logging::Field::Reason(
+                        crate::logging::Reason::Protocol,
+                    )],
+                );
+                break ClientExit::Done;
+            }
         }
     };
     Ok(exit)
@@ -169,10 +313,7 @@ fn switch_session_process(name: &str) -> Result<()> {
     let args = switched_args(&raw, name);
     let exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(exe);
-    command
-        .args(args)
-        .env_remove("LUVUS_SOCKET_PATH")
-        .env_remove("BOHAY_SOCKET_PATH");
+    command.args(args).env_remove("LUVUS_SOCKET_PATH");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -206,30 +347,83 @@ fn switched_args(raw: &[String], name: &str) -> Vec<String> {
 }
 
 fn input_loop<W: Write>(mut writer: W, pending: Vec<Event>) {
-    for event in pending {
-        let Some(msg) = event_message(event) else {
-            continue;
-        };
-        if protocol::write_message(&mut writer, &msg).is_err() {
-            return;
+    #[cfg(windows)]
+    {
+        let mut decoder = crate::terminal::host_input::HostInputDecoder::default();
+        for event in pending {
+            if !write_decoded_input(&mut writer, decoder.push(event)) {
+                return;
+            }
+        }
+        loop {
+            if let Some(timeout) = decoder.wait_timeout() {
+                match poll_event(timeout) {
+                    Ok(false) => {
+                        if !write_decoded_input(&mut writer, decoder.flush_expired()) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(true) => {}
+                    Err(_) => break,
+                }
+            }
+            let Ok(event) = read_event() else {
+                break;
+            };
+            if !write_decoded_input(&mut writer, decoder.push(event)) {
+                break;
+            }
         }
     }
-    while let Ok(event) = read_event() {
-        let msg = match event_message(event) {
-            Some(msg) => msg,
-            None => continue,
-        };
-        if protocol::write_message(&mut writer, &msg).is_err() {
-            break;
+
+    #[cfg(not(windows))]
+    {
+        for event in pending {
+            if !write_input_event(&mut writer, event) {
+                return;
+            }
+        }
+        while let Ok(event) = read_event() {
+            if !write_input_event(&mut writer, event) {
+                break;
+            }
         }
     }
 }
 
+fn write_input_event(writer: &mut impl Write, event: Event) -> bool {
+    event_message(event).is_none_or(|message| protocol::write_message(writer, &message).is_ok())
+}
+
+#[cfg(windows)]
+fn write_decoded_input(
+    writer: &mut impl Write,
+    decoded: crate::terminal::host_input::DecodedEvents,
+) -> bool {
+    let mut connected = true;
+    decoded.for_each(|event| {
+        if connected {
+            connected = write_input_event(writer, event);
+        }
+    });
+    connected
+}
+
 fn event_message(event: Event) -> Option<ClientMessage> {
-    match event {
+    match crate::terminal::host_key::normalize_platform_modifiers(event) {
         Event::Key(k) => Some(ClientMessage::Key(k)),
         Event::Mouse(m) => Some(ClientMessage::Mouse(m)),
-        Event::Resize(cols, rows) => Some(ClientMessage::Resize { cols, rows }),
+        Event::Resize(cols, rows) => {
+            crate::logging::event(
+                crate::logging::EventKind::ClientResize,
+                &[
+                    crate::logging::Field::Cols(u64::from(cols)),
+                    crate::logging::Field::Rows(u64::from(rows)),
+                ],
+            );
+            Some(ClientMessage::Resize { cols, rows })
+        }
         Event::Paste(s) => Some(ClientMessage::Paste(s)),
         // Regained focus: the window may have moved or been repainted while we
         // were away, and luvus never saw it. Re-send the current size, which the
@@ -375,14 +569,26 @@ fn diff_cells(diff: &FrameDiff, truecolor: bool) -> Vec<(u16, u16, Cell)> {
     cells
 }
 
+/// Visible in-bounds pane cell. Does not remap a compact/mobile row-0/1 caret
+/// onto the status line, and does not invent a prompt row.
+fn ime_position(cursor: Option<(u16, u16)>, tw: u16, th: u16) -> Option<(u16, u16)> {
+    cursor.filter(|(x, y)| *x < tw && *y < th)
+}
+
 /// Write `cells` straight to the terminal via the backend (no full re-blit / no
 /// ratatui double-buffer), position the cursor, and flush. `clear` first wipes the
 /// screen (full frame / resync); diffs paint over what's already there.
+///
+/// Hide, write cells, CUP to the pane PTY (hidden still parks), then show/hide.
+/// `backend.draw` walks the hardware cursor onto the last cell (e.g. a
+/// `working` spinner); IME must not observe that cell.
 fn paint<B>(
     terminal: &mut Terminal<B>,
     cells: &[(u16, u16, Cell)],
     cursor: Option<(u16, u16)>,
+    cursor_visible: bool,
     clear: bool,
+    last_cursor: &mut Option<(u16, u16)>,
 ) -> Result<()>
 where
     B: Backend,
@@ -392,6 +598,7 @@ where
     let size = terminal.size()?;
     let (tw, th) = (size.width, size.height);
     let backend = terminal.backend_mut();
+    backend.hide_cursor()?;
     if clear {
         backend.clear()?;
     }
@@ -401,12 +608,24 @@ where
             .filter(|(x, y, _)| *x < tw && *y < th)
             .map(|(x, y, c)| (*x, *y, c)),
     )?;
-    match cursor {
-        Some((x, y)) if x < tw && y < th => {
+    match ime_position(cursor, tw, th) {
+        Some((x, y)) => {
+            *last_cursor = Some((x, y));
             backend.set_cursor_position(Position::new(x, y))?;
-            backend.show_cursor()?;
+            if cursor_visible {
+                backend.show_cursor()?;
+            } else {
+                backend.hide_cursor()?;
+            }
         }
-        _ => backend.hide_cursor()?,
+        None => {
+            if let Some((x, y)) = *last_cursor {
+                if x < tw && y < th {
+                    backend.set_cursor_position(Position::new(x, y))?;
+                }
+            }
+            backend.hide_cursor()?;
+        }
     }
     backend.flush()?;
     Ok(())
@@ -414,12 +633,61 @@ where
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{copy_and_flush, relay};
+    use super::{
+        copy_and_flush, is_handshake_io_error, read_handshake_message, relay,
+        write_handshake_message,
+    };
+    use crate::ipc::protocol::{ClientMessage, PROTOCOL_VERSION};
     use std::cell::RefCell;
     use std::io::{Cursor, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::rc::Rc;
     use std::thread;
+
+    #[test]
+    fn empty_remote_stream_is_classified_as_a_handshake_failure() {
+        let error = match read_handshake_message(&mut Cursor::new(Vec::<u8>::new())) {
+            Err(error) => error,
+            Ok(_) => panic!("an empty stream must not complete the handshake"),
+        };
+        assert!(is_handshake_io_error(&error));
+        assert_eq!(
+            error.to_string(),
+            "connection failed before the Luvus handshake: failed to fill whole buffer"
+        );
+    }
+
+    #[test]
+    fn closed_remote_input_is_classified_as_a_handshake_failure() {
+        struct ClosedWriter;
+        impl Write for ClosedWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "remote command exited",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = write_handshake_message(
+            &mut ClosedWriter,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .unwrap_err();
+        assert!(is_handshake_io_error(&error));
+        assert_eq!(
+            error.to_string(),
+            "connection failed before the Luvus handshake: remote command exited"
+        );
+    }
 
     /// The blit skips wide-char continuation cells (empty symbol) instead of
     /// drawing a space into the glyph's right half — the emoji-glitch fix. The
@@ -440,6 +708,7 @@ mod tests {
             height: 1,
             cells: vec![c("\u{1F534}"), c(""), c("A"), c("B")],
             cursor: None,
+            cursor_visible: false,
         };
         let cells = super::frame_cells(&frame, true);
         let syms: Vec<(u16, String)> = cells
@@ -573,6 +842,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let config = crate::config::Config {
             theme: "terminal".into(),
+            shell: "/bin/sh".into(),
             ..Default::default()
         };
         std::fs::write(
@@ -581,6 +851,9 @@ mod tests {
         )
         .unwrap();
 
+        // Keep startup diagnostics out of pipes, which can fill and block the
+        // child. Only a bounded excerpt is read if startup fails.
+        let diagnostics = std::fs::File::create(home.join("startup.log")).unwrap();
         // A real server on a scratch home.
         let server = Command::new(&bin)
             .args([
@@ -594,9 +867,12 @@ mod tests {
             // An agent pane inherits the live session's socket. The scratch
             // server and its cleanup must never escape this test home.
             .env_remove("LUVUS_SOCKET_PATH")
+            .env_remove("LUVUS_SESSION")
+            .env_remove("LUVUS_PANE_ID")
+            .env_remove("LUVUS_TASK_ID")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(diagnostics.try_clone().unwrap())
+            .stderr(diagnostics)
             .spawn()
             .unwrap();
         struct ScratchServer {
@@ -610,7 +886,7 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.home);
             }
         }
-        let _server = ScratchServer {
+        let mut server = ScratchServer {
             child: server,
             home: home.clone(),
         };
@@ -619,11 +895,26 @@ mod tests {
             if sock.exists() {
                 break;
             }
+            if server.child.try_wait().unwrap().is_some() {
+                break;
+            }
             thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(sock.exists(), "server never created its client socket");
+        if !sock.exists() {
+            let mut diagnostics = String::new();
+            std::io::Read::take(std::fs::File::open(home.join("startup.log")).unwrap(), 8192)
+                .read_to_string(&mut diagnostics)
+                .unwrap();
+            panic!("server never created its client socket: {diagnostics}");
+        }
 
         let conn = crate::ipc::transport::connect(&sock).unwrap();
+        assert_eq!(
+            conn.set_timeouts(std::time::Duration::from_secs(5))
+                .unwrap(),
+            crate::ipc::transport::TimeoutMode::Kernel,
+            "Unix lifecycle tests require bounded blocking reads and writes"
+        );
         let mut writer = conn.clone();
         let mut reader = std::io::BufReader::new(conn);
 
@@ -685,7 +976,7 @@ mod tests {
             "the server returned a real frame after palette negotiation"
         );
 
-        // `_server` kills only the child handle spawned above, even if an
+        // `server` kills only the child handle spawned above, even if an
         // assertion panics. It never addresses an inherited production socket.
     }
 
@@ -769,28 +1060,256 @@ mod render_tests {
             height: 1,
             cells: vec![cell("a"), cell("b"), cell("c")],
             cursor: None,
+            cursor_visible: false,
         };
         let f1 = FrameData {
             width: 3,
             height: 1,
             cells: vec![cell("a"), cell("X"), cell("c")],
             cursor: Some((1, 0)),
+            cursor_visible: true,
         };
 
         let mut term = Terminal::new(TestBackend::new(3, 1)).unwrap();
+        let mut last_cursor = None;
         // Paint a full frame, then apply a diff that changes only one cell.
-        paint(&mut term, &frame_cells(&f0, true), f0.cursor, true).unwrap();
+        paint(
+            &mut term,
+            &frame_cells(&f0, true),
+            f0.cursor,
+            f0.cursor_visible,
+            true,
+            &mut last_cursor,
+        )
+        .unwrap();
         let diff = FrameDiff {
             width: 3,
             height: 1,
             runs: protocol::diff_runs(&f0, &f1),
             cursor: f1.cursor,
+            cursor_visible: f1.cursor_visible,
         };
-        paint(&mut term, &diff_cells(&diff, true), diff.cursor, false).unwrap();
+        paint(
+            &mut term,
+            &diff_cells(&diff, true),
+            diff.cursor,
+            diff.cursor_visible,
+            false,
+            &mut last_cursor,
+        )
+        .unwrap();
 
         // The terminal now shows f1 — the client stays correct without ever
         // re-blitting the whole frame.
-        let got = protocol::frame_from_buffer(term.backend().buffer(), None);
+        let got = protocol::frame_from_buffer(term.backend().buffer(), None, false);
         assert_eq!(got.cells, f1.cells);
+    }
+}
+
+#[cfg(test)]
+mod paint_tests {
+    use super::paint;
+    use crate::ipc::protocol::{self, FrameData, FrameDiff};
+    use ratatui::backend::{Backend, TestBackend};
+    use ratatui::layout::Position;
+    use ratatui::Terminal;
+
+    fn cell(s: &str) -> protocol::CellData {
+        protocol::CellData {
+            symbol: s.into(),
+            fg: 0,
+            bg: 0,
+            mods: 0,
+        }
+    }
+
+    #[test]
+    fn pty_visible_cursor_is_restored_after_spinner_like_diff() {
+        let mut term = Terminal::new(TestBackend::new(8, 8)).unwrap();
+        let mut cells = vec![cell(" "); 64];
+        let f0 = FrameData {
+            width: 8,
+            height: 8,
+            cells: cells.clone(),
+            cursor: Some((1, 4)),
+            cursor_visible: true,
+        };
+        let mut last = None;
+        paint(
+            &mut term,
+            &super::frame_cells(&f0, true),
+            f0.cursor,
+            f0.cursor_visible,
+            true,
+            &mut last,
+        )
+        .unwrap();
+
+        // Crossterm's draw walks the hardware cursor onto each cell. TestBackend
+        // does not, so park it on the bottom-right spinner cell the same way.
+        term.backend_mut()
+            .set_cursor_position(Position::new(7, 7))
+            .unwrap();
+
+        cells[63] = cell("*");
+        let f1 = FrameData {
+            width: 8,
+            height: 8,
+            cells,
+            cursor: Some((1, 4)),
+            cursor_visible: true,
+        };
+        let diff = FrameDiff {
+            width: 8,
+            height: 8,
+            runs: protocol::diff_runs(&f0, &f1),
+            cursor: Some((1, 4)),
+            cursor_visible: true,
+        };
+        paint(
+            &mut term,
+            &super::diff_cells(&diff, true),
+            diff.cursor,
+            diff.cursor_visible,
+            false,
+            &mut last,
+        )
+        .unwrap();
+
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(1, 4)
+        );
+        assert!(term.backend().cursor_visible());
+    }
+
+    #[test]
+    fn hidden_pty_cursor_does_not_show_a_luvus_caret() {
+        let mut term = Terminal::new(TestBackend::new(8, 8)).unwrap();
+        let mut cells = vec![cell(" "); 64];
+        let f0 = FrameData {
+            width: 8,
+            height: 8,
+            cells: cells.clone(),
+            cursor: Some((1, 4)),
+            cursor_visible: true,
+        };
+        let mut last = None;
+        paint(
+            &mut term,
+            &super::frame_cells(&f0, true),
+            f0.cursor,
+            f0.cursor_visible,
+            true,
+            &mut last,
+        )
+        .unwrap();
+        assert!(term.backend().cursor_visible());
+
+        term.backend_mut()
+            .set_cursor_position(Position::new(7, 7))
+            .unwrap();
+
+        cells[63] = cell("*");
+        let f1 = FrameData {
+            width: 8,
+            height: 8,
+            cells,
+            cursor: Some((1, 4)),
+            cursor_visible: false,
+        };
+        let diff = FrameDiff {
+            width: 8,
+            height: 8,
+            runs: protocol::diff_runs(&f0, &f1),
+            cursor: Some((1, 4)),
+            cursor_visible: false,
+        };
+        paint(
+            &mut term,
+            &super::diff_cells(&diff, true),
+            diff.cursor,
+            diff.cursor_visible,
+            false,
+            &mut last,
+        )
+        .unwrap();
+
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(1, 4)
+        );
+        assert!(!term.backend().cursor_visible());
+    }
+
+    #[test]
+    fn out_of_bounds_cursor_hides_caret() {
+        let mut term = Terminal::new(TestBackend::new(8, 8)).unwrap();
+        let mut last = None;
+        let cells = vec![cell(" "); 64];
+        let f0 = FrameData {
+            width: 8,
+            height: 8,
+            cells,
+            cursor: Some((1, 4)),
+            cursor_visible: true,
+        };
+        paint(
+            &mut term,
+            &super::frame_cells(&f0, true),
+            f0.cursor,
+            f0.cursor_visible,
+            true,
+            &mut last,
+        )
+        .unwrap();
+
+        paint(&mut term, &[], Some((99, 99)), false, false, &mut last).unwrap();
+
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(1, 4)
+        );
+        assert!(!term.backend().cursor_visible());
+    }
+
+    #[test]
+    fn hidden_in_view_pty_parks_without_showing() {
+        let mut term = Terminal::new(TestBackend::new(8, 8)).unwrap();
+        let mut last = None;
+        let cells = vec![cell(" "); 64];
+        let f0 = FrameData {
+            width: 8,
+            height: 8,
+            cells,
+            cursor: Some((3, 5)),
+            cursor_visible: false,
+        };
+        paint(
+            &mut term,
+            &super::frame_cells(&f0, true),
+            f0.cursor,
+            f0.cursor_visible,
+            true,
+            &mut last,
+        )
+        .unwrap();
+
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(3, 5)
+        );
+        assert!(!term.backend().cursor_visible());
+    }
+
+    #[test]
+    fn tab_row_caret_stays_put_on_a_tall_screen() {
+        assert_eq!(super::ime_position(Some((3, 0)), 80, 24), Some((3, 0)));
+        assert_eq!(super::ime_position(Some((3, 1)), 80, 24), Some((3, 1)));
+    }
+
+    #[test]
+    fn grok_prompt_caret_stays_put() {
+        assert_eq!(super::ime_position(Some((4, 20)), 80, 24), Some((4, 20)));
     }
 }

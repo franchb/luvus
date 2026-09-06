@@ -78,6 +78,13 @@ A **workspace** is one project folder, fixed at its `cwd` (see
 [Core Concepts](/docs/getting-started/concepts/#2-workspace--tab--pane)). They
 live in the sidebar's top list.
 
+Closing the final workspace leaves the client attached with the normal Luvus
+chrome instead of closing the app or showing a separate landing screen. Luvus
+immediately replaces it with a neutral workspace and real terminal rooted at
+your home directory. You can type, change directory, create tabs or splits, and
+open the folder picker normally. The sidebar path follows the focused pane, so
+split terminals with different working directories remain unambiguous.
+
 - **Open one:** the `+` button above the list, or `Ctrl+Space N`, opens a
   **folder picker**. Browse with the arrows / wheel, use the **Home** row to jump
   home, or press `g` (also clickable in the footer) to type an absolute, relative,
@@ -85,8 +92,22 @@ live in the sidebar's top list.
   **Open this folder** afterward to confirm the workspace. Press `n` to
   create-and-open a new folder, or `w` to open a repo **as a new worktree**.
   Running `luvus` inside a folder also adds it automatically.
-- **Switch:** click a row, or `Ctrl+Space w` / `W` to cycle.
-- **Jump to its git tab:** click the branch name next to a workspace.
+- **Switch quickly:** use `Ctrl+Space u` / `U` to cycle to the next / previous
+  workspace.
+- **Navigate the list:** `Ctrl+Space w` focuses WORKSPACES. Use arrows or
+  `j` / `k`, press `Enter` to switch, `a` to open the selected row's action
+  menu, and `Esc` or `q` to return input to the pane.
+- **Jump to its git tab:** right-click the workspace and choose **Open Git
+  Tab**, or focus it and press `Ctrl+Space g`.
+
+### Following a pane into another repository
+
+When a terminal or agent changes its working directory into another Git
+repository or linked worktree, luvus confirms the new root across two scans and
+then moves the complete normal tab to that workspace. If the workspace is not
+open yet, luvus creates it without starting another shell. Split tabs move only
+when every pane agrees on the same destination; mixed-workspace splits and
+dashboard tabs stay where they are.
 
 ### Right-click a workspace
 
@@ -97,6 +118,9 @@ Right-click any workspace row for its menu:
   disk)
 - **Pin** / **Unpin** it at the top of the list. A linked worktree stays with
   its parent, so pinning either one moves the complete group.
+- **Hide Path** switches WORKSPACES to compact one-row entries. Right-click
+  again and choose **Show Path** to restore the cwd rows. Luvus remembers this
+  choice across restarts.
 - **New Git Worktree** / **Open Worktree** (for git repos)
 - **Open Git Tab** · **Open Task Board** · **Open Mission Control**
 
@@ -111,7 +135,19 @@ luvus workspace unpin 2
 ```
 
 `workspace list` reports both the stable API index and `display_position`, so a
-pin never changes which workspace a later command targets.
+pin never changes which workspace a later command targets. It also reports two
+paths. `cwd` is the stable project root. `terminal_cwd` is the exact live path
+of the focused pane in the active tab. Changing focus updates `terminal_cwd`, so
+split panes with different directories report whichever terminal is currently
+selected. The stable `cwd` and a custom workspace name remain unchanged.
+
+Mission Control is also available without a mouse. Press `Ctrl+Space m`, choose
+it from the desktop switcher with `Ctrl+Space M`, or open it through automation:
+
+```sh
+luvus mission open
+luvus mission open 2
+```
 
 ## The sidebar
 
@@ -133,17 +169,29 @@ Arrange them in **Settings → Layout**, under the `── Docks ──` divider
 - Each side has a **visible** toggle and a **width**.
 - Every dock has **`[Left] [Right] [Off]`** buttons. Click to put it on the left
   sidebar, the right sidebar, or hide it. The current placement is highlighted.
-- Toggle the right sidebar any time with `Ctrl+Space B` (and the left with
-  `Ctrl+Space b`).
+- Toggle both sidebars with `Ctrl+Space b`. `Ctrl+Space B` toggles only the
+  right sidebar when you want to keep the left side visible.
+- Drag the horizontal rule between two stacked docks on the same side to
+  resize them. Only those two docks change size. The split is remembered
+  across restarts and terminal resizes, and a dock cannot be squeezed below
+  three rows.
 
 For example, move **Agents** to the right so your agent statuses sit on one edge
 and your project list on the other. If you hide the left sidebar entirely, the
 **Menu** button moves to the right sidebar so Settings is always reachable.
 
 :::tip
-The **Agents** dock header has an **All / Active** toggle: *Active* shows only
-running agents, while *All* also lists the resumable sessions luvus found on disk (click
-one to reopen it). See [Working with Agents](/docs/guides/agents/).
+The **Agents** dock has two independent filters. **All / Active** controls
+lifecycle: *Active* shows only running agents, while *All* also lists resumable
+sessions found on disk (click one to reopen it). Workspace scope filters both
+live agents and resumable sessions to the active workspace. Both choices are
+remembered across restarts; use prefix `a` for All/Active and prefix `A` for All
+workspaces/this workspace. You can also right-click any agent or resumable
+session row and choose **Show Workspace Only** or **Show All Workspaces**.
+
+Attention stays global while workspace scope is selected. If another workspace
+has a blocked agent, one overflow line reports the count; click it to jump to
+that agent without clearing the scope. See [Working with Agents](/docs/guides/agents/).
 :::
 
 ## Luvus Bar
@@ -194,15 +242,30 @@ follows it. If you would rather not hold a modifier, **right-click** and pick
 | `https://luvus.dev/docs` | opens in your browser |
 | `luvus.dev/docs` | same, with `https://` filled in |
 | `localhost:3000` | opens your dev server, over `http` |
-| `src/main.rs` | opens in a luvus tab, like clicking it in FILES |
-| `src/main.rs:42` | opens in a tab, scrolled to line 42 |
+| `src/main.rs` | opens in luvus, where **File click behavior** says |
+| `src/main.rs:42` | the same, scrolled to line 42 |
 
 ### Files
 
-A file path opens **in luvus**, not in some other app. It goes through exactly the
-same path as clicking the file in the FILES tree, so it respects your
-**Settings → General → Open files with** choice: the built-in read-only viewer by
-default, or your terminal editor if you set one.
+A file path opens **in luvus**, not in some other app, and it lands where a
+click on that file's FILES row would — your **Settings → General → File click
+behavior** choice:
+
+- **Preview** (the default): the workspace's reused preview pane, beside the
+  pane you clicked in. The agent that printed the path stays on screen.
+- **Open in tab**: a new tab, through your **Open files with** choice — the
+  built-in read-only viewer, or your terminal editor if you set one.
+
+**`Ctrl`+`Shift`+click** opens a permanent pane beside the focus instead, the
+same as `Shift`+click on a FILES row.
+
+`path:42` preserves the requested line in Preview, permanent-pane and built-in
+read-only tab placements. A configured terminal editor opens the file at the
+top, because line-jump arguments differ between editors.
+
+When an agent such as Claude prints a terminal file hyperlink, luvus uses its
+validated local file target rather than guessing from the visible label. It
+then follows the same **File click behavior** and **Open files with** settings.
 
 **A path only underlines if the file is really there.** Paths are resolved against
 that pane's working directory, so `src/main.rs` means what it means to the shell

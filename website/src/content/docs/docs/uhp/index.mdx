@@ -1,0 +1,155 @@
+---
+title: Universal Harness Protocol (UHP)
+description: The stable Luvus UHP 1.0 contract for harnesses, orchestrators, and developer tools.
+---
+
+UHP 1.0 is Luvus's single public automation protocol. It exposes the complete
+runtime and terminal state through one method registry, one schema bundle, one
+event sequence, and one version identity: `luvus-uhp` `1.0`.
+
+UHP exists so a script, coding harness, module, remote client, or future UI can
+control the same server-owned state without scraping terminal pixels or
+reimplementing Luvus behavior. Methods are semantic and validated: start an
+agent, move a pane, apply a layout, wait for output, add DIFF notes, or stream a
+terminal through explicit contracts.
+
+```text
+UHP 1.0
+├── server, config, and events
+├── host and named-session lifecycle
+├── workspaces, tabs, panes, and layouts
+├── agents and orchestration
+├── terminal inventory, capture, streams, and input
+├── files, Git, DIFF, and worktrees
+└── modules, themes, bars, docks, and notifications
+```
+
+The Unix socket or Windows named pipe is only the local transport. The private
+binary protocol used to render attached Luvus clients is separate and is not a
+harness API.
+
+## Where UHP fits
+
+| Surface | Best for | Contract |
+|---|---|---|
+| `luvus <noun> <verb>` | Humans, shell scripts, and one operation at a time | Friendly wrappers and stable CLI output |
+| UHP 1.0 | Harnesses, integrations, event consumers, and remote clients | Typed NDJSON requests, replies, events, and streams |
+| Binary client transport | Luvus TUI rendering and input | Private implementation detail, not public automation |
+
+The CLI and UHP converge on the same validated app dispatch. A feature is not a
+separate protocol merely because it has its own method namespace.
+
+## Choose your path
+
+| You want to | Start here |
+|---|---|
+| Understand framing, discovery, identity, and safety | This overview |
+| Make your first call | [Getting started](/docs/uhp/getting-started/) |
+| Copy working Python, shell, agent, terminal, and event flows | [Practical examples](/docs/uhp/examples/) |
+| Build a remote transport or independent client | [Remote access](/docs/uhp/remote-access/) |
+| Look up an exact method and its parameters | [Method reference](/docs/uhp/methods/) |
+| Observe or control live PTYs | [Terminal methods](/docs/uhp/terminal/) |
+| Validate an implementation against UHP 1.0 | [Schemas and conformance](/docs/uhp/conformance/) |
+
+## Connection profiles
+
+UHP has three profiles with different authority and lifecycle:
+
+| Profile | How to reach it | Authority |
+|---|---|---|
+| Session server | Discovered owner-only Unix socket or Windows named pipe | Full authority of the local account, or a scoped delegated token |
+| Host | One request through `luvus uhp proxy` | Local host and named-session lifecycle; confirmed mutations only |
+| Access gateway | Explicit foreground `luvus uhp access` behind a trusted provider | Read-only by default or short-lived scoped control |
+
+Normal Luvus startup opens no TCP listener. The access gateway binds loopback
+only, and an external provider decides whether and how to carry that byte stream
+over SSH, a private overlay, or another authenticated tunnel.
+
+## Discovery
+
+```sh
+luvus session list --json
+luvus uhp schema
+luvus uhp capabilities
+luvus uhp snapshot
+luvus uhp events
+```
+
+Host-wide discovery is available even when no session server is running:
+
+```sh
+printf '%s\n' '{"id":"host","method":"host.capabilities","params":{}}' | luvus uhp proxy
+```
+
+`uhp.capabilities` is the only protocol handshake. It returns the protocol
+version, methods and contracts, server and event identity, bounded limits,
+agent authority sources, authorization scopes, and atomic operations.
+Consumers must use discovery rather than infer support from the Luvus release.
+The installed schema's `event_catalog.properties` maps every current general
+stream event name to the JSON Schema for its `data` payload. Register the
+bundle's `documents` by `$id` before resolving catalog references.
+
+## Framing
+
+Ordinary UHP calls use one LF-terminated JSON request and response per
+connection:
+
+```json
+{"id":"1","method":"uhp.capabilities","params":{}}
+```
+
+Requests require a non-empty string `id`, a known `method`, and an object
+`params`. The optional `auth` field carries a delegated token. Unknown envelope
+fields, duplicate keys, invalid parameters, and oversized frames fail before
+dispatch.
+
+Event subscriptions and terminal observe/control requests turn that one
+connection into a bounded stream after their acknowledgment.
+
+## Identity and concurrency
+
+Workspace and tab IDs survive reorder and restart. A terminal mutation uses:
+
+```text
+server_generation + terminal_id + pane_id
+```
+
+This rejects stale servers, replaced PTYs, and obsolete layout routes. Never
+identify a terminal from its title, prompt text, or tab position.
+
+State results carry `revision`. A mutation can provide `if_revision` and will
+fail with `revision_conflict` if the server changed first. Compound operations
+such as `agent.start`, `agent.prompt`, `workspace.move_block`, `layout.apply`,
+and `diff.note.apply` validate and commit atomically.
+
+## Events and waits
+
+`events.subscribe` supports replay with `after_sequence`. Replay and subscriber
+queues are bounded. A stale cursor or slow consumer requires a new snapshot.
+
+Prefer `events.wait`, `agent.wait`, `terminal.backend.wait_change`, and
+`terminal.backend.wait_output` over polling. Waits are bounded and cancelled
+when their connection or target disappears.
+
+## Security
+
+The local endpoint validates same-user ownership and is the default authority
+boundary. Normal Luvus startup never opens a TCP listener. The explicit,
+foreground `luvus uhp access` command may bind one ephemeral IPv4 loopback
+gateway for a trusted transport provider; it never exposes the owner endpoint.
+Delegated tokens are memory-only, bounded, expiring, and scope-restricted.
+
+Terminal and process responses avoid full argument vectors because they can
+contain prompts, credentials, or tokens. Capture, input, messages, and cwd are
+also bounded.
+
+Host-profile methods run only in the short-lived `luvus uhp proxy` process.
+They trust the local operating-system account, reject delegated session tokens,
+and are not forwarded through `luvus uhp access`. Destructive or installation
+methods additionally require `confirm:true`.
+
+Its machine-readable access descriptor is part of the installed schema bundle.
+See [Remote access and transport providers](/docs/uhp/remote-access/) before
+implementing a provider. See [Getting started with UHP](/docs/uhp/getting-started/)
+for a walkthrough and the [method reference](/docs/uhp/methods/) for the
+complete namespaces.

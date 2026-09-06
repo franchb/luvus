@@ -1,119 +1,47 @@
-//! PTY pane: spawn a child against a pseudo-terminal and pump its output
-//! through a `VtEngine`. In M0 we use portable-pty's reader/writer directly;
-//! the dedicated fd-owning actor thread (needed for live handoff) lands later.
+//! PTY pane lifecycle. Unix panes use one poll-driven descriptor actor for
+//! ordered input and output; Windows keeps portable-pty's split reader/writer
+//! backend. Child waiting is one process-wide event-driven reaper.
 
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::io::Read;
+#[cfg(any(windows, test))]
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(all(test, unix))]
+use std::sync::mpsc;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use anyhow::Result;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use crate::event::AppEvent;
 use crate::ids::PaneId;
+use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::TerminalRuntime;
 use crate::terminal::vt::{create_engine, VtEngine, VtEngineKind};
 
-const CHILD_REAPER_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) mod input;
+mod io;
+mod reaper;
+pub(crate) use input::InputSender;
 
-struct ReaperEntry {
-    id: PaneId,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    child_exited: Arc<AtomicBool>,
-    app_tx: Sender<AppEvent>,
-}
-
-static CHILD_REAPER: OnceLock<Sender<ReaperEntry>> = OnceLock::new();
+/// Keep each pane's read working set small. Unix amortizes synchronization by
+/// draining several of these chunks under one bounded engine lock.
+const PTY_READ_BUFFER_BYTES: usize = 8 * 1024;
 
 #[cfg(test)]
-static CHILD_REAPER_STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Hand a child to the process-wide reaper. A pane still owns dedicated reader
-/// and writer threads so one blocked PTY cannot stall another pane, but waiting
-/// for child exit needs no per-pane thread: `try_wait` is non-blocking on every
-/// portable-pty backend.
-fn register_child_reaper(
-    id: PaneId,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    child_exited: Arc<AtomicBool>,
-    app_tx: Sender<AppEvent>,
-) {
-    let reaper = CHILD_REAPER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel();
-        thread::Builder::new()
-            .name("luvus-pty-reaper".to_string())
-            .spawn(move || child_reaper_loop(rx))
-            .expect("failed to start the PTY child reaper");
-        #[cfg(test)]
-        CHILD_REAPER_STARTS.fetch_add(1, Ordering::SeqCst);
-        tx
-    });
-    let entry = ReaperEntry {
-        id,
-        child,
-        child_exited,
-        app_tx,
-    };
-    if let Err(error) = reaper.send(entry) {
-        // A panic in the shared reaper must not leave an unreaped child. This
-        // fallback is deliberately exceptional; the normal path stays at one
-        // waiter thread for the whole server.
-        let mut entry = error.0;
-        let _ = thread::Builder::new()
-            .name("luvus-pty-reaper-fallback".to_string())
-            .spawn(move || {
-                let _ = entry.child.wait();
-                finish_child(entry);
-            });
-    }
-}
-
-fn child_reaper_loop(rx: Receiver<ReaperEntry>) {
-    let mut children = Vec::<ReaperEntry>::new();
-    loop {
-        let received = if children.is_empty() {
-            rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
-        } else {
-            rx.recv_timeout(CHILD_REAPER_INTERVAL)
-        };
-        match received {
-            Ok(entry) => children.push(entry),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-        children.extend(rx.try_iter());
-
-        let mut index = 0;
-        while index < children.len() {
-            if child_poll_finished(children[index].child.try_wait()) {
-                let entry = children.swap_remove(index);
-                finish_child(entry);
-            } else {
-                index += 1;
-            }
-        }
-    }
-}
-
-#[inline]
-fn child_poll_finished(result: std::io::Result<Option<portable_pty::ExitStatus>>) -> bool {
-    matches!(result, Ok(Some(_)))
-}
+use reaper::child_poll_finished;
+use reaper::register_child_reaper;
+#[cfg(all(test, unix))]
+use reaper::CHILD_REAPER_STARTS;
 
 fn terminate_spawned_child(child: &mut (dyn portable_pty::Child + Send + Sync)) {
     let _ = child.kill();
     let _ = child.wait();
-}
-
-fn finish_child(entry: ReaperEntry) {
-    // Publish exit before notifying the app. If the app immediately drops the
-    // pane, `Drop` must not signal a PID that the operating system may reuse.
-    entry.child_exited.store(true, Ordering::SeqCst);
-    let _ = entry.app_tx.send(AppEvent::PtyExit(entry.id));
 }
 
 pub(crate) enum InputAction {
@@ -126,6 +54,7 @@ pub(crate) enum InputAction {
     },
 }
 
+#[cfg(any(windows, test))]
 fn write_input_action(writer: &mut dyn Write, action: InputAction) -> std::io::Result<()> {
     match action {
         InputAction::Bytes(bytes) => writer.write_all(&bytes)?,
@@ -156,10 +85,13 @@ pub struct MouseModes {
 }
 
 pub struct Pane {
+    /// Stable application identity for operational lifecycle events. This is
+    /// never derived from the child command or terminal contents.
+    id: PaneId,
     pub engine: Arc<Mutex<dyn VtEngine>>,
     /// `None` until a deferred spawn's worker stores it (docs/82).
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
-    input_tx: Sender<InputAction>,
+    input_tx: InputSender,
     pub cwd: PathBuf,
     pub command: String,
     /// The shell's pid, for reading its live working directory and process
@@ -174,6 +106,9 @@ pub struct Pane {
     /// it while holding the VT lock, so capture can return a revision that
     /// exactly matches the screen snapshot it serialized.
     content_revision: Arc<AtomicU64>,
+    observed_title_generation: AtomicU64,
+    #[cfg(windows)]
+    history_maintenance_pending: AtomicBool,
     /// `PtyData` coalescing: set by the reader when it announces new output,
     /// cleared by the app loop when it consumes the event. While set, further
     /// reads skip the send — a saturated PTY (thousands of 8 KB reads/s) wakes
@@ -210,6 +145,7 @@ impl Drop for Pane {
         // A deferred spawn that hasn't forked yet aborts in the worker; one
         // that has forked is killed by the worker's own post-fork check.
         self.cancelled.store(true, Ordering::SeqCst);
+        self.input_tx.wake();
         // Already reaped → the pid may belong to someone else now.
         if self.child_exited.load(Ordering::SeqCst) {
             return;
@@ -251,6 +187,7 @@ impl Pane {
         initial: Option<&str>,
         shell: &str,
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Result<Pane> {
         let cmd = CommandBuilder::new(shell);
         Self::build(
@@ -264,6 +201,7 @@ impl Pane {
             basename(shell),
             &[],
             history_budget_bytes,
+            appearance,
         )
     }
 
@@ -282,6 +220,7 @@ impl Pane {
         shell: &str,
         argv: &[String],
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty shell command"));
@@ -301,6 +240,7 @@ impl Pane {
             basename(shell),
             &[],
             history_budget_bytes,
+            appearance,
         )
     }
 
@@ -316,6 +256,7 @@ impl Pane {
         argv: &[String],
         env: &[(String, String)],
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty module command"));
@@ -335,6 +276,7 @@ impl Pane {
             basename(program),
             env,
             history_budget_bytes,
+            appearance,
         )
     }
 
@@ -349,9 +291,11 @@ impl Pane {
         cols: u16,
         rows: u16,
         cwd: PathBuf,
+        fallback_cwds: &[PathBuf],
         app_tx: Sender<AppEvent>,
         shell: &str,
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Pane {
         let cmd = CommandBuilder::new(shell);
         Self::build_deferred(
@@ -359,13 +303,14 @@ impl Pane {
             cols,
             rows,
             cwd,
-            &[],
+            fallback_cwds,
             app_tx,
             None,
             cmd,
             basename(shell),
             &[],
             history_budget_bytes,
+            appearance,
         )
     }
 
@@ -384,6 +329,7 @@ impl Pane {
         initial: Option<&str>,
         shell: &str,
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Pane {
         let cmd = CommandBuilder::new(shell);
         Self::build_deferred(
@@ -398,6 +344,7 @@ impl Pane {
             basename(shell),
             &[],
             history_budget_bytes,
+            appearance,
         )
     }
 
@@ -415,6 +362,7 @@ impl Pane {
         shell: &str,
         argv: &[String],
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty shell command"));
@@ -435,6 +383,7 @@ impl Pane {
             basename(shell),
             &[],
             history_budget_bytes,
+            appearance,
         ))
     }
 
@@ -450,6 +399,7 @@ impl Pane {
         command: String,
         extra_env: &[(String, String)],
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Result<Pane> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -473,15 +423,17 @@ impl Pane {
         };
         drop(pair.slave);
 
-        // All bytes (user input + terminal responses) funnel through one channel
-        // to a single writer thread — keeps ordering correct, needs no mutex.
-        let (input_tx, input_rx) = mpsc::channel::<InputAction>();
+        // User input and terminal-generated responses share one ordered queue.
+        // Unix wakes one poll-driven actor; Windows retains the split backend.
+        let (input_tx, input_rx) = io::input_channel();
+        input_tx.set_notice(id, app_tx.clone());
         let engine = create_engine(
             VtEngineKind::configured(),
             cols,
             rows,
             input_tx.clone(),
             history_budget_bytes,
+            appearance,
         );
         // Replay the saved screen so a restored pane shows its prior content.
         if let Some(screen) = initial {
@@ -490,23 +442,22 @@ impl Pane {
             }
         }
 
-        let mut writer = pair.master.take_writer()?;
-        thread::spawn(move || {
-            while let Ok(action) = input_rx.recv() {
-                if write_input_action(writer.as_mut(), action).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let reader = pair.master.try_clone_reader()?;
-        let eng = engine.clone();
-        let tx = app_tx.clone();
         let data_pending = Arc::new(AtomicBool::new(false));
-        let pending = data_pending.clone();
         let content_revision = Arc::new(AtomicU64::new(0));
-        let revision = content_revision.clone();
-        thread::spawn(move || read_loop(id, reader, eng, tx, pending, revision));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if let Err(error) = io::start(
+            id,
+            pair.master.as_ref(),
+            input_rx,
+            engine.clone(),
+            app_tx.clone(),
+            data_pending.clone(),
+            content_revision.clone(),
+            cancelled.clone(),
+        ) {
+            terminate_spawned_child(child.as_mut());
+            return Err(error.into());
+        }
 
         // Reap the child so we notice it exiting. The shared reaper sets the
         // exit flag *before* the event goes out, so by the time the loop closes
@@ -516,10 +467,14 @@ impl Pane {
         register_child_reaper(id, child, child_exited.clone(), app_tx);
 
         Ok(Pane {
+            id,
             engine,
             child_pid: Arc::new(AtomicU32::new(child_pid)),
             terminal_runtime: Arc::new(Mutex::new(Some(terminal_runtime))),
             content_revision,
+            observed_title_generation: AtomicU64::new(0),
+            #[cfg(windows)]
+            history_maintenance_pending: AtomicBool::new(true),
             master: Arc::new(Mutex::new(Some(pair.master))),
             input_tx,
             cwd,
@@ -527,7 +482,7 @@ impl Pane {
             data_pending,
             child_exited,
             size: Arc::new(Mutex::new((cols, rows))),
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled,
         })
     }
 
@@ -548,38 +503,25 @@ impl Pane {
         command: String,
         extra_env: &[(String, String)],
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Pane {
         // Everything a caller can observe before the child exists: the engine
         // (pane.read, detection, rendering) and the input queue.
-        let (input_tx, input_rx) = mpsc::channel::<InputAction>();
+        let (input_tx, input_rx) = io::input_channel();
+        input_tx.set_notice(id, app_tx.clone());
         let engine = create_engine(
             VtEngineKind::configured(),
             cols,
             rows,
             input_tx.clone(),
             history_budget_bytes,
+            appearance,
         );
         if let Some(screen) = initial {
             if let Ok(mut engine) = engine.lock() {
                 engine.advance(screen.as_bytes());
             }
         }
-
-        // The writer thread starts with the pane and blocks until the spawn
-        // worker hands over the PTY writer; bytes sent meanwhile queue in
-        // input_rx. On every failure path the worker drops `master_tx`, so
-        // this thread exits with the queue instead of leaking.
-        let (master_tx, master_rx) = mpsc::channel::<Box<dyn Write + Send>>();
-        thread::spawn(move || {
-            let Ok(mut writer) = master_rx.recv() else {
-                return;
-            };
-            while let Ok(action) = input_rx.recv() {
-                if write_input_action(writer.as_mut(), action).is_err() {
-                    break;
-                }
-            }
-        });
 
         let child_pid = Arc::new(AtomicU32::new(0));
         let terminal_runtime: Arc<Mutex<Option<TerminalRuntime>>> = Arc::new(Mutex::new(None));
@@ -704,28 +646,25 @@ impl Pane {
                     });
                 }
 
-                let writer = match pair.master.take_writer() {
-                    Ok(writer) => writer,
-                    Err(_) => {
-                        let _ = tx.send(AppEvent::PtyExit(id));
-                        return;
-                    }
-                };
-                let reader = match pair.master.try_clone_reader() {
-                    Ok(reader) => reader,
-                    Err(_) => return fail(),
-                };
-                *master.lock().unwrap_or_else(|p| p.into_inner()) = Some(pair.master);
-                let read_tx = tx.clone();
-                let ready_tx = tx.clone();
-                thread::spawn(move || {
-                    read_loop(id, reader, engine, read_tx, data_pending, content_revision)
-                });
-                register_child_reaper(id, child, child_exited, tx.clone());
-
-                if master_tx.send(writer).is_err() {
+                if io::start(
+                    id,
+                    pair.master.as_ref(),
+                    input_rx,
+                    engine,
+                    tx.clone(),
+                    data_pending,
+                    content_revision,
+                    cancelled.clone(),
+                )
+                .is_err()
+                {
+                    terminate_spawned_child(child.as_mut());
+                    child_exited.store(true, Ordering::SeqCst);
                     return fail();
                 }
+                *master.lock().unwrap_or_else(|p| p.into_inner()) = Some(pair.master);
+                let ready_tx = tx.clone();
+                register_child_reaper(id, child, child_exited, tx.clone());
                 *terminal_runtime
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
@@ -738,10 +677,14 @@ impl Pane {
         drop(worker);
 
         Pane {
+            id,
             engine,
             child_pid,
             terminal_runtime,
             content_revision,
+            observed_title_generation: AtomicU64::new(0),
+            #[cfg(windows)]
+            history_maintenance_pending: AtomicBool::new(true),
             master,
             input_tx,
             cwd,
@@ -760,9 +703,18 @@ impl Pane {
         let pending = self
             .data_pending
             .swap(false, std::sync::atomic::Ordering::AcqRel);
-        if pending {
+        // Unix compacts on a bounded deadline in its existing descriptor
+        // actor. Doing it here would repeatedly pack and re-inflate rows while
+        // one large output stream is still being consumed. The blocking
+        // Windows reader has no such event-loop deadline, so retain its
+        // coalesced app-boundary maintenance.
+        #[cfg(windows)]
+        if pending || self.history_maintenance_pending.load(Ordering::Acquire) {
             if let Ok(mut engine) = self.engine.lock() {
-                engine.finish_output_batch();
+                let more =
+                    engine.finish_output_batch_step() || engine.history_maintenance_pending();
+                self.history_maintenance_pending
+                    .store(more, Ordering::Release);
             }
         }
         pending
@@ -772,7 +724,38 @@ impl Pane {
     /// consuming it. The server uses this to arm the 100 ms fallback only while
     /// a pane actually has pending bytes, instead of waking forever when idle.
     pub fn has_data_pending(&self) -> bool {
+        #[cfg(windows)]
+        if self.history_maintenance_pending.load(Ordering::Acquire) {
+            return true;
+        }
         self.data_pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn has_history_maintenance(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.history_maintenance_pending.load(Ordering::Acquire)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Coalesce title-only presentation with the existing PTY output wake.
+    pub(crate) fn take_title_change(&self) -> bool {
+        let Ok(engine) = self.engine.lock() else {
+            return false;
+        };
+        let generation = engine.title_generation();
+        self.observed_title_generation
+            .swap(generation, Ordering::AcqRel)
+            != generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_data_pending_for_test(&self) {
+        self.data_pending.store(true, Ordering::Release);
     }
 
     /// Clear the pending-output coalescing flag so the reader's next
@@ -795,13 +778,31 @@ impl Pane {
         self.rearm_pty_notify();
         self.input_tx
             .send(InputAction::Bytes(bytes.to_vec()))
-            .map_err(|_| "target pane closed before input was delivered".to_string())
+            .map_err(str::to_string)
+    }
+
+    pub(crate) fn acknowledge_input_rejection(&self) {
+        self.input_tx.acknowledge_rejection();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_input_sender_for_test(&mut self, sender: Sender<InputAction>) {
+        self.input_tx = sender.into();
     }
 
     /// Enqueue one atomic submitted-text action for protocol consumers. Queue
     /// success is dispatch evidence only; it does not claim the child consumed
     /// or acted on the bytes.
     pub fn try_submit_text(&self, text: &str) -> Result<(), String> {
+        self.try_submit_text_with_settle(text, std::time::Duration::from_millis(30))
+    }
+
+    /// Admit paste and Enter together, preserving the caller's settle policy.
+    pub(crate) fn try_submit_text_with_settle(
+        &self,
+        text: &str,
+        settle: std::time::Duration,
+    ) -> Result<(), String> {
         let bracketed = self
             .engine
             .lock()
@@ -815,9 +816,9 @@ impl Pane {
                 } else {
                     wrap_paste(text, bracketed)
                 },
-                settle: std::time::Duration::from_millis(30),
+                settle,
             })
-            .map_err(|_| "target pane closed before input was queued".to_string())
+            .map_err(str::to_string)
     }
 
     pub fn terminal_runtime(&self) -> Option<TerminalRuntime> {
@@ -839,25 +840,19 @@ impl Pane {
         self.child_exited.load(Ordering::SeqCst)
     }
 
-    /// Enqueue `bytes` after `delay`, off-thread. Used to follow a pasted prompt
-    /// with a submit key once the child has ingested the paste: an agent's input
-    /// widget needs the paste to land before the Enter, or the Enter is swallowed
-    /// into the paste. The cloned input channel keeps the writer alive for exactly
-    /// this one deferred send.
-    pub fn send_after(&self, bytes: Vec<u8>, delay: std::time::Duration) {
-        let tx = self.input_tx.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(delay);
-            let _ = tx.send(InputAction::Bytes(bytes));
-        });
+    fn wake_history_maintenance(&self) {
+        self.input_tx.wake();
+        #[cfg(windows)]
+        self.history_maintenance_pending
+            .store(true, Ordering::Release);
     }
 
-    /// Apply a new per-pane history memory budget (Settings → Layout). Shrinks
-    /// retained history immediately when lowered.
+    /// Apply a new per-pane history memory budget, shrinking retention immediately.
     pub fn set_history_budget(&self, bytes: usize) {
         if let Ok(mut e) = self.engine.lock() {
             e.set_history_budget(bytes);
         }
+        self.wake_history_maintenance();
     }
 
     /// Scroll this pane's scrollback viewport `delta` lines (positive = up into
@@ -890,7 +885,20 @@ impl Pane {
             .unwrap_or(0)
     }
 
+    /// `(visible_top, retained_rows)` from one terminal snapshot. Mouse
+    /// selection uses this to bind a screen row to retained history without an
+    /// output burst changing the history length between separate reads.
+    pub(crate) fn retained_viewport(&self) -> Option<(usize, usize)> {
+        self.engine.lock().ok().map(|engine| {
+            (
+                engine.history_len().saturating_sub(engine.scroll_offset()),
+                engine.retained_row_count(),
+            )
+        })
+    }
+
     /// Read one retained row without allocating every other row.
+    #[cfg(test)]
     pub fn retained_row_text(&self, index: usize) -> Option<String> {
         self.engine.lock().ok()?.retained_row_text(index)
     }
@@ -904,6 +912,44 @@ impl Pane {
             let row_count = engine.retained_row_count();
             engine.for_each_retained_row(&mut |index, line| f(index, history, row_count, line));
         }
+    }
+
+    /// Extract retained terminal text by grid cell rather than string index.
+    /// This keeps wide glyphs and combining sequences aligned with selection
+    /// highlights.
+    pub fn retained_selection_text(
+        &self,
+        range: ((usize, usize), (usize, usize)),
+    ) -> Option<String> {
+        self.engine.lock().ok()?.retained_selection_text(range)
+    }
+
+    /// Extract a selection expressed in the currently visible viewport. This
+    /// is the fallback when a mouse press could not snapshot retained-history
+    /// coordinates, and still preserves terminal cell semantics for Unicode.
+    pub fn visible_selection_text(
+        &self,
+        ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
+    ) -> Option<String> {
+        let engine = self.engine.lock().ok()?;
+        let visible_top = engine.history_len().saturating_sub(engine.scroll_offset());
+        let row_count = engine.retained_row_count();
+        let last_row = row_count.checked_sub(1)?;
+        engine.retained_selection_text((
+            (
+                visible_top.saturating_add(start_row).min(last_row),
+                start_col,
+            ),
+            (visible_top.saturating_add(end_row).min(last_row), end_col),
+        ))
+    }
+
+    /// Cell geometry used by keyboard copy-mode navigation.
+    pub fn retained_row_layout(
+        &self,
+        index: usize,
+    ) -> Option<crate::terminal::vt::RetainedRowLayout> {
+        self.engine.lock().ok()?.retained_row_layout(index)
     }
 
     /// Jump the scrollback viewport so the row `offset` lines above the live
@@ -935,6 +981,12 @@ impl Pane {
                 cache_bytes: None,
                 compacted_rows: None,
                 allocated_cells: None,
+                packed_blocks: None,
+                packed_bytes: None,
+                packed_rows: None,
+                dense_row_bytes: None,
+                row_descriptor_bytes: None,
+                allocation_count: None,
                 exact_bytes: false,
             },
         )
@@ -954,6 +1006,14 @@ impl Pane {
             .lock()
             .map(|e| e.application_cursor())
             .unwrap_or(false)
+    }
+
+    /// Input modes read together under one engine lock.
+    pub fn key_encoding_modes(&self) -> (bool, bool) {
+        self.engine
+            .lock()
+            .map(|e| (e.application_cursor(), e.disambiguate_escape_codes()))
+            .unwrap_or((false, false))
     }
 
     /// `(mouse_report, sgr)` — whether the child tracks the mouse, and whether
@@ -994,12 +1054,7 @@ impl Pane {
     /// dropped file's path as literal text instead of attaching the file, and
     /// vim auto-indents pasted code. Re-wrapping restores the distinction.
     pub fn send_paste(&self, text: &str) {
-        let bracketed = self
-            .engine
-            .lock()
-            .map(|e| e.bracketed_paste())
-            .unwrap_or(false);
-        self.send(&wrap_paste(text, bracketed));
+        let _ = self.try_send_paste(text);
     }
 
     pub fn try_send_paste(&self, text: &str) -> Result<(), String> {
@@ -1039,6 +1094,15 @@ impl Pane {
         if let Ok(mut e) = self.engine.lock() {
             e.resize(cols, rows);
         }
+        self.wake_history_maintenance();
+        crate::logging::event(
+            crate::logging::EventKind::PtyResize,
+            &[
+                crate::logging::Field::PaneId(u64::from(self.id.0)),
+                crate::logging::Field::Cols(u64::from(cols)),
+                crate::logging::Field::Rows(u64::from(rows)),
+            ],
+        );
         true
     }
 
@@ -1087,26 +1151,44 @@ fn apply_pane_env(
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("LUVUS_ENV", "1");
-    cmd.env("BOHAY_ENV", "1");
     cmd.env("LUVUS_PANE_ID", id.0.to_string());
-    cmd.env("BOHAY_PANE_ID", id.0.to_string());
     if let Some(sock) = crate::ipc::api::socket_path_env() {
         cmd.env("LUVUS_SOCKET_PATH", &sock);
-        cmd.env("BOHAY_SOCKET_PATH", sock);
+    }
+    if let Some(address) = crate::ipc::api::socket_address_env() {
+        cmd.env("LUVUS_API_ADDRESS", &address);
     }
     if let Some(name) = crate::session::active_name() {
         cmd.env(crate::session::SESSION_ENV_VAR, &name);
-        cmd.env(crate::session::LEGACY_SESSION_ENV_VAR, name);
     }
     // This session's exact binary, so an agent can use `$LUVUS_BIN_PATH`
     // instead of a `luvus` on PATH that may be an older install with a
     // different CLI (skill/binary skew). Matches the server it talks to.
     if let Ok(exe) = std::env::current_exe() {
         cmd.env("LUVUS_BIN_PATH", &exe);
-        cmd.env("BOHAY_BIN_PATH", exe);
+        if let Some(path) = path_with_server_binary(&exe, std::env::var_os("PATH")) {
+            cmd.env("PATH", path);
+        }
     }
 }
 
+/// Put the server's own executable directory first without dropping the
+/// user's existing command search path. A debug server therefore gives its
+/// panes the debug CLI, while an installed server gives them that exact
+/// release CLI. `split_paths`/`join_paths` keep this portable across Unix and
+/// Windows and avoid shell-specific quoting.
+fn path_with_server_binary(exe: &Path, inherited: Option<OsString>) -> Option<OsString> {
+    let binary_dir = exe.parent()?;
+    let mut entries = vec![binary_dir.to_path_buf()];
+    if let Some(inherited) = inherited {
+        entries.extend(
+            std::env::split_paths(&inherited).filter(|entry| entry.as_path() != binary_dir),
+        );
+    }
+    std::env::join_paths(entries).ok()
+}
+
+#[cfg(windows)]
 fn read_loop(
     id: PaneId,
     mut reader: Box<dyn Read + Send>,
@@ -1115,7 +1197,7 @@ fn read_loop(
     data_pending: Arc<AtomicBool>,
     content_revision: Arc<AtomicU64>,
 ) {
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; PTY_READ_BUFFER_BYTES];
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => {
@@ -1145,6 +1227,35 @@ mod reap_tests {
     use super::*;
     use crate::ids::PaneId;
 
+    struct SignalMaskGuard(libc::sigset_t);
+
+    impl SignalMaskGuard {
+        fn block_sigchld() -> Self {
+            unsafe {
+                let mut sigchld: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut sigchld);
+                libc::sigaddset(&mut sigchld, libc::SIGCHLD);
+                let mut previous: libc::sigset_t = std::mem::zeroed();
+                let result = libc::pthread_sigmask(libc::SIG_BLOCK, &sigchld, &mut previous);
+                assert_eq!(
+                    result,
+                    0,
+                    "block SIGCHLD: {}",
+                    std::io::Error::from_raw_os_error(result)
+                );
+                Self(previous)
+            }
+        }
+    }
+
+    impl Drop for SignalMaskGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut());
+            }
+        }
+    }
+
     fn alive(pid: u32) -> bool {
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
@@ -1171,6 +1282,7 @@ mod reap_tests {
             None,
             "/bin/sh",
             500,
+            PaneAppearance::default(),
         )
         .expect("spawn")
     }
@@ -1182,6 +1294,129 @@ mod reap_tests {
         assert_eq!(CHILD_REAPER_STARTS.load(Ordering::SeqCst), 1);
         drop(first);
         drop(second);
+    }
+    #[test]
+    fn inherited_blocked_sigchld_still_reaps_natural_exit() {
+        const CHILD_RUN: &str = "LUVUS_BLOCKED_SIGCHLD_REAPER_TEST";
+        if std::env::var_os(CHILD_RUN).is_none() {
+            // Run this case alone in a fresh process so SIGCHLD is blocked
+            // before the process-wide OnceLock and handler are first touched.
+            // The child's process-global handler disappears with the child, so
+            // parallel tests cannot observe a temporary action.
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "terminal::pty::reap_tests::inherited_blocked_sigchld_still_reaps_natural_exit",
+                    "--nocapture",
+                ])
+                .env(CHILD_RUN, "1")
+                .output()
+                .expect("run isolated blocked-SIGCHLD test");
+            assert!(
+                output.status.success(),
+                "isolated blocked-SIGCHLD test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let _mask = SignalMaskGuard::block_sigchld();
+        assert_eq!(
+            CHILD_REAPER_STARTS.load(Ordering::SeqCst),
+            0,
+            "the isolated process must block SIGCHLD before reaper setup"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let id = PaneId::alloc();
+        let pane = Pane::spawn(
+            id,
+            80,
+            24,
+            std::env::temp_dir(),
+            tx,
+            None,
+            "/bin/sh",
+            500,
+            PaneAppearance::default(),
+        )
+        .expect("spawn shell with inherited blocked SIGCHLD");
+        let pid = pane.child_pid.load(Ordering::SeqCst);
+        assert_ne!(pid, 0);
+
+        // Let the reaper reach its infinite poll before the child exits. With
+        // SIGCHLD inherited as blocked, the old design stranded here forever.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        pane.send(b"exit\r");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pane.child_exited.load(Ordering::SeqCst) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "natural child exit never woke the reaper"
+            );
+            // The PTY actor may publish PtyExit before the child waiter. Keep
+            // waiting until the reaper sets child_exited, which is the behavior
+            // this blocked-signal regression is proving.
+            match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(50))) {
+                Ok(AppEvent::PtyExit(exited)) if exited == id => {}
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("natural child exit never woke the reaper: {error}"),
+            }
+        }
+        assert!(wait_gone(pid), "naturally exited child was not reaped");
+        drop(pane);
+    }
+
+    #[test]
+    fn dropping_a_live_child_is_still_reaped() {
+        let pane = spawn_sh();
+        let pid = pane.child_pid.load(Ordering::SeqCst);
+        assert_ne!(pid, 0);
+        assert!(alive(pid));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(pane);
+        assert!(wait_gone(pid), "exit is still reaped without a timer");
+    }
+
+    #[test]
+    fn quiet_pty_history_and_resize_finish_incremental_maintenance() {
+        // Packing is what this waits on, and only the alacritty engine packs.
+        if crate::terminal::vt::unsupported_by_selected_engine("cold-history packing") {
+            return;
+        }
+        let _env = crate::persist::test_env("pty-history-maintenance");
+        let (tx, rx) = mpsc::channel();
+        let mut pane = Pane::spawn_command(
+            PaneId::alloc(), 80, 24, std::env::current_dir().unwrap(), tx,
+            &["/bin/sh".into(), "-c".into(), "i=0; while [ $i -lt 2024 ]; do printf 'row %s cafe\n' \"$i\"; i=$((i + 1)); done; sleep 10".into()],
+            &[], 16 * 1024 * 1024, PaneAppearance::default(),
+        ).unwrap();
+        for resize in [false, true] {
+            if resize {
+                assert!(pane.resize(90, 24));
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let complete = {
+                    let engine = pane.engine.lock().unwrap();
+                    let metrics = engine.history_metrics();
+                    metrics.retained_rows >= 1900
+                        && metrics.packed_rows.unwrap_or(0) > 1700
+                        && !engine.history_maintenance_pending()
+                };
+                if complete {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "quiet packing must finish without another output event"
+                );
+                let _ = rx.recv_timeout(std::time::Duration::from_millis(10));
+            }
+        }
     }
 
     /// A deferred pane (docs/82) is fully usable before its shell exists:
@@ -1197,9 +1432,11 @@ mod reap_tests {
             80,
             24,
             std::env::temp_dir(),
+            &[],
             tx,
             "/bin/sh",
             500,
+            PaneAppearance::default(),
         );
         assert_eq!(
             pane.child_pid.load(Ordering::SeqCst),
@@ -1245,6 +1482,7 @@ mod reap_tests {
             Some("RESTORED-SCREEN\r\n"),
             "/bin/sh",
             500,
+            PaneAppearance::default(),
         );
         assert!(
             pane.engine
@@ -1272,6 +1510,7 @@ mod reap_tests {
             None,
             "/bin/sh",
             500,
+            PaneAppearance::default(),
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1293,6 +1532,48 @@ mod reap_tests {
         assert_ne!(pane.child_pid.load(Ordering::SeqCst), 0);
     }
 
+    /// A deferred pane (the split path) whose primary cwd was deleted after it
+    /// was resolved must retry its fallback chain rather than dying. Regression
+    /// for the split that silently disappeared when its cwd vanished in the race
+    /// window before the fork: same shape as the restore-path test above, but
+    /// driven through `spawn_deferred`.
+    #[test]
+    fn deferred_pane_retries_a_fallback_cwd() {
+        let (tx, rx) = mpsc::channel();
+        let id = PaneId::alloc();
+        let fallback = std::env::temp_dir();
+        let missing = fallback.join(format!("luvus-missing-cwd-{}", std::process::id()));
+        let pane = Pane::spawn_deferred(
+            id,
+            80,
+            24,
+            missing,
+            std::slice::from_ref(&fallback),
+            tx,
+            "/bin/sh",
+            500,
+            PaneAppearance::default(),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "the fallback PTY never became ready");
+            match rx.recv_timeout(remaining) {
+                Ok(AppEvent::PtyReady { id: ready, cwd }) if ready == id => {
+                    assert_eq!(cwd, fallback);
+                    break;
+                }
+                Ok(AppEvent::PtyExit(exited)) if exited == id => {
+                    panic!("the deferred pane closed instead of using its fallback cwd")
+                }
+                Ok(_) => {}
+                Err(error) => panic!("the fallback PTY never became ready: {error}"),
+            }
+        }
+        assert_ne!(pane.child_pid.load(Ordering::SeqCst), 0);
+    }
+
     /// A resize issued before the deferred fork must still reach the child:
     /// the worker opens the PTY at the latest recorded size (docs/82).
     #[test]
@@ -1303,9 +1584,11 @@ mod reap_tests {
             80,
             24,
             std::env::temp_dir(),
+            &[],
             tx,
             "/bin/sh",
             500,
+            PaneAppearance::default(),
         );
         // The spawn has not forked yet: this is the racing resize.
         assert!(pane.resize(132, 40));
@@ -1367,7 +1650,10 @@ mod reap_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{child_poll_finished, wrap_paste, write_input_action, InputAction};
+    use super::{
+        child_poll_finished, path_with_server_binary, wrap_paste, write_input_action, InputAction,
+    };
+    use std::path::PathBuf;
     use std::time::Duration;
 
     #[test]
@@ -1423,5 +1709,28 @@ mod tests {
         assert!(child_poll_finished(Ok(Some(
             portable_pty::ExitStatus::with_exit_code(0)
         ))));
+    }
+
+    #[test]
+    fn pane_path_pins_the_owning_server_binary_portably() {
+        let binary_dir = std::env::temp_dir().join("luvus exact binary");
+        let exe = binary_dir.join(if cfg!(windows) { "luvus.exe" } else { "luvus" });
+        let other = std::env::temp_dir().join("other tools");
+        let inherited = std::env::join_paths([other.clone(), binary_dir.clone()]).unwrap();
+
+        let path = path_with_server_binary(&exe, Some(inherited)).expect("portable PATH");
+        let entries = std::env::split_paths(&path).collect::<Vec<PathBuf>>();
+        assert_eq!(entries.first(), Some(&binary_dir));
+        assert_eq!(
+            entries.iter().filter(|entry| *entry == &binary_dir).count(),
+            1
+        );
+        assert!(entries.contains(&other), "the user's PATH is preserved");
+
+        let only = path_with_server_binary(&exe, None).expect("PATH without an inherited value");
+        assert_eq!(
+            std::env::split_paths(&only).collect::<Vec<_>>(),
+            [binary_dir]
+        );
     }
 }

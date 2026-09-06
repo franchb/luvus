@@ -1,6 +1,6 @@
 ---
 title: Browsing & Opening Files
-description: A file tree in the sidebar, a fast read-only viewer, and opening any file straight into vim, nano, or your own $EDITOR.
+description: Browse files, open a real terminal editor, and explicitly preview Markdown and Mermaid as native terminal documents.
 ---
 
 An agent edits files and you want to *see* them, without leaving luvus and
@@ -10,9 +10,12 @@ in a real editor.
 
 ## The FILES dock
 
-Press **`Ctrl+Space e`** to show or hide it, or place it from
-**Settings → Layout** like any other dock. It follows the active workspace, so
-switching projects re-roots the tree.
+Press **`Ctrl+Space e`** to show the FILES dock if necessary and focus its tree.
+Use `Esc` or `q` to return to the terminal pane, and `Ctrl+Space b` to hide or
+restore the sidebars. You can place the dock from **Settings → Layout** like any
+other dock. It follows the active workspace, so switching projects re-roots the
+tree while preserving that project's cursor, scroll position, and expanded
+folders.
 
 The global fuzzy finder can search every eligible file name and relative path
 in the workspace even when its folder has never been expanded here. Press
@@ -30,20 +33,76 @@ conflicted, mint for renamed, with a letter badge and a mark on any folder that
 contains changes. Files created outside luvus, by an agent or a command in a
 pane, show up on their own within a couple of seconds.
 
-**Right-click a row** for New File, New Folder, Rename, Copy Path, and Delete
-(Delete always asks first).
+**Right-click a row**, or press `a` on the keyboard-selected row, for New File,
+New Folder, Rename, Copy Path, Insert Path, Open as Workspace (folders), and
+Delete (Delete always asks first).
+
+Create, rename, and confirmed delete run on the shared filesystem worker. The
+prompt closes after admission and a pending message appears; completion or failure
+is reported afterward. Only one mutation is admitted at a time. If the queue is
+busy, the prompt remains available to retry. Confirmation is the cancellation
+boundary: an admitted operation is not cancelled by switching workspace or closing
+a modal. Its result never closes a newer prompt or reveals a path in a different
+workspace. New-file creation cannot truncate an existing entry, and deleting a
+directory symlink removes the link rather than its target.
+
+| Key | FILES tree action |
+|---|---|
+| `j` / `k`, `↓` / `↑` | next / previous row |
+| `h` / `←` | collapse a folder, or move to its parent |
+| `l` / `→` | expand a folder, or move to its first child |
+| `Enter` | follow **File click behavior** for the selected row |
+| `Shift+Enter` | open the selected file in a permanent read-only pane |
+| `a` | open the selected row's actions; use arrows or `j` / `k` and `Enter` |
+| `g` / `G`, Home / End | first / last row |
+| PageUp / PageDown | move one visible page |
+| `Esc` / `q` | return input to the terminal pane |
+
+**Insert Path** types the selected file or folder's absolute path into the pane
+you were already working in, without submitting it — so you can name a file in a command or an
+agent prompt without leaving the keyboard to type the path out. Focusing the
+FILES tree does not replace the underlying terminal-pane focus, so the path
+lands where you were typing. It is inserted only; Luvus never sends Enter, and
+never adds an `@` or any other prefix, so the syntax stays yours. A path is left
+uninserted if there is no focused live terminal pane (for example, when a
+read-only file view is focused), if the absolute path contains a control
+character such as a line break, tab, or Escape — which would submit or alter
+your terminal input — or if it is not valid UTF-8, since the text Luvus could
+insert would not be the path you clicked.
 
 ## Opening a file
 
 | Gesture | What happens |
 |---|---|
-| **Click** | opens using your default (see below) |
-| **Shift+click** | always opens the **read-only viewer** in a pane beside the focus |
-| **Right-click** | pick per file: read-only, or any editor you have installed |
+| **Click** | **previews** the file by default, or opens a tab — see [What a click does](#what-a-click-does) |
+| **Shift+click** | when forwarded by the terminal, opens the **read-only viewer** in a *permanent* pane beside the focus |
+| **Right-click** | **Open in Tab**, open in an installed editor, or explicitly preview Markdown/Mermaid |
 
-Shift+click is the fixed "just let me look at this" gesture. It stays read-only
-no matter what you set as the default, which is what you want when you are
-reading a file next to a running agent.
+Shift+click is an optional "keep this one open" shortcut. It stays read-only
+whatever the two settings below say, and unlike a preview it is never reused for
+the next file you click. Some terminals reserve Shift-modified mouse input for
+native text selection, so the gesture may not reach Luvus; use **Open in Tab**
+from the right-click menu when you need a permanent view.
+
+## What a click does
+
+**Settings → General → "File click behavior"** has two choices:
+
+| Choice | What a plain click does |
+|---|---|
+| **Preview** (default) | reuses **one** read-only preview pane in the workspace |
+| **Open in tab** | gives the file a whole tab, using **Open files with** |
+
+Preview is the browsing gesture. Click `a.rs` and the preview shows `a.rs`;
+click `b.rs` and the *same* pane shows `b.rs`; click `a.rs` again and it comes
+back. Reading through twenty files leaves you with one pane, not twenty tabs.
+A preview click always uses Luvus's own read-only viewer — it never starts,
+replaces, or quits an editor, so an agent working next door is never disturbed.
+
+Choose **Open in tab** for the behavior clicks had before this setting existed:
+every plain click opens a tab and follows your **Open files with** choice, which
+means it can launch your terminal editor. Clicking a file that already has a tab
+focuses that tab.
 
 ## The read-only viewer
 
@@ -62,9 +121,13 @@ file an agent is editing stays current in front of you.
 | `w` | toggle soft wrap |
 | `/`, then `n` / `N` | search, next / previous match |
 | `y` or `c` | copy the whole file |
-| `q` / `Esc` | close |
+| `x` / `q` / `Esc` | close |
 
-Dragging across the text selects and copies it, the same as in any pane.
+Dragging across the text selects and copies it, the same as in any pane. Visual
+wraps rejoin into their original source line while real file line breaks remain.
+Double-click a word, path, or URL to copy and highlight that token. This works
+whether the read-only file viewer is opened as the reused preview, a permanent
+pane, or a tab.
 
 ## Opening in vim, nano, or your editor
 
@@ -76,17 +139,66 @@ An editor opens in a **new tab** at full width, running as a real terminal
 program. The tab is titled after the editor, and when you quit the editor the
 tab closes itself.
 
-To set what a plain click does, go to **Settings → General → "Open files with"**
-and step through the choices with `‹ ›`: **read-only** (the default) or any
-detected editor. To override it for one file, right-click that file and pick
-from the menu.
+To set which viewer opens a file, go to **Settings → General → "Open files
+with"** and step through the choices with `‹ ›`: **read-only** (the default) or
+any detected editor. That choice applies when a click opens a **tab** — in
+Preview mode a click always uses the built-in viewer. To override it for one
+file, right-click that file and pick from the menu.
 
 If you set an editor and later uninstall it, luvus falls back to the read-only
 viewer rather than doing nothing.
 
+## Markdown and Mermaid previews
+
+Markdown never overrides your file settings. A normal click, **Open in Tab**,
+or editor action still behaves exactly as described above. For `.md` and
+`.markdown`, right-click the file and choose **Open Markdown Preview** to open a
+dedicated native preview tab. Right-click a tracked source/editor pane for that
+file and the same action appears immediately below **Rename**; from there it
+opens a sibling preview pane without replacing or stopping the editor.
+
+Standalone `.mermaid` and `.mmd` files use **Open Mermaid Preview** in the same places.
+Fenced `mermaid` blocks inside Markdown and standalone Mermaid previews share
+one bounded renderer. Flowcharts/graphs and sequence diagrams render as
+deterministic Unicode terminal text; unsupported or malformed syntax shows its
+original source instead of hiding content. `.mdx` is not treated as a preview
+format.
+
+Flowcharts preserve ranked boxes, decision shapes, branches, merges, cycles,
+and labelled routes. The layout follows `TB`, `BT`, `LR`, or `RL` when it fits
+the pane. A very narrow pane uses a compact text outline instead of clipping the
+diagram into unreadable fragments.
+
+Test fixtures for both preview types live in `examples/preview/`: open
+`README.md` for the Markdown showcase, `workflow.mmd` for a flowchart, and
+`agent-session.mermaid` for a sequence diagram.
+
+Previews are offline and terminal-native: they do not use a browser, execute
+HTML or Mermaid directives, load linked assets, or make network requests.
+Parsing and width-specific layout run only after an explicit preview action and
+off the app loop. Closing the last preview releases its parsed document and
+bounded layout cache.
+
+| Key | Preview action |
+|---|---|
+| `j` / `k`, `↓` / `↑` | rendered row down / up |
+| `d` / `u`, Space / PageUp | half page or page navigation |
+| `g` / `G` | top / bottom |
+| `/`, then `n` / `N` | search rendered text |
+| `y` or `c` | copy the canonical raw source |
+| Ctrl/Cmd+click a link | open an HTTP(S) URL or an existing linked file |
+| `q` / `Esc` | close (or clear an active search first) |
+
+Dragging copies the rendered terminal text without turning visual wraps into
+newlines. Real document line breaks remain. Double-clicking copies and
+highlights the rendered word, path, or URL under the pointer. Reopening the same
+file and preview kind focuses the existing preview in that placement rather
+than creating a duplicate. Open the file normally whenever you want its raw
+source or editor.
+
 ## What this is not
 
-The file viewer does not do syntax coloring. To review staged and working-tree
+The source file viewer does not do syntax coloring. To review staged and working-tree
 patches with split or stack layouts and local notes, switch the dock to
 [DIFF](/docs/guides/diff/). Use the [git tab](/docs/guides/git/) for branches,
 commits, pull requests, issues, and commit flow. To edit, open the file in an

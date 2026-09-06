@@ -3,103 +3,155 @@
 
 use super::*;
 use crate::files::view_text_w;
+use unicode_width::UnicodeWidthChar;
 
-/// Last selectable character index on a retained row. Empty rows still expose
-/// one visual cell so vertical navigation and a blank-line selection are stable.
-fn copy_line_end(line: Option<&str>) -> usize {
-    line.map(|line| line.chars().count().saturating_sub(1))
-        .unwrap_or(0)
+/// Keep the command overlay useful when a just-spawned child has not appeared
+/// in the platform process snapshot yet. The OS tree remains authoritative for
+/// every process it reports; the pane's launch command only fills a missing
+/// depth-zero root.
+fn ensure_process_tree_root(
+    pid: u32,
+    command: &str,
+    mut processes: Vec<crate::platform::ProcInfo>,
+) -> Vec<crate::platform::ProcInfo> {
+    if pid != 0
+        && !command.trim().is_empty()
+        && !processes
+            .iter()
+            .any(|process| process.pid == pid && process.depth == 0)
+    {
+        processes.insert(
+            0,
+            crate::platform::ProcInfo {
+                pid,
+                depth: 0,
+                command: command.to_string(),
+            },
+        );
+    }
+    processes
 }
 
 fn copy_word_forward(
     row_count: usize,
-    mut row_text: impl FnMut(usize) -> Option<String>,
+    mut row_layout: impl FnMut(usize) -> Option<crate::terminal::vt::RetainedRowLayout>,
     mut at: (usize, usize),
 ) -> (usize, usize) {
     while at.0 < row_count {
-        let line = row_text(at.0).unwrap_or_default();
-        let chars: Vec<char> = line.chars().collect();
-        while at.1 < chars.len() && !chars[at.1].is_whitespace() {
+        let Some(layout) = row_layout(at.0) else {
+            at.0 += 1;
+            at.1 = 0;
+            continue;
+        };
+        let last = layout.last_column();
+        while at.1 <= last && !layout.is_whitespace(at.1) {
             at.1 += 1;
         }
-        while at.1 < chars.len() && chars[at.1].is_whitespace() {
+        while at.1 <= last && layout.is_whitespace(at.1) {
             at.1 += 1;
         }
-        if at.1 < chars.len() {
+        if at.1 <= last {
             return at;
         }
         at.0 += 1;
         at.1 = 0;
     }
     let last = row_count.saturating_sub(1);
-    let line = row_text(last);
-    (last, copy_line_end(line.as_deref()))
+    let column = row_layout(last).map_or(0, |layout| layout.last_column());
+    (last, column)
+}
+
+/// Vim `E`: the last cell of the word under the cursor, or of the next word when
+/// the cursor already sits on that cell.
+///
+/// Copy mode's whole word family is whitespace-delimited, with no `iskeyword`
+/// notion: `w` is really vim's `W`, `B` is vim's `b`, and both `e` and `E` land
+/// here. One rule for all three, so they always agree on where a word ends.
+///
+/// Row-local on purpose: a retained row is a physical terminal row, and `w`
+/// already treats a row edge as a break, so the trailing scan never crosses one.
+fn copy_word_end(
+    row_count: usize,
+    mut row_layout: impl FnMut(usize) -> Option<crate::terminal::vt::RetainedRowLayout>,
+    at: (usize, usize),
+) -> (usize, usize) {
+    // Step off the current cell first, so pressing `e` again advances instead of
+    // parking on the same word end.
+    let mut cur = (at.0, at.1.saturating_add(1));
+    while cur.0 < row_count {
+        let Some(layout) = row_layout(cur.0) else {
+            cur = (cur.0 + 1, 0);
+            continue;
+        };
+        let last = layout.last_column();
+        if cur.1 > last || layout.is_whitespace(cur.1) {
+            if cur.1 >= last {
+                cur = (cur.0 + 1, 0);
+            } else {
+                cur.1 += 1;
+            }
+            continue;
+        }
+        while cur.1 < last && !layout.is_whitespace(cur.1 + 1) {
+            cur.1 += 1;
+        }
+        return cur;
+    }
+    let last = row_count.saturating_sub(1);
+    (
+        last,
+        row_layout(last).map_or(0, |layout| layout.last_column()),
+    )
 }
 
 fn copy_word_back(
-    mut row_text: impl FnMut(usize) -> Option<String>,
+    mut row_layout: impl FnMut(usize) -> Option<crate::terminal::vt::RetainedRowLayout>,
     mut at: (usize, usize),
 ) -> (usize, usize) {
     loop {
-        let line = row_text(at.0).unwrap_or_default();
-        let chars: Vec<char> = line.chars().collect();
-        let mut col = at.1.min(chars.len());
-        while col > 0 && chars[col - 1].is_whitespace() {
+        let Some(layout) = row_layout(at.0) else {
+            if at.0 == 0 {
+                return (0, 0);
+            }
+            at.0 -= 1;
+            at.1 = row_layout(at.0).map_or(0, |layout| layout.last_column().saturating_add(1));
+            continue;
+        };
+        let mut col = at.1.min(layout.last_column().saturating_add(1));
+        while col > 0 && layout.is_whitespace(col - 1) {
             col -= 1;
         }
-        while col > 0 && !chars[col - 1].is_whitespace() {
+        while col > 0 && !layout.is_whitespace(col - 1) {
             col -= 1;
         }
-        if col > 0 || !chars.is_empty() {
-            return (at.0, col.min(copy_line_end(Some(&line))));
+        if col > 0 || layout.has_text() {
+            return (at.0, col.min(layout.last_column()));
         }
         if at.0 == 0 {
             return (0, 0);
         }
         at.0 -= 1;
-        let line = row_text(at.0);
-        at.1 = copy_line_end(line.as_deref()).saturating_add(1);
+        at.1 = row_layout(at.0).map_or(0, |layout| layout.last_column().saturating_add(1));
     }
 }
 
-fn append_selected_row(
-    out: &mut String,
-    appended: &mut bool,
-    line: &str,
-    row: usize,
-    ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
-) {
-    let chars: Vec<char> = line.chars().collect();
-    // A drag that starts beside the visible text must not grow leftward on
-    // middle rows: that otherwise copies the blank cell between the pane edge
-    // and every list item. Keep the drag's leftmost edge for those rows while
-    // preserving the exact start point on the first row.
-    let middle_left = start_col.min(end_col);
-    let left = if row == start_row {
-        start_col
-    } else {
-        middle_left
-    };
-    let right = if row == end_row {
-        end_col
-    } else {
-        chars.len().saturating_sub(1)
-    };
-    if *appended {
-        out.push('\n');
+/// Apply a copy-mode motion `count` times, stopping as soon as it stops moving.
+/// A motion that has saturated at the edge of retained history must not keep
+/// re-scanning the grid: every word step takes the engine lock the PTY reader
+/// also needs, so `9999e` near the bottom has to cost one step, not 9999.
+fn repeat_motion(
+    count: usize,
+    mut at: (usize, usize),
+    mut step: impl FnMut((usize, usize)) -> (usize, usize),
+) -> (usize, usize) {
+    for _ in 0..count {
+        let next = step(at);
+        if next == at {
+            break;
+        }
+        at = next;
     }
-    *appended = true;
-    if left <= right {
-        out.extend(
-            chars
-                .iter()
-                .skip(left)
-                .take(right.saturating_sub(left).saturating_add(1)),
-        );
-    }
-    while out.ends_with(' ') {
-        out.pop();
-    }
+    at
 }
 
 fn finish_selected_text(mut out: String) -> Option<String> {
@@ -108,51 +160,145 @@ fn finish_selected_text(mut out: String) -> Option<String> {
     (!out.trim().is_empty()).then_some(out)
 }
 
-/// Drop the one blank cell which can sit between a pane edge and uniformly
-/// aligned prose. This is deliberately narrow: code with its usual two- or
-/// four-space indentation is retained exactly as selected.
-fn strip_uniform_single_cell_margin(text: String) -> String {
-    let mut saw_text = false;
-    let uniform_margin = text.lines().filter(|line| !line.is_empty()).all(|line| {
-        saw_text = true;
-        line.starts_with(' ') && !line.starts_with("  ")
-    });
-    if !saw_text || !uniform_margin {
-        return text;
+/// A second left click within this of the first, on the same cell (±1), is a
+/// double-click. Terminals emit no native double-click, so luvus times it.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+const COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(1400);
+
+/// A run of grid cells on one row: `(row, start_col, end_col)`, `end_col`
+/// exclusive — the same shape as [`crate::links::Link::spans`].
+type CellSpan = (u16, u16, u16);
+
+/// Convert rendered native-view rows to the same cell-aligned representation
+/// used by terminal token lookup. This runs only on a double-click, never on a
+/// frame, and keeps wide and zero-width characters from shifting the clicked
+/// cell away from its word.
+fn align_plain_rows(rows: Vec<String>) -> crate::terminal::vt::AlignedRows {
+    let mut aligned = crate::terminal::vt::AlignedRows::new(rows.len());
+    for (row, line) in rows.into_iter().enumerate() {
+        let mut column = 0u16;
+        let mut base: Option<(char, usize, Vec<char>)> = None;
+        let flush = |base: &mut Option<(char, usize, Vec<char>)>,
+                     aligned: &mut crate::terminal::vt::AlignedRows,
+                     column: &mut u16| {
+            let Some((character, width, zero_width)) = base.take() else {
+                return;
+            };
+            aligned.push_cell(
+                row as u16,
+                *column,
+                character,
+                (!zero_width.is_empty()).then_some(zero_width.as_slice()),
+            );
+            for offset in 1..width {
+                aligned.push_cell(
+                    row as u16,
+                    column.saturating_add(offset as u16),
+                    crate::terminal::vt::ALIGNED_WIDE_CELL,
+                    None,
+                );
+            }
+            *column = column.saturating_add(width as u16);
+        };
+
+        for character in line.chars() {
+            let width = character.width().unwrap_or(0);
+            if width == 0 {
+                if let Some((_, _, zero_width)) = base.as_mut() {
+                    zero_width.push(character);
+                }
+                continue;
+            }
+            flush(&mut base, &mut aligned, &mut column);
+            base = Some((character, width, Vec::new()));
+        }
+        flush(&mut base, &mut aligned, &mut column);
     }
-    text.lines()
-        .map(|line| line.strip_prefix(' ').unwrap_or(line))
-        .collect::<Vec<_>>()
-        .join("\n")
+    aligned
 }
 
-/// Extract a terminal selection from logical rows. Both mouse and keyboard
-/// selection feed this function, keeping clipboard semantics aligned.
-fn extract_rows_selection(
-    rows: &[String],
-    ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
-) -> Option<String> {
-    if start_row > end_row || start_row >= rows.len() {
+/// The whitespace-delimited word covering grid cell (`col`, `row`), and the one
+/// span it occupies. `None` on a whitespace or out-of-range cell. Wide-cell
+/// continuation markers participate in the word boundary and are removed from
+/// the copied text, so either cell of `你` selects the same complete word. Char
+/// indices are the columns, matching how [`crate::links::link_at`] and the grid
+/// renderer address cells.
+fn word_at_grid(
+    rows: &crate::terminal::vt::AlignedRows,
+    col: u16,
+    row: u16,
+) -> Option<(String, Vec<CellSpan>)> {
+    let line = rows.rows().get(row as usize)?;
+    let chars: Vec<char> = line.chars().collect();
+    let idx = col as usize;
+    if idx >= chars.len() || chars[idx].is_whitespace() {
         return None;
     }
-    let mut out = String::new();
-    let last_row = end_row.min(rows.len().saturating_sub(1));
-    let mut appended = false;
-    for (row, line) in rows
-        .iter()
-        .enumerate()
-        .take(last_row.saturating_add(1))
-        .skip(start_row)
-    {
-        append_selected_row(
-            &mut out,
-            &mut appended,
-            line,
-            row,
-            ((start_row, start_col), (end_row, end_col)),
-        );
+    let mut lo = idx;
+    while lo > 0 && !chars[lo - 1].is_whitespace() {
+        lo -= 1;
     }
-    finish_selected_text(out)
+    let mut hi = idx + 1;
+    while hi < chars.len() && !chars[hi].is_whitespace() {
+        hi += 1;
+    }
+    let mut text = String::new();
+    for (offset, character) in chars[lo..hi].iter().copied().enumerate() {
+        if character == crate::terminal::vt::ALIGNED_WIDE_CELL {
+            continue;
+        }
+        text.push(character);
+        text.extend(rows.zero_width_at(row, (lo + offset) as u16));
+    }
+    if text.is_empty() {
+        return None;
+    }
+    Some((text, vec![(row, lo as u16, hi as u16)]))
+}
+
+/// The URL or path covering a grid cell, reconstructed from its original
+/// graphemes. Link parsing remains deliberately ASCII-only for opening
+/// untrusted terminal output, but copying must also keep Unicode path segments.
+/// A searchable projection maps Unicode letters/digits and wide-cell
+/// continuations to ASCII while retaining one character per physical cell;
+/// the returned spans are then used to recover the exact displayed text.
+fn copy_link_at_grid(
+    rows: &crate::terminal::vt::AlignedRows,
+    col: u16,
+    row: u16,
+) -> Option<(String, Vec<CellSpan>)> {
+    let searchable: Vec<String> = rows
+        .rows()
+        .iter()
+        .map(|line| {
+            line.chars()
+                .map(|character| {
+                    if character == crate::terminal::vt::ALIGNED_WIDE_CELL
+                        || (!character.is_ascii() && character.is_alphanumeric())
+                    {
+                        'x'
+                    } else {
+                        character
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let link = crate::links::link_at(&searchable, col, row)?;
+
+    let mut text = String::new();
+    for (span_row, start, end) in &link.spans {
+        let line: Vec<char> = rows.rows().get(*span_row as usize)?.chars().collect();
+        for column in *start..*end {
+            let character = *line.get(column as usize)?;
+            if character == crate::terminal::vt::ALIGNED_WIDE_CELL {
+                continue;
+            }
+            text.push(character);
+            text.extend(rows.zero_width_at(*span_row, column));
+        }
+    }
+    (!text.is_empty()).then_some((text, link.spans))
 }
 
 impl App {
@@ -181,6 +327,9 @@ impl App {
             let _ = req.reply.send(response);
             return true;
         }
+        if req.method == "task.merge" {
+            return self.handle_task_merge_request(req);
+        }
         let Some(req) = self.prepare_files_api(req) else {
             return true;
         };
@@ -188,7 +337,56 @@ impl App {
             return true;
         };
         let response = self.handle_api(&req);
-        let _ = req.reply.send(response);
+        self.reply_after_automation_save(req, response);
+        true
+    }
+
+    /// Park `task.merge` until its off-loop Git job returns. This preserves the
+    /// ordinary one-request/one-response API while keeping repository work away
+    /// from the single app owner.
+    fn handle_task_merge_request(&mut self, mut req: crate::ipc::api::ApiRequest) -> bool {
+        if self.workspaces.is_empty() {
+            let _ = req.reply.send(
+                json!({"id":req.id,"error":{"code":"no_session","message":"no active session"}})
+                    .to_string(),
+            );
+            return true;
+        }
+        let expected_revision = req
+            .params
+            .as_object_mut()
+            .and_then(|params| params.remove("if_revision"));
+        if let Some(expected) = expected_revision {
+            let actual = crate::ipc::api::current_sequence(&self.events);
+            if expected.as_u64() != Some(actual) {
+                let _ = req.reply.send(
+                    json!({"id":req.id,"error":{"code":"revision_conflict",
+                        "message":"socket state changed before this mutation",
+                        "expected":expected,"actual":actual}})
+                    .to_string(),
+                );
+                return true;
+            }
+        }
+        let Some(id) = req
+            .params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+        else {
+            let _ = req.reply.send(
+                json!({"id":req.id,"error":{"code":"invalid_request","message":"id is required"}})
+                    .to_string(),
+            );
+            return true;
+        };
+        let error_reply = req.reply.clone();
+        let request_id = req.id.clone();
+        if let Err((code, message)) = self.start_task_merge(&id, Some((req.id, req.reply))) {
+            let _ = error_reply
+                .send(json!({"id":request_id,"error":{"code":code,"message":message}}).to_string());
+        }
         true
     }
 
@@ -222,6 +420,9 @@ impl App {
         // off-loop. Apply its completed registry before the empty-workspace guard
         // so the single writer always observes the result.
         let ev = match ev {
+            AppEvent::IoCompleted(completion) => {
+                return completion.apply(self);
+            }
             AppEvent::BackendCreateReady {
                 id,
                 reply,
@@ -241,7 +442,20 @@ impl App {
                 if let Some(pane) = self.panes.get_mut(&id) {
                     pane.cwd = cwd;
                 }
+                self.runtime_cwd_dirty = true;
+                self.runtime_proc_dirty = true;
                 self.register_backend_terminal(id);
+                self.reconcile_durable_active_targets(Some(id));
+                if self.durable_target_requires_readiness_scan(id) {
+                    self.request_proc_scan_if_stale(id);
+                }
+                crate::logging::event(
+                    crate::logging::EventKind::PaneOpen,
+                    &[
+                        crate::logging::Field::PaneId(u64::from(id.0)),
+                        crate::logging::Field::SpawnKind(crate::logging::SpawnKind::Deferred),
+                    ],
+                );
                 return true;
             }
             AppEvent::BackendObserve { params, reply } => {
@@ -253,7 +467,11 @@ impl App {
                 return true;
             }
             AppEvent::ConfigReloaded { id, config, reply } => {
-                let response = match self.apply_socket_config(config) {
+                if self.config_save_pending() {
+                    self.defer_config_reload(id, reply);
+                    return false;
+                }
+                let response = match self.apply_socket_config(*config, None) {
                     Ok(()) => {
                         json!({"id":id,"result":{"type":"config_reloaded","config":self.config}})
                     }
@@ -270,6 +488,10 @@ impl App {
                 reply,
             } => {
                 self.apply_socket_manifests(manifests);
+                crate::logging::event(
+                    crate::logging::EventKind::ManifestReload,
+                    &[crate::logging::Field::Outcome(crate::logging::Outcome::Ok)],
+                );
                 let _ = reply.send(
                     json!({"id":id,"result":{
                         "type":"agent_manifests_reloaded","rules":self.manifests.rule_count()
@@ -303,17 +525,39 @@ impl App {
             AppEvent::SearchHandoffReady { session, result } => {
                 match result {
                     Ok(()) => self.pending_session_switch = Some(session),
-                    Err(error) => self.show_toast(format!("session switch failed: {error}")),
+                    Err(error) => {
+                        log_worker_failed(crate::logging::Worker::Search, "handoff");
+                        self.show_toast(format!("session switch failed: {error}"));
+                    }
                 }
+                return true;
+            }
+            AppEvent::NamedSessionsLoaded { generation, result } => {
+                self.apply_named_sessions_loaded(generation, result);
+                return true;
+            }
+            AppEvent::NamedSessionPrepared {
+                generation,
+                name,
+                result,
+            } => {
+                self.apply_named_session_prepared(generation, name, result);
+                return true;
+            }
+            AppEvent::NamedSessionStopped {
+                generation,
+                name,
+                result,
+            } => {
+                self.apply_named_session_stopped(generation, name, result);
                 return true;
             }
             other => other,
         };
         // Control-API requests and parked `wait.output` replies must be answered
-        // even with no workspace open. A server that has closed its last node
-        // stays alive (docs/43 §3.3), and the methods that reopen one are the
-        // only way back; dropping the reply channel here would leave the caller
-        // reading EOF instead of a `workspace.open` / `server.stop` answer.
+        // even if restore or shell startup left no workspace. Normal close paths
+        // immediately create a neutral home terminal; this guard keeps the
+        // exceptional recovery path from dropping replies or indexing a layout.
         if self.workspaces.is_empty() {
             match ev {
                 AppEvent::ThemeReloaded {
@@ -347,7 +591,7 @@ impl App {
                         return true;
                     }
                     let resp = self.handle_api(&req);
-                    let _ = req.reply.send(resp);
+                    self.reply_after_automation_save(req, resp);
                     return true;
                 }
                 AppEvent::WaitOutput { id, reply, .. } => {
@@ -378,11 +622,37 @@ impl App {
                     );
                     return true;
                 }
-                // Closing the last workspace empties `workspaces` and sets
-                // `should_quit`; the loop drains the rest of the event batch
-                // before it checks that flag, so ignore everything else here
-                // once there's nothing left to act on (`layout()` would
-                // otherwise index an empty `workspaces`).
+                // Integration belongs to the server-owned task ledger, not a
+                // workspace. Settle it even if replacement-pane startup left
+                // the server temporarily without a workspace.
+                AppEvent::TaskMergeFinished {
+                    task,
+                    branch,
+                    previous,
+                    integration_branch,
+                    result,
+                    reply,
+                } => {
+                    self.task_merge_finished(
+                        task,
+                        branch,
+                        previous,
+                        integration_branch,
+                        result,
+                        reply,
+                    );
+                    return true;
+                }
+                // A worker may finish after the previous workspace closes while
+                // replacement shell startup fails. Drop its stale result, but
+                // release the guard so CWD tracking can recover later.
+                AppEvent::CwdScanned { .. } => {
+                    self.cwd_scan_inflight = false;
+                    return false;
+                }
+                // Late pane and worker events may arrive after the final project
+                // closes. If replacement startup failed, ignore them rather than
+                // indexing a layout that does not exist.
                 _ => return false,
             }
         }
@@ -400,21 +670,28 @@ impl App {
                 if self.paste_into_modal(&s) {
                     return true; // the modal buffer changed → redraw
                 }
-                // Otherwise it goes to the focused pane. `send_paste` re-wraps in
-                // the bracketed-paste markers crossterm stripped, so a child that
-                // distinguishes paste from typing (an agent CLI attaching a
-                // dropped file, vim not auto-indenting) still sees a paste.
-                if let Some(p) = self.focused() {
-                    p.scroll_to_bottom(); // pasting is input → snap to live
-                    p.send_paste(&s);
-                }
-                self.mark_user_input(); // so the echo isn't misread as agent work
+                // Otherwise it goes to the focused pane.
+                self.paste_into_focused_pane(&s);
                 false // goes to the pane; its echo (PtyData) renders it
             }
             AppEvent::Resize => {
                 // A resize (or a same-size resize event a terminal emits on a
                 // move/expose) may have damaged the screen — force a full repaint.
                 self.force_redraw = true;
+                true
+            }
+            AppEvent::PtyInputRejected(id) => {
+                crate::logging::event(
+                    crate::logging::EventKind::PtyInputRejected,
+                    &[crate::logging::Field::PaneId(u64::from(id.0))],
+                );
+                if let Some(pane) = self.panes.get(&id) {
+                    pane.acknowledge_input_rejection();
+                    self.show_toast(format!(
+                        "pane {} input queue full: input rejected; wait for the child to read",
+                        id.0
+                    ));
+                }
                 true
             }
             AppEvent::PtyData(id) => {
@@ -426,6 +703,10 @@ impl App {
                     s.last_activity = Instant::now();
                 }
                 self.detection_dirty.insert(id);
+                if self.panes.contains_key(&id) {
+                    self.runtime_cwd_dirty_panes.insert(id);
+                }
+                self.runtime_proc_dirty = true;
                 // A parked `wait.output` for this pane just got new output to
                 // test against — resolve it on the same wake (docs/81).
                 self.check_output_waits(id);
@@ -433,6 +714,14 @@ impl App {
                 true // the pane's screen advanced
             }
             AppEvent::PtyExit(id) => {
+                self.runtime_cwd_dirty_panes.remove(&id);
+                crate::logging::event(
+                    crate::logging::EventKind::PtyExit,
+                    &[
+                        crate::logging::Field::PaneId(u64::from(id.0)),
+                        crate::logging::Field::ExitClass(crate::logging::ExitClass::Unknown),
+                    ],
+                );
                 self.emit_backend_terminal_event(id, "terminal.exited", json!({}));
                 self.close_pane(id);
                 true
@@ -458,15 +747,23 @@ impl App {
             } => {
                 let params = json!({ "pane": pane });
                 match self.resolve_pane(&params) {
-                    Some(id) => {
+                    Ok(Some(id)) => {
                         self.register_output_wait(
                             id, request_id, needle, reply, timeout, cancelled,
                         );
                     }
-                    None => {
+                    Ok(None) => {
                         let _ = reply.send(
                             json!({ "id": request_id, "error": {
                                 "code": "not_found", "message": "pane not found"
+                            }})
+                            .to_string(),
+                        );
+                    }
+                    Err((code, message)) => {
+                        let _ = reply.send(
+                            json!({ "id": request_id, "error": {
+                                "code": code, "message": message
                             }})
                             .to_string(),
                         );
@@ -477,28 +774,39 @@ impl App {
             AppEvent::AgentWait {
                 id: request_id,
                 pane,
-                state,
+                states,
                 reply,
                 timeout,
                 cancelled,
             } => {
                 let params = json!({"pane":pane});
-                match (
-                    self.resolve_pane(&params),
-                    crate::app::dispatch::parse_agent_wait_state(&state),
-                ) {
-                    (Some(id), Some(state)) => {
-                        self.register_agent_wait(id, request_id, state, reply, timeout, cancelled);
+                let parsed_states: Option<Vec<_>> = (!states.is_empty())
+                    .then(|| {
+                        states
+                            .iter()
+                            .map(|state| crate::app::dispatch::parse_agent_wait_state(state))
+                            .collect()
+                    })
+                    .flatten();
+                match (self.resolve_pane(&params), parsed_states) {
+                    (Ok(Some(id)), Some(states)) => {
+                        self.register_agent_wait(id, request_id, states, reply, timeout, cancelled);
                     }
-                    (None, _) => {
+                    (Ok(None), _) => {
                         let _ = reply.send(
                             json!({"id":request_id,"error":{"code":"not_found","message":"pane not found"}})
                                 .to_string(),
                         );
                     }
-                    (_, None) => {
+                    (Ok(Some(_)), None) => {
                         let _ = reply.send(
-                            json!({"id":request_id,"error":{"code":"invalid_request","message":"status must be idle, working, blocked, or done"}})
+                            json!({"id":request_id,"error":{"code":"invalid_request","message":"statuses must be a non-empty set of idle, working, blocked, or done"}})
+                                .to_string(),
+                        );
+                    }
+                    (Err((code, message)), _) => {
+                        let _ = reply.send(
+                            json!({"id":request_id,"error":{"code":code,"message":message}})
                                 .to_string(),
                         );
                     }
@@ -529,6 +837,9 @@ impl App {
                 out,
                 err,
             } => {
+                if code != Some(0) {
+                    log_worker_failed(crate::logging::Worker::Module, "exit");
+                }
                 self.module_command_finished(log_id, code, out, err);
                 true
             }
@@ -538,13 +849,61 @@ impl App {
             // Process-table churn is only a cache update, but a confirmed agent
             // exit changes the visible sidebar immediately. `apply_proc_scan`
             // distinguishes those cases so the common scan stays render-free.
-            AppEvent::ProcScanned(found) => self.apply_proc_scan(found),
-            // Mission Control usage (docs/54, MC-2): swap in the fresh cache; the
-            // mission render blits it. Repaint so a visible mission tab updates.
-            AppEvent::UsageScanned { usage, mtimes } => {
+            AppEvent::ProcScanned(found) => {
+                let scan_succeeded = found.is_some();
+                let changed = self.apply_proc_scan(found);
+                if scan_succeeded {
+                    changed | self.reconcile_durable_active_targets(None)
+                } else {
+                    changed
+                }
+            }
+            AppEvent::CwdScanned {
+                panes,
+                branches,
+                workspace_candidates,
+            } => self.apply_cwd_scan(panes, branches, workspace_candidates),
+            // Mission Control usage (docs/54, MC-2): replace a fleet scan or
+            // merge only the keys covered by a workspace scan. Repaint so a
+            // visible mission tab updates.
+            AppEvent::UsageScanned {
+                scope,
+                scanned,
+                mut usage,
+                mut mtimes,
+                report_owned,
+            } => {
                 self.usage_scan_inflight = false;
-                self.agent_usage = usage;
-                self.usage_mtimes = mtimes;
+                self.prune_reported_usage();
+                let excluded = report_owned
+                    .into_iter()
+                    .chain(self.reported_usage.keys().cloned())
+                    .collect::<std::collections::HashSet<_>>();
+                usage.retain(|key, _| !excluded.contains(key));
+                mtimes.retain(|key, _| !excluded.contains(key));
+                if scope == crate::mission::MissionScope::All {
+                    let mut next = usage;
+                    for key in self.reported_usage.keys() {
+                        if let Some(value) = self.agent_usage.get(key) {
+                            next.insert(key.clone(), value.clone());
+                        }
+                    }
+                    self.agent_usage = next;
+                    self.usage_mtimes = mtimes;
+                } else {
+                    for key in scanned {
+                        if !self.reported_usage.contains_key(&key) {
+                            self.agent_usage.remove(&key);
+                        }
+                        self.usage_mtimes.remove(&key);
+                    }
+                    self.agent_usage.extend(
+                        usage
+                            .into_iter()
+                            .filter(|(key, _)| !self.reported_usage.contains_key(key)),
+                    );
+                    self.usage_mtimes.extend(mtimes);
+                }
                 // Fleet burn rate: change in total cost since the last scan (docs/54).
                 let total: f64 = self.agent_usage.values().filter_map(|u| u.cost).sum();
                 let now = std::time::Instant::now();
@@ -567,44 +926,119 @@ impl App {
                 visible_root,
                 result,
             } => {
+                if result.is_err() {
+                    log_worker_failed(crate::logging::Worker::Diff, "scan");
+                }
                 let changed = self.apply_diff_status(token, visible_root, result);
                 self.finish_pending_diff_api();
                 changed
             }
-            AppEvent::DiffLoaded { id, token, result } => self.apply_diff_loaded(id, token, result),
+            AppEvent::DiffLoaded { id, token, result } => {
+                if result.is_err() {
+                    log_worker_failed(crate::logging::Worker::Diff, "load");
+                }
+                self.apply_diff_loaded(id, token, result)
+            }
             AppEvent::DiffNotesLoaded { review_id, result } => {
+                if result.is_err() {
+                    log_worker_failed(crate::logging::Worker::Diff, "notes");
+                }
                 self.apply_diff_notes_loaded(review_id, result)
             }
-            AppEvent::DiffNoteSaved { note, result } => self.apply_diff_note_saved(note, result),
-            AppEvent::DiffNoteRemoved { id, result } => self.apply_diff_note_removed(id, result),
+            AppEvent::DiffNoteSaved { note, result } => {
+                if result.is_err() {
+                    log_worker_failed(crate::logging::Worker::Diff, "note_save");
+                }
+                self.apply_diff_note_saved(note, result)
+            }
+            AppEvent::DiffNoteRemoved { id, result } => {
+                if result.is_err() {
+                    log_worker_failed(crate::logging::Worker::Diff, "note_remove");
+                }
+                self.apply_diff_note_removed(id, result)
+            }
             AppEvent::DiffProgressSaved { result } => {
                 if let Err(error) = result {
+                    log_worker_failed(crate::logging::Worker::Diff, "progress_save");
                     self.show_toast(format!("review progress not saved: {error}"));
                 }
                 true
             }
-            AppEvent::FileChanges { id, changes } => {
-                if let Some(crate::app::ViewKind::File(v)) = self.views.get_mut(&id) {
-                    v.changes = changes;
-                    true
-                } else {
-                    false // the view leaf closed before the diff landed
+            AppEvent::FileChanges {
+                id,
+                path,
+                token,
+                changes,
+            } => {
+                match self.views.get_mut(&id) {
+                    // Markers from a superseded read would tint the wrong lines
+                    // — and they are the later half of their worker, so they are
+                    // the likelier half to arrive stale.
+                    Some(crate::app::ViewKind::File(v))
+                        if v.read_token == token && v.path == path =>
+                    {
+                        v.changes = changes;
+                        true
+                    }
+                    // The leaf closed, became a diff, or has asked for a newer
+                    // read since: drop it.
+                    _ => false,
                 }
             }
-            AppEvent::FileRead { id, load } => {
-                if let Some(crate::app::ViewKind::File(v)) = self.views.get_mut(&id) {
-                    v.apply(load);
-                    true
-                } else {
-                    false // the view leaf was closed before its read landed
+            AppEvent::FileRead {
+                id,
+                path,
+                token,
+                load,
+            } => {
+                match self.views.get_mut(&id) {
+                    // Only the newest read the leaf asked for may apply. One
+                    // preview browsing A → B → A finishes those reads in any
+                    // order, and the first A read landing last would quietly
+                    // restore contents from before the file changed.
+                    Some(crate::app::ViewKind::File(v))
+                        if v.read_token == token && v.path == path =>
+                    {
+                        v.apply(load);
+                        true
+                    }
+                    // The leaf closed, became a diff, or has asked for a newer
+                    // read since: drop it.
+                    _ => false,
                 }
             }
+            AppEvent::PreviewRead {
+                id,
+                path,
+                kind,
+                token,
+                load,
+            } => self.apply_preview_read(id, path, kind, token, load),
+            AppEvent::PreviewLayout {
+                id,
+                path,
+                kind,
+                token,
+                key,
+                layout,
+            } => self.apply_preview_layout(id, path, kind, token, key, layout),
             AppEvent::GitData { view, payload } => {
                 self.git_data(view, payload);
                 true
             }
             AppEvent::TaskGateFinished { task, code, out } => {
                 self.task_gate_finished(&task, code, out);
+                true
+            }
+            AppEvent::TaskMergeFinished {
+                task,
+                branch,
+                previous,
+                integration_branch,
+                result,
+                reply,
+            } => {
+                self.task_merge_finished(task, branch, previous, integration_branch, result, reply);
                 true
             }
             AppEvent::UpdateAvailable(version) => {
@@ -633,9 +1067,11 @@ impl App {
             // Handled by the server loop; never reaches here at runtime.
             AppEvent::ClientConnected { .. }
             | AppEvent::ClientDetach { .. }
-            | AppEvent::ClientInput { .. } => false,
+            | AppEvent::ClientInput { .. }
+            | AppEvent::Shutdown => false,
             // Consumed by the pre-dispatch worker-result branch above.
-            AppEvent::ThemeUninstalled { .. }
+            AppEvent::IoCompleted(_)
+            | AppEvent::ThemeUninstalled { .. }
             | AppEvent::ConfigReloaded { .. }
             | AppEvent::ManifestsReloaded { .. }
             | AppEvent::BackendCreateReady { .. }
@@ -645,6 +1081,11 @@ impl App {
             | AppEvent::SearchResults { .. }
             | AppEvent::SearchFederatedResults { .. }
             | AppEvent::SearchHandoffReady { .. } => unreachable!(),
+            AppEvent::NamedSessionsLoaded { .. }
+            | AppEvent::NamedSessionPrepared { .. }
+            | AppEvent::NamedSessionStopped { .. } => {
+                unreachable!()
+            }
         }
     }
 
@@ -680,6 +1121,9 @@ impl App {
     /// all single-line fields.
     fn paste_into_modal(&mut self, s: &str) -> bool {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        if self.named_session_menu.is_some() {
+            return self.paste_named_session_prompt(s);
+        }
         if self.module_setting_edit.is_some() {
             for character in s.chars().filter(|character| !character.is_control()) {
                 self.handle_module_setting_key(KeyEvent::new(
@@ -772,6 +1216,28 @@ impl App {
         let hit = |rect: Rect| c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom();
         let first = |rects: &[Rect]| rects.iter().copied().find(|rect| hit(*rect));
 
+        if self.named_session_menu.is_some() {
+            if self.session_menu.is_some() {
+                if let Some(menu) = &self.session_menu {
+                    if let Some(rect) = menu.items.iter().map(|(_, r)| *r).find(|r| hit(*r)) {
+                        return Some(rect);
+                    }
+                }
+                // Hover stays inside the Stop menu while it is open — do not
+                // highlight the session list behind it when moving the mouse.
+                return self.named_session_close_rect.filter(|rect| hit(*rect));
+            }
+            return self
+                .named_session_close_rect
+                .filter(|rect| hit(*rect))
+                .or_else(|| {
+                    self.named_session_row_rects
+                        .iter()
+                        .map(|(_, rect)| *rect)
+                        .find(|rect| hit(*rect))
+                });
+        }
+
         if self.changelog_open {
             return self
                 .changelog_check_rect
@@ -827,6 +1293,20 @@ impl App {
                 .map(|(_, rect)| *rect)
                 .find(|rect| hit(*rect));
         }
+        if let Some(menu) = &self.orch_menu {
+            return menu
+                .items
+                .iter()
+                .map(|(_, rect)| *rect)
+                .find(|rect| hit(*rect));
+        }
+        if self.orch_form.is_some() || self.orch_start.is_some() || self.orch_detail.is_some() {
+            return self
+                .orch_hits
+                .iter()
+                .map(|(_, rect)| *rect)
+                .find(|rect| hit(*rect));
+        }
         if let Some(menu) = &self.dock_menu {
             return first(&menu.rects);
         }
@@ -850,6 +1330,7 @@ impl App {
                 .iter()
                 .map(|(_, rect)| *rect)
                 .chain(self.switcher_scope_rects.iter().map(|(_, rect)| *rect))
+                .chain(self.switcher_close_rect)
                 .find(|rect| hit(*rect));
         }
 
@@ -874,7 +1355,10 @@ impl App {
             .chain(self.diff_row_rects.iter().map(|(_, rect)| *rect))
             .chain(
                 [
+                    self.named_session_button_rect,
                     self.switcher_button_rect,
+                    self.mobile_pane_prev_rect,
+                    self.mobile_pane_next_rect,
                     self.sidebar_toggle_rect,
                     self.right_sidebar_toggle_rect,
                     self.version_rect,
@@ -910,12 +1394,141 @@ impl App {
 
     fn apply_mouse(&mut self, m: ratatui::crossterm::event::MouseEvent) {
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        // A new primary-button gesture replaces any copied mouse selection,
+        // even when a modal, menu, resize handle, or child TUI claims the press
+        // below. This keeps the delayed highlight from surviving an unrelated
+        // click through one of those early-return paths.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.clear_selection();
+        }
         // Track the cursor for hover affordances (e.g. the session delete ✕).
         self.hover = Some((m.column, m.row));
-        // Any click dismisses the help overlay.
+        if let MouseEventKind::Down(_) = m.kind {
+            self.menu_scroll.press(m.column, m.row);
+        }
+        // The shortcut reference scrolls with the wheel; a click dismisses it.
         if self.help_open {
-            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-                self.help_open = false;
+            match m.kind {
+                MouseEventKind::ScrollUp => {
+                    self.help_scroll = self.help_scroll.min(self.help_scroll_max).saturating_sub(2)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(2).min(self.help_scroll_max)
+                }
+                MouseEventKind::Down(MouseButton::Left) => self.help_open = false,
+                _ => {}
+            }
+            return;
+        }
+        if self.named_session_menu.is_some() {
+            // Context menu on a session row owns the click first.
+            if self.session_menu.is_some() {
+                match m.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        // If this press scrolls the session popup, keep the
+                        // context menu under the cursor like other menus.
+                        if self.menu_scroll.wheel(m.column, m.row, 0) {
+                            // no-op: just update hover for menu_scroll internal state
+                        }
+                        self.session_menu_click(m.column, m.row);
+                    }
+                    MouseEventKind::Down(MouseButton::Right) => {
+                        // Re-anchor: right-clicking another row moves the menu, like Agents.
+                        if let Some(idx) = self
+                            .named_session_row_rects
+                            .iter()
+                            .find(|(_, r)| {
+                                m.column >= r.x
+                                    && m.column < r.right()
+                                    && m.row >= r.y
+                                    && m.row < r.bottom()
+                            })
+                            .map(|(i, _)| *i)
+                        {
+                            if idx != 0 {
+                                // Keep `menu` bound here so `menu.preparing` is in scope.
+                                // The previous `.and_then(|menu| menu.rows.get(..))` moves
+                                // `menu` into the closure, so a naive `&& !menu.preparing`
+                                // at the row check would not compile.
+                                if let Some(menu) = self.named_session_menu.as_ref() {
+                                    if let Some(row) = menu.rows.get(idx - 1) {
+                                        if row.running && !row.current && !menu.preparing {
+                                            self.open_session_menu(
+                                                row.name.clone(),
+                                                m.column,
+                                                m.row,
+                                                row.running,
+                                                row.current,
+                                            );
+                                        } else {
+                                            self.session_menu = None;
+                                        }
+                                    } else {
+                                        self.session_menu = None;
+                                    }
+                                } else {
+                                    self.session_menu = None;
+                                }
+                            } else {
+                                self.session_menu = None;
+                            }
+                        } else if !self.session_menu.as_ref().is_some_and(|menu| {
+                            menu.items.iter().any(|(_, r)| {
+                                m.column >= r.x
+                                    && m.column < r.right()
+                                    && m.row >= r.y
+                                    && m.row < r.bottom()
+                            })
+                        }) {
+                            self.session_menu = None;
+                        }
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let _ = self.menu_scroll.wheel(m.column, m.row, 0);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.named_session_click(m.column, m.row)
+                }
+                MouseEventKind::Down(MouseButton::Right) => {
+                    // Right-click on a row → open Stop menu for running sessions only.
+                    if let Some(idx) = self
+                        .named_session_row_rects
+                        .iter()
+                        .find(|(_, r)| {
+                            m.column >= r.x
+                                && m.column < r.right()
+                                && m.row >= r.y
+                                && m.row < r.bottom()
+                        })
+                        .map(|(i, _)| *i)
+                    {
+                        if idx != 0 {
+                            // Same reason as the guard above: bind `menu` first so
+                            // `!menu.preparing` is available (`.and_then` would hide it).
+                            if let Some(menu) = self.named_session_menu.as_ref() {
+                                if let Some(row) = menu.rows.get(idx - 1) {
+                                    if row.running && !row.current && !menu.preparing {
+                                        self.open_session_menu(
+                                            row.name.clone(),
+                                            m.column,
+                                            m.row,
+                                            row.running,
+                                            row.current,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp => self.move_named_session_cursor(-1),
+                MouseEventKind::ScrollDown => self.move_named_session_cursor(1),
+                _ => {}
             }
             return;
         }
@@ -1021,13 +1634,30 @@ impl App {
             }
             return;
         }
-        // The board's start-worker picker / task detail own the mouse while
-        // open: a click dismisses them, the wheel scrolls the detail.
-        if self.orch_start.is_some() || self.orch_detail.is_some() {
+        // ORCH overlays own the mouse. Visible controls act through the same
+        // board methods as keyboard input; clicks elsewhere never fall through
+        // to the dashboard behind the modal.
+        if self.orch_form.is_some() || self.orch_start.is_some() || self.orch_detail.is_some() {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    self.orch_start = None;
-                    self.orch_detail = None;
+                    let hit = self
+                        .orch_hits
+                        .iter()
+                        .find(|(_, rect)| {
+                            m.column >= rect.x
+                                && m.column < rect.right()
+                                && m.row >= rect.y
+                                && m.row < rect.bottom()
+                        })
+                        .map(|(hit, _)| hit.clone());
+                    if let Some(hit) = hit {
+                        self.orch_activate_hit(hit);
+                    } else if self.orch_form.is_some() || self.orch_detail.is_some() {
+                        // Match Settings and the folder picker: the modal
+                        // surface is inert, while its dimmed backdrop cancels.
+                        self.orch_form = None;
+                        self.orch_detail = None;
+                    }
                 }
                 MouseEventKind::ScrollUp if self.orch_detail.is_some() => {
                     self.orch_detail_scroll = self.orch_detail_scroll.saturating_sub(2)
@@ -1080,6 +1710,20 @@ impl App {
             }
             return;
         }
+        // A context menu taller than the space it has scrolls under the wheel:
+        // menus are mouse-only, so this is the only way to reach a row that does
+        // not fit. Only a popup actually under the cursor takes the event, so the
+        // wheel goes on doing what it did before everywhere else.
+        if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown = m.kind {
+            let delta = if matches!(m.kind, MouseEventKind::ScrollUp) {
+                -1
+            } else {
+                1
+            };
+            if self.menu_scroll.wheel(m.column, m.row, delta) {
+                return;
+            }
+        }
         // The tab context menu owns the mouse while open.
         if self.tab_menu.is_some() {
             if let MouseEventKind::Down(_) = m.kind {
@@ -1122,6 +1766,12 @@ impl App {
             }
             return;
         }
+        if self.orch_menu.is_some() {
+            if let MouseEventKind::Down(_) = m.kind {
+                self.orch_menu_click(m.column, m.row);
+            }
+            return;
+        }
         // A module dock row's menu (docs/52) owns the mouse while open.
         if self.dock_menu.is_some() {
             if let MouseEventKind::Down(_) = m.kind {
@@ -1158,7 +1808,7 @@ impl App {
             }
             return;
         }
-        // Tapping the compact-mode `≡` button opens the switcher.
+        // Tapping the mobile MENU button opens the full-screen navigator.
         if let (MouseEventKind::Down(MouseButton::Left), Some(r)) =
             (m.kind, self.switcher_button_rect)
         {
@@ -1166,6 +1816,27 @@ impl App {
                 self.open_switcher();
                 return;
             }
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            let hit = |rect: Rect| {
+                m.column >= rect.x
+                    && m.column < rect.right()
+                    && m.row >= rect.y
+                    && m.row < rect.bottom()
+            };
+            if self.mobile_pane_prev_rect.is_some_and(hit) {
+                self.cycle_pane(-1);
+                return;
+            }
+            if self.mobile_pane_next_rect.is_some_and(hit) {
+                self.cycle_pane(1);
+                return;
+            }
+        }
+        // The complete two-row mobile header is chrome. Only MENU acts; every
+        // other header tap is consumed instead of leaking into a mouse-aware PTY.
+        if self.compact && m.row < self.last_pane_area.y {
+            return;
         }
         // Text-input modals: only the ⏎/esc footer buttons respond to the mouse;
         // any other click is swallowed (the centered modal owns the screen).
@@ -1193,6 +1864,35 @@ impl App {
             }
             return;
         }
+        // Pointer interaction outside the FILES dock returns keyboard input to
+        // the pane or control the user actually clicked. A click inside keeps
+        // the tree focus and its cursor intact.
+        if matches!(m.kind, MouseEventKind::Down(_)) && self.files_focused {
+            let inside_files = m.column >= self.files_area.x
+                && m.column < self.files_area.right()
+                && m.row >= self.files_area.y
+                && m.row < self.files_area.bottom();
+            if !inside_files {
+                self.files_focused = false;
+            }
+        }
+        // WORKSPACES/AGENTS keyboard ownership follows the same rule as FILES:
+        // a pointer press outside the focused list returns input to the pane.
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            let area = match self.sidebar_focus {
+                Some(SidebarListFocus::Workspaces) => Some(self.workspaces_area),
+                Some(SidebarListFocus::Agents) => Some(self.agents_area),
+                None => None,
+            };
+            if area.is_some_and(|area| {
+                m.column < area.x
+                    || m.column >= area.right()
+                    || m.row < area.y
+                    || m.row >= area.bottom()
+            }) {
+                self.sidebar_focus = None;
+            }
+        }
         // Bar actions and the read-only overflow popup own their rendered
         // rectangles. This sits below every modal guard: while a modal is open,
         // it owns the screen and a click must never invoke a hidden bar action.
@@ -1207,8 +1907,8 @@ impl App {
         // highlight (docs/27, RESIZE-4), plus the sidebar edge seam (docs/29).
         self.update_hover_divider(m.column, m.row);
         self.update_hover_sidebar(m.column, m.row);
-        // Right-click a pane tab, WORKSPACES row, agent, file, dock row, or pane
-        // to open the matching context menu.
+        // Right-click a pane tab, WORKSPACES row, live/scheduled agent, ORCH
+        // row, file, dock row, or pane to open the matching context menu.
         if let MouseEventKind::Down(MouseButton::Right) = m.kind {
             let (c, r) = (m.column, m.row);
             let hit =
@@ -1219,12 +1919,42 @@ impl App {
                 self.open_ws_menu(*i, c, r);
             } else if let Some((id, _)) = self.agent_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_agent_menu(AgentTarget::Live(*id), c, r); // live agent → Close
+            } else if let Some((id, _)) = self.automation_rects.iter().find(|(_, rect)| hit(*rect))
+            {
+                let id = id.clone();
+                if let Some(pane) = self.automation_live_pane(&id) {
+                    self.open_agent_menu(AgentTarget::Live(pane), c, r);
+                } else {
+                    self.open_agent_menu(AgentTarget::Automation(id), c, r);
+                }
             } else if let Some((i, _)) = self.session_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_agent_menu(AgentTarget::Session(*i), c, r); // session → Resume/Close
             } else if let Some((row, _)) = self.diff_row_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_diff_menu(*row, c, r);
             } else if let Some((i, _)) = self.file_tree_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_file_menu(*i, c, r); // FILES-dock row → new/rename/delete (docs/38)
+            } else if let Some(automation) =
+                self.orch_hits
+                    .iter()
+                    .find_map(|(target, rect)| match target {
+                        OrchHit::Automation(automation) if hit(*rect) => Some(automation.clone()),
+                        _ => None,
+                    })
+            {
+                if let Some(pane) = self.automation_live_pane(&automation) {
+                    self.open_agent_menu(AgentTarget::Live(pane), c, r);
+                } else {
+                    self.open_agent_menu(AgentTarget::Automation(automation), c, r);
+                }
+            } else if let Some((task, _)) =
+                self.orch_hits
+                    .iter()
+                    .find_map(|(target, rect)| match target {
+                        OrchHit::Task(task) if hit(*rect) => Some((task.clone(), *rect)),
+                        _ => None,
+                    })
+            {
+                self.open_orch_menu(&task, c, r);
             } else if let Some((dock, row_i, _)) = self
                 .module_dock_rects
                 .iter()
@@ -1263,11 +1993,39 @@ impl App {
         // ── pane text selection: drag to select, release auto-copies (OSC 52) ──
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // A sidebar-edge drag (docs/29) claims the press first: its seam is
-                // the sidebar's own `│` column (never a pane), and its neighbour is
-                // only grabbed when it isn't pane content, so this can't swallow a
-                // click meant for a pane or a mouse-tracking agent.
+                // Native document links are exact rendered rectangles and only
+                // activate through an explicit Ctrl/Cmd click. Claim that
+                // gesture before resize or terminal forwarding can reinterpret
+                // it; ordinary clicks remain text selection.
+                if m.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+                {
+                    let preview_link = self
+                        .preview_link_rects
+                        .iter()
+                        .find(|(_, _, rect)| {
+                            m.column >= rect.x
+                                && m.column < rect.right()
+                                && m.row >= rect.y
+                                && m.row < rect.bottom()
+                        })
+                        .map(|(pane, target, _)| (*pane, target.clone()));
+                    if let Some((pane, target)) = preview_link {
+                        self.activate_preview_link(pane, target);
+                        return;
+                    }
+                }
+                // A sidebar-edge drag (docs/29) claims the press first, but its
+                // target is exactly the sidebar's rendered `│` rule. Pane borders
+                // and content remain available for selection and child mouse input.
                 if self.begin_sidebar_resize(m.column, m.row) {
+                    return;
+                }
+                // Then the horizontal rule between two stacked docks. Checked
+                // after the edge seam so a corner press still resizes the
+                // sidebar, and before pane resize because this target lives
+                // inside the sidebar, where no pane divider can be.
+                if self.begin_dock_resize(m.column, m.row) {
                     return;
                 }
                 // Pane resize (docs/27) takes priority over selection: a divider
@@ -1300,6 +2058,7 @@ impl App {
                         self.link_press = Some(LinkPress {
                             target: h.target,
                             at: (m.column, m.row),
+                            beside: m.modifiers.contains(KeyModifiers::SHIFT),
                         });
                         return;
                     }
@@ -1316,15 +2075,53 @@ impl App {
                 if !m.modifiers.contains(KeyModifiers::SHIFT) && self.begin_mouse_forward(&m, 0) {
                     return;
                 }
+                // A second left press on (or within one cell of) the first,
+                // inside the double-click window, copies and highlights the
+                // path / URL / word under the cursor. This point is reached only
+                // when the press was *not* forwarded to a mouse-tracking app (its
+                // reporting is off, or `Shift` bypassed it), so it never steals a
+                // click a pane app wanted.
+                let now = Instant::now();
+                // Only a press inside a pane's content arms (and matches) the
+                // detector, and both presses must land in the *same* pane: a title
+                // or border click must never combine with a nearby body click into
+                // a double-click, which would copy and swallow the pane's focus.
+                let content_pane = self.pane_content_at(m.column, m.row).map(|(id, _)| id);
+                let is_double = self.last_left_click.take().is_some_and(|(pane, at, when)| {
+                    content_pane == Some(pane)
+                        && now.duration_since(when) <= DOUBLE_CLICK
+                        && m.column.abs_diff(at.0) <= 1
+                        && m.row.abs_diff(at.1) <= 1
+                });
+                if is_double {
+                    if self.copy_token_at(m.column, m.row) {
+                        // Its release keeps the highlight instead of re-copying.
+                        self.dbl_click_release = true;
+                        return;
+                    }
+                } else if let Some(pane) = content_pane {
+                    self.last_left_click = Some((pane, (m.column, m.row), now));
+                }
                 // Begin a selection only inside a pane's content; otherwise drop
                 // any old one. Falls through to normal click handling (focus/etc).
                 self.selection = self
                     .pane_content_at(m.column, m.row)
-                    .map(|(pane, content)| Selection {
-                        pane,
-                        content,
-                        anchor: (m.column, m.row),
-                        cursor: (m.column, m.row),
+                    .map(|(pane, content)| {
+                        let retained = self
+                            .retained_selection_point(pane, content, m.column, m.row)
+                            .map(|point| RetainedSelection {
+                                anchor: point,
+                                cursor: point,
+                            });
+                        Selection {
+                            pane,
+                            content,
+                            anchor: (m.column, m.row),
+                            cursor: (m.column, m.row),
+                            retained,
+                            scrolled: false,
+                            dragging: true,
+                        }
                     });
             }
             MouseEventKind::Down(MouseButton::Middle) => {
@@ -1351,6 +2148,10 @@ impl App {
                     self.update_sidebar_resize(m.column, m.row);
                     return;
                 }
+                if self.dock_resize.is_some() {
+                    self.update_dock_resize(m.column, m.row);
+                    return;
+                }
                 if self.resize_drag.is_some() {
                     self.update_resize(m.column, m.row);
                     return;
@@ -1364,24 +2165,35 @@ impl App {
                     }
                     return;
                 }
-                if let Some(sel) = self.selection.as_mut() {
-                    let c = sel.content;
-                    sel.cursor = (
-                        m.column.clamp(c.x, c.right().saturating_sub(1)),
-                        m.row.clamp(c.y, c.bottom().saturating_sub(1)),
-                    );
-                }
+                // Dragging after a double-click turns it back into an ordinary
+                // selection, so its release copies what was dragged.
+                self.dbl_click_release = false;
+                self.update_mouse_selection_cursor(m.column, m.row);
                 return;
             }
             MouseEventKind::Up(MouseButton::Left) | MouseEventKind::Up(MouseButton::Middle) => {
+                // A double-click already copied and scheduled its highlight
+                // expiry on press. Its release only closes the gesture.
+                if self.dbl_click_release {
+                    self.dbl_click_release = false;
+                    return;
+                }
                 if let Some(p) = self.link_press.take() {
                     if (m.column, m.row) == p.at {
-                        self.activate_link(p.target);
+                        if p.beside {
+                            self.activate_link_in(p.target, crate::app::files::OpenTarget::Pane);
+                        } else {
+                            self.activate_link(p.target);
+                        }
                     }
                     return;
                 }
                 if self.sidebar_resize.is_some() {
                     self.end_sidebar_resize();
+                    return;
+                }
+                if self.dock_resize.is_some() {
+                    self.end_dock_resize();
                     return;
                 }
                 if self.resize_drag.is_some() {
@@ -1393,15 +2205,22 @@ impl App {
                     self.send_grabbed_mouse(g, MouseSeq::Release, m.column, m.row);
                     return;
                 }
+                self.update_mouse_selection_cursor(m.column, m.row);
+                if let Some(selection) = self.selection.as_mut() {
+                    selection.dragging = false;
+                }
                 // A real drag copies its text + flashes a toast; a plain click
                 // clears the (1-cell) selection so nothing stays highlighted.
+                // After a successful copy the highlight lingers briefly so you can
+                // see what was copied; the toast times out on the same cadence.
                 match self.selection_text() {
                     Some(text) => {
                         self.pending_clipboard = Some(text);
                         let msg = self.catalog.copied;
                         self.show_toast(msg);
+                        self.schedule_copy_highlight_clear();
                     }
-                    None => self.selection = None,
+                    None => self.clear_selection(),
                 }
                 return;
             }
@@ -1440,15 +2259,23 @@ impl App {
             _ => {}
         }
         let scroll: i32 = match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => 0,
             MouseEventKind::ScrollUp => -3,
             MouseEventKind::ScrollDown => 3,
-            _ => return, // motion / release: hover updated, nothing else to do
+            _ => 0,
         };
+        let hscroll: i32 = match m.kind {
+            MouseEventKind::ScrollLeft => -3,
+            MouseEventKind::ScrollRight => 3,
+            _ => 0,
+        };
+        if scroll == 0 && hscroll == 0 && !matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            return; // motion / release: hover updated, nothing else to do
+        }
         let (c, r) = (m.column, m.row);
         let hit = |rect: Rect| c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom();
 
-        if scroll != 0 {
+        if scroll != 0 || hscroll != 0 {
             // Wheel over a sidebar list scrolls it one item per notch (the next
             // render clamps the offset to the list length).
             let step = |off: usize| {
@@ -1458,15 +2285,15 @@ impl App {
                     off + 1
                 }
             };
-            if hit(self.workspaces_area) {
+            if scroll != 0 && hit(self.workspaces_area) {
                 self.workspaces_scroll = step(self.workspaces_scroll);
                 return;
             }
-            if hit(self.agents_area) {
+            if scroll != 0 && hit(self.agents_area) {
                 self.agents_scroll = step(self.agents_scroll);
                 return;
             }
-            if hit(self.files_area) {
+            if scroll != 0 && hit(self.files_area) {
                 if self.files_mode == crate::diff::FilesMode::Diff {
                     self.diff_scroll_by(if scroll < 0 { -1 } else { 1 });
                 } else {
@@ -1475,17 +2302,17 @@ impl App {
                 return;
             }
             // Wheel over a git tab scrolls its active view (docs/17).
-            if self.active_is_git() && hit(self.last_pane_area) {
+            if scroll != 0 && self.active_is_git() && hit(self.last_pane_area) {
                 self.git_scroll(scroll);
                 return;
             }
             // Wheel over the orchestration board scrolls its list (docs/22).
-            if self.active_is_orch() && hit(self.orch_area) {
+            if scroll != 0 && self.active_is_orch() && hit(self.orch_area) {
                 self.orch_scroll_by(scroll);
                 return;
             }
             // Wheel over Mission Control scrolls its agent list (docs/54).
-            if self.active_is_mission() && hit(self.mission_area) {
+            if scroll != 0 && self.active_is_mission() && hit(self.mission_area) {
                 let n = self.mission_rows.len();
                 self.mission_cursor = match scroll {
                     s if s < 0 => self.mission_cursor.saturating_sub(1),
@@ -1501,92 +2328,154 @@ impl App {
                 .find(|(id, rect)| self.views.contains_key(id) && hit(*rect))
                 .map(|(id, rect)| (*id, *rect))
             {
-                let viewport = rect.height.saturating_sub(1) as usize;
+                let viewport = rect.height.saturating_sub(2) as usize;
                 match self.views.get_mut(&id) {
                     Some(crate::app::ViewKind::File(v)) => {
                         let text_w = view_text_w(v, rect.width);
                         v.scroll_by(scroll, viewport, text_w);
                     }
                     Some(crate::app::ViewKind::Diff(v)) => {
-                        let rows = v.stack_rows.len().max(v.split_rows.len());
-                        if scroll < 0 {
-                            v.scroll = v.scroll.saturating_sub(3);
+                        let is_split = v.effective_split(rect.width);
+                        if hscroll != 0 {
+                            if hscroll < 0 {
+                                v.horizontal = v.horizontal.saturating_sub(8);
+                            } else {
+                                v.horizontal = v.horizontal.saturating_add(8);
+                            }
+                            let marker_style = self.config.layout.diff_marker_style;
+                            v.ensure_horizontal_visible(rect.width, marker_style, is_split);
                         } else {
-                            v.scroll = v
-                                .scroll
-                                .saturating_add(3)
-                                .min(rows.saturating_sub(viewport));
+                            let rows = if is_split {
+                                v.split_rows.len()
+                            } else {
+                                v.stack_rows.len()
+                            };
+                            if is_split {
+                                let current = v.split_row_for_stack(v.scroll);
+                                let split = if scroll < 0 {
+                                    current.saturating_sub(3)
+                                } else {
+                                    current.saturating_add(3).min(rows.saturating_sub(viewport))
+                                };
+                                if let Some(stack) = v.stack_row_for_split(split) {
+                                    v.scroll = stack;
+                                    v.selected = stack;
+                                }
+                            } else if scroll < 0 {
+                                v.scroll = v.scroll.saturating_sub(3);
+                                v.selected = v.scroll;
+                            } else {
+                                v.scroll = v
+                                    .scroll
+                                    .saturating_add(3)
+                                    .min(rows.saturating_sub(viewport));
+                                v.selected = v.scroll;
+                            }
                         }
-                        v.selected = v.scroll;
+                    }
+                    Some(crate::app::ViewKind::Preview(v)) => {
+                        let key = crate::files::preview::LayoutKey {
+                            width: rect.width.max(1),
+                            ascii: false,
+                        };
+                        v.scroll_by(scroll, viewport, key);
                     }
                     None => {}
                 }
                 return;
             }
             // Otherwise the wheel scrolls the pane under the cursor.
-            if let Some(id) = self
-                .pane_rects
-                .iter()
-                .find(|(_, rect)| hit(*rect))
-                .map(|(id, _)| *id)
-            {
-                let up = scroll < 0;
-                // Pane-local, 1-based coordinates for a forwarded mouse event.
-                let content = self
-                    .pane_content_rects
+            // Skip when only horizontal scroll is active — there is no
+            // meaningful terminal horizontal-wheel protocol to forward.
+            if scroll != 0 {
+                if let Some(id) = self
+                    .pane_rects
                     .iter()
-                    .find(|(pid, _)| *pid == id)
-                    .map(|(_, r)| *r);
-                // Set after the pane borrow ends: `Some(v)` writes `scroll_pane = v`.
-                let mut set_scroll: Option<Option<PaneId>> = None;
-                // Forwarding the wheel makes the app repaint; that output is the
-                // user scrolling, not the agent working (docs/07).
-                let mut scrolled_the_app = false;
-                if let Some(pane) = self.panes.get(&id) {
-                    let mm = pane.mouse_mode();
-                    if mm.report {
-                        // The app tracks the mouse (e.g. a TUI agent like Claude
-                        // Code on the alternate screen) — forward the wheel so it
-                        // scrolls its own transcript, exactly like a real terminal.
-                        let base = content.unwrap_or(Rect::new(0, 0, 1, 1));
-                        let col = m.column.saturating_sub(base.x) + 1;
-                        let row = m.row.saturating_sub(base.y) + 1;
-                        let seq = mouse_wheel_seq(up, col, row, mm.sgr);
-                        for _ in 0..3 {
-                            pane.send(&seq);
+                    .find(|(_, rect)| hit(*rect))
+                    .map(|(id, _)| *id)
+                {
+                    let up = scroll < 0;
+                    // Pane-local, 1-based coordinates for a forwarded mouse event.
+                    let content = self
+                        .pane_content_rects
+                        .iter()
+                        .find(|(pid, _)| *pid == id)
+                        .map(|(_, r)| *r);
+                    // Set after the pane borrow ends: `Some(v)` writes `scroll_pane = v`.
+                    let mut set_scroll: Option<Option<PaneId>> = None;
+                    // Forwarding the wheel makes the app repaint; that output is the
+                    // user scrolling, not the agent working (docs/07).
+                    let mut scrolled_the_app = false;
+                    let extending_selection = self.selection.is_some_and(|selection| {
+                        selection.pane == id && selection.dragging && selection.retained.is_some()
+                    });
+                    let mut scrolled_selection = false;
+                    if let Some(pane) = self.panes.get(&id) {
+                        let mm = pane.mouse_mode();
+                        if extending_selection && !pane.alt_screen() {
+                            // The selection gesture owns primary-screen scrolling,
+                            // even when the child reports mouse input. Its endpoints
+                            // are retained-history rows, so the original anchor stays
+                            // attached to the same text while the cursor extends.
+                            pane.scroll(-scroll);
+                            set_scroll = Some((pane.scroll_state().0 > 0).then_some(id));
+                            scrolled_selection = true;
+                        } else if mm.report {
+                            // The app tracks the mouse (e.g. a TUI agent like Claude
+                            // Code on the alternate screen) — forward the wheel so it
+                            // scrolls its own transcript, exactly like a real terminal.
+                            let base = content.unwrap_or(Rect::new(0, 0, 1, 1));
+                            let col = m.column.saturating_sub(base.x) + 1;
+                            let row = m.row.saturating_sub(base.y) + 1;
+                            // Preserve the terminal protocol's one-event/one-report
+                            // boundary. In particular, Windows ConPTY may coalesce
+                            // rapid writes; sending duplicates here can make a TUI
+                            // receive several concatenated SGR reports as one input
+                            // record and reject the entire wheel action.
+                            pane.send(&mouse_wheel_seq(up, col, row, mm.sgr));
+                            scrolled_the_app = true;
+                        } else if !pane.alt_screen() {
+                            // Primary screen with real history: scroll luvus's
+                            // scrollback viewport (`scroll` is -3 up / +3 down, and a
+                            // positive delta scrolls up into history — so negate it).
+                            pane.scroll(-scroll);
+                            // Engage keyboard scroll mode while scrolled up (so the
+                            // number/j/k keys work); disengage once back at live.
+                            set_scroll = Some((pane.scroll_state().0 > 0).then_some(id));
+                        } else if mm.alternate_scroll {
+                            // The application explicitly requested alternate
+                            // scrolling, so translate wheel movement into its
+                            // cursor-key scroll input. Without that mode there is
+                            // no host history on an alternate screen to move.
+                            let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
+                            for _ in 0..scroll.abs() {
+                                pane.send(seq);
+                            }
+                            scrolled_the_app = true;
                         }
-                        scrolled_the_app = true;
-                    } else if !pane.alt_screen() {
-                        // Primary screen with real history: scroll luvus's
-                        // scrollback viewport (`scroll` is -3 up / +3 down, and a
-                        // positive delta scrolls up into history — so negate it).
-                        pane.scroll(-scroll);
-                        // Engage keyboard scroll mode while scrolled up (so the
-                        // number/j/k keys work); disengage once back at live.
-                        set_scroll = Some((pane.scroll_state().0 > 0).then_some(id));
-                    } else if mm.alternate_scroll {
-                        // The application explicitly requested alternate
-                        // scrolling, so translate wheel movement into its
-                        // cursor-key scroll input. Without that mode there is
-                        // no host history on an alternate screen to move.
-                        let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-                        for _ in 0..scroll.abs() {
-                            pane.send(seq);
+                    }
+                    if scrolled_the_app {
+                        self.mark_input_for(id);
+                    }
+                    if let Some(v) = set_scroll {
+                        self.scroll_pane = v;
+                    }
+                    if scrolled_selection {
+                        if let Some(selection) = self.selection.as_mut() {
+                            selection.scrolled = true;
                         }
-                        scrolled_the_app = true;
+                        self.update_mouse_selection_cursor(m.column, m.row);
                     }
                 }
-                if scrolled_the_app {
-                    self.mark_input_for(id);
-                }
-                if let Some(v) = set_scroll {
-                    self.scroll_pane = v;
-                }
-            }
+            } // scroll != 0
             return;
         }
 
         // The sidebar gear opens Settings.
+        if self.named_session_button_rect.is_some_and(hit) {
+            self.open_named_session_menu();
+            return;
+        }
         if self.settings_icon_rect.is_some_and(hit) {
             self.open_settings();
             return;
@@ -1622,18 +2511,6 @@ impl App {
             self.zoomed = !self.zoomed;
             return;
         }
-        // Clicking a pane's title strip opens the running-command overlay — the
-        // full argv from the OS, since an agent's on-screen `Bash(… …)` is
-        // elided before it ever reaches us.
-        if let Some((id, _)) = self
-            .pane_title_rects
-            .iter()
-            .find(|(_, rect)| hit(*rect))
-            .map(|(id, r)| (*id, *r))
-        {
-            self.open_cmd_inspect(id);
-            return;
-        }
         // Tab-bar scroll arrows: step to the previous / next tab.
         if self.tab_prev_rect.is_some_and(hit) {
             let a = self.ws().active_tab;
@@ -1667,20 +2544,32 @@ impl App {
         // The AGENTS All/Active filter toggle.
         if let Some((val, _)) = self.agents_filter_rects.iter().find(|(_, rect)| hit(*rect)) {
             let val = *val;
-            if self.agents_active_only != val {
-                self.agents_active_only = val;
-                self.agents_scroll = 0;
-            }
+            self.set_agents_filter(val);
+            return;
+        }
+        // The "blocked in other workspaces" line jumps to a pane this scope hid,
+        // rather than widening the list or cycling to a local blocked row.
+        if let Some((id, _)) = self.agents_elsewhere_rect.filter(|(_, rect)| hit(*rect)) {
+            self.sidebar_focus = None;
+            self.focus_pane_global(id);
             return;
         }
         if let Some((id, _)) = self.agent_rects.iter().find(|(_, rect)| hit(*rect)) {
             let id = *id;
+            self.sidebar_focus = None;
             self.focus_pane_global(id);
+            return;
+        }
+        if let Some((id, _)) = self.automation_rects.iter().find(|(_, rect)| hit(*rect)) {
+            let id = id.clone();
+            self.sidebar_focus = None;
+            self.open_automation_detail(&id);
             return;
         }
         // Clicking a resumable session row reopens it into a pane.
         if let Some((i, _)) = self.session_rects.iter().find(|(_, rect)| hit(*rect)) {
             let i = *i;
+            self.sidebar_focus = None;
             self.resume_session(i);
             return;
         }
@@ -1695,18 +2584,20 @@ impl App {
             } else {
                 crate::app::files::OpenTarget::Preview
             };
+            self.files_focused = false;
             self.diff_row_activate(row, target);
             return;
         }
         // Clicking a FILES row expands/collapses a folder or opens a file (docs/38).
-        // A plain click opens the file in a full tab (the native default); Shift
-        // opens it in a pane split beside the focus.
+        // A plain click follows the `File click behavior` setting — reuse one
+        // preview (the default) or open a whole tab; Shift is the permanent
+        // read-only pane beside the focus, and never configurable.
         if let Some((i, _)) = self.file_tree_rects.iter().find(|(_, rect)| hit(*rect)) {
             let i = *i;
             let target = if m.modifiers.contains(KeyModifiers::SHIFT) {
                 crate::app::files::OpenTarget::Pane
             } else {
-                crate::app::files::OpenTarget::Tab
+                self.file_click_target()
             };
             self.file_row_activate(i, target);
             return;
@@ -1742,18 +2633,9 @@ impl App {
             }
             return;
         }
-        // Clicking a workspace's branch opens its git tab (docs/17).
-        if let Some((i, _)) = self
-            .workspace_branch_rects
-            .iter()
-            .find(|(_, rect)| hit(*rect))
-        {
-            let i = *i;
-            self.open_git_tab(i);
-            return;
-        }
         if let Some((i, _)) = self.ws_rects.iter().find(|(_, rect)| hit(*rect)) {
             let i = (*i).min(self.workspaces.len().saturating_sub(1));
+            self.sidebar_focus = None;
             self.active_ws = i;
             return;
         }
@@ -1786,19 +2668,45 @@ impl App {
                 return;
             }
         }
-        // Clicking a task row on the board selects it (docs/22, ORCH-7).
+        // ORCH controls use renderer-owned stable geometry. A double click is
+        // the mouse equivalent of Enter and jumps to the task's worker pane.
         if self.active_is_orch() {
-            let body_top = self.orch_area.y + 2; // header + separator
-            if hit(self.orch_area) && m.row >= body_top {
-                let idx = self.orch_scroll + (m.row - body_top) as usize;
-                if idx < self.orch.tasks.len() {
-                    self.orch_cursor = idx;
+            let target = self
+                .orch_hits
+                .iter()
+                .find(|(_, rect)| hit(*rect))
+                .map(|(target, _)| target.clone());
+            if let Some(OrchHit::Task(id)) = target {
+                let now = Instant::now();
+                let double = self.orch_last_click.take().is_some_and(|(previous, when)| {
+                    previous == id && now.duration_since(when) <= DOUBLE_CLICK
+                });
+                if double {
+                    self.orch_jump_to_task(&id);
+                } else {
+                    self.orch_select_task(&id);
+                    self.orch_last_click = Some((id, now));
                 }
+            } else if let Some(OrchHit::Automation(id)) = target {
+                let now = Instant::now();
+                let double = self.orch_last_click.take().is_some_and(|(previous, when)| {
+                    previous == id && now.duration_since(when) <= DOUBLE_CLICK
+                });
+                if self.orch_select_automation(&id) {
+                    if double {
+                        self.open_automation_detail(&id);
+                    } else {
+                        self.orch_last_click = Some((id, now));
+                    }
+                }
+            } else if let Some(target) = target {
+                self.orch_last_click = None;
+                self.orch_activate_hit(target);
             }
             return;
         }
-        // Clicking an agent row in Mission Control jumps straight to that session's
-        // pane (or resumes it), the whole point of the tab (docs/54).
+        // Mission Control mouse controls use geometry published by its renderer,
+        // so responsive rows select the same stable item shown on screen.
         if self.active_is_mission() {
             // A click dismisses an open overlay (detail / answer) rather than
             // acting behind it.
@@ -1813,8 +2721,23 @@ impl App {
                 self.set_mission_scope(*scope);
                 return;
             }
-            // Agent rows are intentionally keyboard-only for now. A plain click
-            // must never jump away from Mission Control unexpectedly.
+            if let Some((id, _)) = self
+                .mission_automation_rects
+                .iter()
+                .find(|(_, rect)| hit(*rect))
+            {
+                let id = id.clone();
+                self.open_automation_detail(&id);
+                return;
+            }
+            let row = self
+                .mission_row_rects
+                .iter()
+                .find(|(_, rect)| hit(*rect))
+                .map(|(index, _)| *index);
+            if let Some(index) = row.filter(|index| *index < self.mission_rows.len()) {
+                self.mission_cursor = index;
+            }
             return;
         }
         if let Some((id, _)) = self.pane_rects.iter().find(|(_, rect)| hit(*rect)) {
@@ -1952,7 +2875,8 @@ impl App {
                     // forwarded, so typing to the agent resumes with no lost key.
                     pane.scroll_to_bottom();
                     exit = true;
-                    if let Some(bytes) = encode_key(&key, newline, pane.application_cursor()) {
+                    let (app_cursor, disambiguate) = pane.key_encoding_modes();
+                    if let Some(bytes) = encode_key(&key, newline, app_cursor, disambiguate) {
                         pane.send(&bytes);
                     }
                 }
@@ -1974,13 +2898,14 @@ impl App {
             return false;
         };
         let (offset, history) = pane.scroll_state();
-        self.selection = None;
+        self.clear_selection();
         self.scroll_pane = None;
         self.copy_mode = Some(CopyMode {
             pane: id,
             anchor: (history.saturating_sub(offset), 0),
             cursor: (history.saturating_sub(offset), 0),
             saved_scroll: offset,
+            pending_count: 0,
         });
         true
     }
@@ -2031,33 +2956,12 @@ impl App {
         let Some(copy) = self.copy_mode.take() else {
             return;
         };
-        let is_codex = self
-            .status
+        let text = self
+            .panes
             .get(&copy.pane)
-            .is_some_and(|status| status.agent == "codex");
-        let text = self.panes.get(&copy.pane).and_then(|pane| {
-            let range = copy.ordered();
-            let mut output = String::new();
-            let start_row = (range.0).0;
-            let end_row = (range.1).0;
-            // Hold one engine lock so every selected row comes from the same
-            // terminal snapshot. Rows that disappeared after the selection was
-            // made are skipped instead of discarding the remaining copy.
-            let mut appended = false;
-            pane.for_each_retained_row(&mut |row, _history, _row_count, line| {
-                if (start_row..=end_row).contains(&row) {
-                    append_selected_row(&mut output, &mut appended, line, row, range);
-                }
-            });
-            finish_selected_text(output)
-        });
-        if let Some(text) = text.map(|text| {
-            if is_codex {
-                strip_uniform_single_cell_margin(text)
-            } else {
-                text
-            }
-        }) {
+            .and_then(|pane| pane.retained_selection_text(copy.ordered()))
+            .and_then(finish_selected_text);
+        if let Some(text) = text {
             self.pending_clipboard = Some(text);
             let msg = self.catalog.copied;
             self.show_toast(msg);
@@ -2071,6 +2975,10 @@ impl App {
 
     /// Copy-mode navigation starts from the configured prefix command, then hjkl/arrows, word jumps,
     /// page keys, Home/End, and g/G move the visual selection; y copies it.
+    ///
+    /// Motions take vim's count prefix (`12j`), `e` jumps to a word end, and
+    /// `Ctrl+D`/`Ctrl+U` move by half a page. Anything unrecognised is swallowed
+    /// rather than forwarded, so a stray key can never reach the selected program.
     fn handle_copy_mode_key(&mut self, key: KeyEvent) -> bool {
         let Some(mut copy) = self.copy_mode else {
             return false;
@@ -2084,9 +2992,9 @@ impl App {
             return true;
         }
         if matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
-            if let Some(copy) = self.copy_mode.as_mut() {
-                copy.anchor = copy.cursor;
-            }
+            copy.anchor = copy.cursor;
+            copy.pending_count = 0;
+            self.copy_mode = Some(copy);
             return true;
         }
         let Some(pane) = self.panes.get(&copy.pane) else {
@@ -2098,41 +3006,99 @@ impl App {
             self.cancel_copy_mode();
             return true;
         }
+        // Vim's count prefix, after the pane checks above: a digit must not keep
+        // copy mode alive on a pane that has gone away. `0` joins a count already
+        // being typed; on its own it keeps its older meaning of "first column",
+        // so no existing key changes.
+        if let KeyCode::Char(typed @ '0'..='9') = key.code {
+            let digit = typed as usize - '0' as usize;
+            if digit != 0 || copy.pending_count > 0 {
+                copy.push_count_digit(digit);
+                self.copy_mode = Some(copy);
+                return true;
+            }
+        }
         let last_row = row_count.saturating_sub(1);
         let page = self.focused_page() as usize;
+        let half_page = page.div_ceil(2).max(1);
+        let count = copy.count();
+        let rows = |per: usize| count.saturating_mul(per);
+        // A count turns `g`/`G` into vim's absolute line jump. The rows a user
+        // counts are 1-based, so `5G` is index 4. Read the raw count beside
+        // `count` above, never through `copy`, so both derive from one snapshot.
+        let explicit = copy.pending_count;
+        let counted_row = |n: usize| n.saturating_sub(1).min(last_row);
+        let ctrl = super::keys::is_ctrl_chord(key.modifiers);
         match key.code {
-            KeyCode::Left | KeyCode::Char('h') => copy.cursor.1 = copy.cursor.1.saturating_sub(1),
-            KeyCode::Right | KeyCode::Char('l') => {
-                copy.cursor.1 = copy.cursor.1.saturating_add(1).min(copy_line_end(
-                    pane.retained_row_text(copy.cursor.0).as_deref(),
-                ));
+            // The only chords copy mode reads. Guarded so bare `d`/`u` stay unbound
+            // instead of silently becoming half-page motions.
+            KeyCode::Char('d') if ctrl => {
+                copy.cursor.0 = copy.cursor.0.saturating_add(rows(half_page)).min(last_row)
             }
-            KeyCode::Up | KeyCode::Char('k') => copy.cursor.0 = copy.cursor.0.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => copy.cursor.0 = (copy.cursor.0 + 1).min(last_row),
+            KeyCode::Char('u') if ctrl => {
+                copy.cursor.0 = copy.cursor.0.saturating_sub(rows(half_page))
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                copy.cursor.1 = copy.cursor.1.saturating_sub(count)
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let last = pane
+                    .retained_row_layout(copy.cursor.0)
+                    .map_or(0, |layout| layout.last_column());
+                copy.cursor.1 = copy.cursor.1.saturating_add(count).min(last);
+            }
+            KeyCode::Up | KeyCode::Char('k') => copy.cursor.0 = copy.cursor.0.saturating_sub(count),
+            KeyCode::Down | KeyCode::Char('j') => {
+                copy.cursor.0 = copy.cursor.0.saturating_add(count).min(last_row)
+            }
             KeyCode::PageUp | KeyCode::Char('b') => {
-                copy.cursor.0 = copy.cursor.0.saturating_sub(page)
+                copy.cursor.0 = copy.cursor.0.saturating_sub(rows(page))
             }
             KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
-                copy.cursor.0 = copy.cursor.0.saturating_add(page).min(last_row)
+                copy.cursor.0 = copy.cursor.0.saturating_add(rows(page)).min(last_row)
             }
-            KeyCode::Home | KeyCode::Char('g') => copy.cursor.0 = 0,
-            KeyCode::End | KeyCode::Char('G') => copy.cursor.0 = last_row,
+            KeyCode::Home | KeyCode::Char('g') => copy.cursor.0 = counted_row(explicit),
+            KeyCode::End | KeyCode::Char('G') => {
+                copy.cursor.0 = if explicit > 0 {
+                    counted_row(explicit)
+                } else {
+                    last_row
+                }
+            }
             KeyCode::Char('0') => copy.cursor.1 = 0,
             KeyCode::Char('$') => {
-                copy.cursor.1 = copy_line_end(pane.retained_row_text(copy.cursor.0).as_deref())
+                copy.cursor.1 = pane
+                    .retained_row_layout(copy.cursor.0)
+                    .map_or(0, |layout| layout.last_column())
             }
             KeyCode::Char('w') => {
-                copy.cursor =
-                    copy_word_forward(row_count, |row| pane.retained_row_text(row), copy.cursor)
+                copy.cursor = repeat_motion(count, copy.cursor, |at| {
+                    copy_word_forward(row_count, |row| pane.retained_row_layout(row), at)
+                })
+            }
+            KeyCode::Char('e') => {
+                copy.cursor = repeat_motion(count, copy.cursor, |at| {
+                    copy_word_end(row_count, |row| pane.retained_row_layout(row), at)
+                })
             }
             KeyCode::Char('B') => {
-                copy.cursor = copy_word_back(|row| pane.retained_row_text(row), copy.cursor)
+                copy.cursor = repeat_motion(count, copy.cursor, |at| {
+                    copy_word_back(|row| pane.retained_row_layout(row), at)
+                })
             }
-            _ => return true,
+            _ => {
+                // An unrecognised key aborts the pending count the way vim does, so
+                // a mistyped chord cannot silently multiply the next motion.
+                copy.pending_count = 0;
+                self.copy_mode = Some(copy);
+                return true;
+            }
         }
-        copy.cursor.1 = copy.cursor.1.min(copy_line_end(
-            pane.retained_row_text(copy.cursor.0).as_deref(),
-        ));
+        copy.pending_count = 0;
+        copy.cursor.1 = copy.cursor.1.min(
+            pane.retained_row_layout(copy.cursor.0)
+                .map_or(0, |layout| layout.last_column()),
+        );
         self.copy_mode = Some(copy);
         self.reveal_copy_cursor();
         true
@@ -2208,6 +3174,54 @@ impl App {
             .map(|(id, r)| (*id, *r))
     }
 
+    /// Map one visible terminal cell into the pane's retained-history space.
+    /// Native file and diff views intentionally stay in screen coordinates.
+    fn retained_selection_point(
+        &self,
+        pane: PaneId,
+        content: Rect,
+        x: u16,
+        y: u16,
+    ) -> Option<(usize, usize)> {
+        if self.views.contains_key(&pane) {
+            return None;
+        }
+        let pane = self.panes.get(&pane)?;
+        let (visible_top, row_count) = pane.retained_viewport()?;
+        if row_count == 0 {
+            return None;
+        }
+        let row = visible_top
+            .saturating_add(y.saturating_sub(content.y) as usize)
+            .min(row_count.saturating_sub(1));
+        let col = x
+            .saturating_sub(content.x)
+            .min(content.width.saturating_sub(1)) as usize;
+        Some((row, col))
+    }
+
+    /// Move the visible cursor endpoint and, for terminal panes, resolve that
+    /// cell against the viewport *now*. The retained anchor is never rewritten.
+    fn update_mouse_selection_cursor(&mut self, x: u16, y: u16) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let content = selection.content;
+        let screen = (
+            x.clamp(content.x, content.right().saturating_sub(1)),
+            y.clamp(content.y, content.bottom().saturating_sub(1)),
+        );
+        let retained = selection.retained.and_then(|_| {
+            self.retained_selection_point(selection.pane, content, screen.0, screen.1)
+        });
+        if let Some(selection) = self.selection.as_mut() {
+            selection.cursor = screen;
+            if let (Some(cursor), Some(retained)) = (retained, selection.retained.as_mut()) {
+                retained.cursor = cursor;
+            }
+        }
+    }
+
     /// Extract the current selection's text from the pane's grid (linear, with
     /// trailing blanks trimmed). `None` for a click without a drag or empty text.
     pub(crate) fn selection_text(&self) -> Option<String> {
@@ -2220,18 +3234,22 @@ impl App {
         if let Some(crate::app::ViewKind::File(v)) = self.views.get(&sel.pane) {
             return crate::files::selection_text(v, sel.content, sel.ordered());
         }
-        let rows = self
-            .panes
-            .get(&sel.pane)?
-            .engine
-            .lock()
-            .ok()?
-            .visible_rows();
+        if let Some(crate::app::ViewKind::Preview(view)) = self.views.get(&sel.pane) {
+            return super::preview::selection_text(view, sel.content, sel.ordered(), self.compact);
+        }
+        if let Some(selection) = sel.retained {
+            let range = selection.ordered();
+            return self
+                .panes
+                .get(&sel.pane)?
+                .retained_selection_text(range)
+                .and_then(finish_selected_text);
+        }
         let ((sx, sy), (ex, ey)) = sel.ordered();
         let (cx, cy) = (sel.content.x, sel.content.y);
-        let text = extract_rows_selection(
-            &rows,
-            (
+        self.panes
+            .get(&sel.pane)?
+            .visible_selection_text((
                 (
                     (sy as usize).saturating_sub(cy as usize),
                     (sx as usize).saturating_sub(cx as usize),
@@ -2240,21 +3258,83 @@ impl App {
                     (ey as usize).saturating_sub(cy as usize),
                     (ex as usize).saturating_sub(cx as usize),
                 ),
-            ),
-        )?;
-        // A drag may begin in the single blank pane cell before uniformly
-        // aligned prose. Codex also emits that one-cell transcript gutter even
-        // when the drag starts on its first visible character. It remains
-        // visibly selected, but is padding rather than useful clipboard text.
-        let is_codex = self
-            .status
-            .get(&sel.pane)
-            .is_some_and(|status| status.agent == "codex");
-        Some(if sx == cx || is_codex {
-            strip_uniform_single_cell_margin(text)
-        } else {
-            text
-        })
+            ))
+            .and_then(finish_selected_text)
+    }
+
+    /// Copy the path, URL, or word under screen cell (`col`, `row`) to the
+    /// clipboard and highlight it — the double-click gesture. A path or URL is
+    /// copied as its full raw token (`src/main.rs:42:7` verbatim, a soft-wrapped
+    /// path rejoined); anything else falls back to the whitespace-delimited word,
+    /// and a whitespace or empty cell copies nothing. Returns whether it copied.
+    ///
+    /// Uses the pure [`crate::links::link_at`], not [`Self::link_at_screen`]:
+    /// copying doesn't need the file to exist, so a `pwd` directory or a
+    /// not-yet-created path still copies.
+    fn copy_token_at(&mut self, col: u16, row: u16) -> bool {
+        let Some((pane, content)) = self.pane_content_at(col, row) else {
+            return false;
+        };
+        let rows = match self.views.get(&pane) {
+            Some(crate::app::ViewKind::File(view)) => {
+                let Some(rows) = crate::files::token_rows(view, content, self.compact) else {
+                    return false;
+                };
+                align_plain_rows(rows)
+            }
+            Some(crate::app::ViewKind::Preview(view)) => {
+                let Some(rows) = super::preview::token_rows(view, content, self.compact) else {
+                    return false;
+                };
+                align_plain_rows(rows)
+            }
+            // DIFF owns its source-cell clicks for review and note selection.
+            // Do not route it through generic word copying.
+            Some(crate::app::ViewKind::Diff(_)) => return false,
+            None => {
+                let Some(p) = self.panes.get(&pane) else {
+                    return false;
+                };
+                let Ok(engine) = p.engine.lock() else {
+                    return false;
+                };
+                // Cell-aligned rows: a wide glyph before the token would otherwise
+                // shift `gcol` off the intended character (and its highlight).
+                engine.visible_rows_aligned()
+            }
+        };
+        let (gcol, grow) = (col - content.x, row - content.y);
+        let (text, spans) = match copy_link_at_grid(&rows, gcol, grow) {
+            Some(pair) => pair,
+            None => match word_at_grid(&rows, gcol, grow) {
+                Some(pair) => pair,
+                None => return false,
+            },
+        };
+        if text.is_empty() {
+            return false;
+        }
+        // Highlight exactly the copied cells: from the first covered cell to the
+        // last, which for a rejoined soft-wrapped path runs through the full rows
+        // between them (the same reading-order rule `Selection` copies with). The
+        // highlight is transient (screen coordinates, cleared after copy or the
+        // next click), so it carries no retained-history span.
+        if let (Some(first), Some(last)) = (spans.first(), spans.last()) {
+            self.selection = Some(Selection {
+                pane,
+                content,
+                anchor: (content.x + first.1, content.y + first.0),
+                cursor: (content.x + last.2.saturating_sub(1), content.y + last.0),
+                retained: None,
+                scrolled: false,
+                dragging: false,
+            });
+        }
+        self.pending_clipboard = Some(text);
+        let msg = self.catalog.copied;
+        self.show_toast(msg);
+        self.schedule_copy_highlight_clear();
+        true
     }
 
     /// Show a transient toast (e.g. "Copied") bottom-center for ~1.4s.
@@ -2268,7 +3348,7 @@ impl App {
         let cwd = pane.cwd.clone();
         let pid = pane.child_pid.load(std::sync::atomic::Ordering::SeqCst);
         let procs = if pid != 0 {
-            crate::platform::process_tree(pid)
+            ensure_process_tree_root(pid, &pane.command, crate::platform::process_tree(pid))
         } else {
             Vec::new()
         };
@@ -2306,9 +3386,53 @@ impl App {
         let (pane, content) = self.pane_content_at(col, row)?;
         let rows = {
             let engine = self.panes.get(&pane)?.engine.lock().ok()?;
-            engine.visible_rows()
+            // Cell-aligned rows so a wide glyph before the link doesn't shift the
+            // column the underline lands on (or which cells Ctrl-click opens).
+            engine.visible_rows_aligned()
         };
-        let link = crate::links::link_at(&rows, col - content.x, row - content.y)?;
+        let grid_col = col - content.x;
+        let grid_row = row - content.y;
+
+        // OSC 8 carries an authoritative target which can differ from the label
+        // Claude and other terminal programs render. Preserve it rather than
+        // reclassifying a visible filename as a website. An unsupported or
+        // malformed target is deliberately inert and never falls back to the
+        // label, since that would undo the safety boundary.
+        if let Some(hyperlink) = rows.hyperlink_at(grid_row, grid_col) {
+            let uri = hyperlink.uri();
+            let visible = crate::links::link_at(rows.rows(), grid_col, grid_row);
+            let line = visible.as_ref().and_then(|link| match &link.hit {
+                crate::links::Hit::Path { line, .. } => *line,
+                crate::links::Hit::Url(_) => None,
+            });
+            let (hit, target) = if let Some(path) = crate::links::file_uri_path(uri) {
+                if !path.is_file() {
+                    return None;
+                }
+                (
+                    crate::links::Hit::Path {
+                        raw: uri.to_string(),
+                        text: path.to_string_lossy().into_owned(),
+                        line,
+                    },
+                    LinkTarget::File { path, line },
+                )
+            } else if crate::platform::is_openable_url(uri) {
+                (
+                    crate::links::Hit::Url(uri.to_string()),
+                    LinkTarget::Url(uri.to_string()),
+                )
+            } else {
+                return None;
+            };
+            let link = crate::links::Link {
+                hit,
+                spans: hyperlink.spans().to_vec(),
+            };
+            return Some(HoverLink { pane, link, target });
+        }
+
+        let link = crate::links::link_at(rows.rows(), grid_col, grid_row)?;
         let target = match &link.hit {
             crate::links::Hit::Url(u) => {
                 crate::platform::is_openable_url(u).then(|| LinkTarget::Url(u.clone()))?
@@ -2350,11 +3474,23 @@ impl App {
     }
 
     /// Act on a resolved link (docs/58): a URL goes to the client's browser, a
-    /// file opens in luvus itself.
+    /// file opens in luvus itself — where `File click behavior` says (docs/38),
+    /// exactly as a click on its FILES row would. That is a reused preview
+    /// pane beside the focus by default, so a path an agent printed lands
+    /// next to the conversation rather than in a tab that hides it.
     pub fn activate_link(&mut self, target: LinkTarget) {
+        let place = self.file_click_target();
+        self.activate_link_in(target, place);
+    }
+
+    /// [`activate_link`](Self::activate_link) with the placement the gesture
+    /// asked for: `Ctrl`+`Shift`+click is the tree's `Shift`+click, a
+    /// permanent pane beside the focus. A URL has no placement and goes to the
+    /// browser regardless.
+    pub fn activate_link_in(&mut self, target: LinkTarget, place: crate::app::files::OpenTarget) {
         match target {
             LinkTarget::Url(url) => self.open_url(url),
-            LinkTarget::File { path, line } => self.open_file_at(path, line),
+            LinkTarget::File { path, line } => self.open_file_link(path, line, place),
         }
     }
 
@@ -2373,7 +3509,27 @@ impl App {
     }
 
     pub fn show_toast(&mut self, text: impl Into<String>) {
-        self.toast = Some((text.into(), Instant::now() + Duration::from_millis(1400)));
+        self.toast = Some((text.into(), Instant::now() + COPY_HIGHLIGHT_DURATION));
+    }
+
+    fn schedule_copy_highlight_clear(&mut self) {
+        self.selection_clear_at = Some(Instant::now() + COPY_HIGHLIGHT_DURATION);
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_clear_at = None;
+    }
+
+    /// Clear an expired copied-selection highlight; returns true when it changed
+    /// so the loop repaints once to remove it, since idle frames aren't rendered.
+    pub fn tick_copy_highlight(&mut self, now: Instant) -> bool {
+        if self.selection_clear_at.is_some_and(|at| now >= at) {
+            self.clear_selection();
+            true
+        } else {
+            false
+        }
     }
 
     /// Clear an expired toast; returns true when it changed (so the loop redraws
@@ -2396,6 +3552,30 @@ impl App {
         } else {
             false
         }
+    }
+
+    /// Deliver `text` to the focused pane exactly as a paste from the outer
+    /// terminal does, and report which pane took it (`None` when the focused
+    /// leaf is a native view or has no pane at all).
+    ///
+    /// `send_paste` re-wraps the text in the bracketed-paste markers crossterm
+    /// stripped, so a child that distinguishes paste from typing (an agent CLI
+    /// attaching a dropped file, vim not auto-indenting) still sees a paste.
+    /// The pane also snaps to live and the input is marked as the user's, so
+    /// detection doesn't read the echo as agent work.
+    ///
+    /// This is the one place that does it: `Insert Path` (docs/38) goes through
+    /// here rather than writing at the pane, so bracketed paste, scroll
+    /// position, and activity tracking cannot drift between the two.
+    pub(crate) fn paste_into_focused_pane(&mut self, text: &str) -> Option<PaneId> {
+        let id = self.layout().focus;
+        let target = self.panes.get(&id).map(|p| {
+            p.scroll_to_bottom(); // pasting is input → snap to live
+            p.send_paste(text);
+            id
+        });
+        self.mark_user_input(); // so the echo isn't misread as agent work
+        target
     }
 
     /// Record that the user just typed into the focused pane, so detection can
@@ -2465,9 +3645,30 @@ impl App {
             }
             return true;
         }
-        // The help cheat-sheet overlay swallows the next key press and closes.
+        // The help cheat-sheet is a complete, scrollable shortcut reference.
+        // Unknown keys still dismiss it and are swallowed, preserving the old
+        // safety property that closing help cannot act on the focused pane.
         if self.help_open {
-            self.help_open = false;
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.min(self.help_scroll_max).saturating_sub(1)
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.help_scroll = self.help_scroll.saturating_add(10)
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self
+                        .help_scroll
+                        .min(self.help_scroll_max)
+                        .saturating_sub(10)
+                }
+                KeyCode::Home => self.help_scroll = 0,
+                KeyCode::End => self.help_scroll = self.help_scroll_max,
+                _ => self.help_open = false,
+            }
             return true;
         }
         // The changelog modal captures keys: scroll with the arrows / j/k / page
@@ -2494,6 +3695,19 @@ impl App {
         // take keys first (docs/13 §3.6).
         if self.module_setting_edit.is_some() {
             self.handle_module_setting_key(key);
+            return true;
+        }
+        if self.named_session_menu.is_some() {
+            // Context menu Esc should close the menu before the session popup.
+            if self.session_menu.is_some() && key.code == KeyCode::Esc {
+                self.session_menu = None;
+                return true;
+            }
+            if self.session_menu.is_some() {
+                self.handle_session_menu_key(key);
+                return true;
+            }
+            self.named_session_key(key);
             return true;
         }
         // The Settings modal captures all input while open.
@@ -2555,14 +3769,16 @@ impl App {
             return true;
         }
         if self.file_menu.is_some() {
-            if key.code == KeyCode::Esc {
-                self.file_menu = None;
-            }
+            self.handle_file_menu_key(key);
             return true;
         }
         if self.diff_menu.is_some() {
+            self.handle_diff_menu_key(key);
+            return true;
+        }
+        if self.orch_menu.is_some() {
             if key.code == KeyCode::Esc {
-                self.diff_menu = None;
+                self.orch_menu = None;
             }
             return true;
         }
@@ -2614,6 +3830,43 @@ impl App {
         if self.mode == Mode::Resize {
             return self.handle_resize_mode_key(key);
         }
+        // Explicit direct shortcuts are the only normal-mode keys Luvus takes
+        // before pane/dashboard dispatch. The configured prefix retains
+        // precedence, and an empty direct map makes this a cheap no-op.
+        if self.mode == Mode::Normal && !self.prefix.matches(&key) {
+            if let Some(command) = keys::direct_command(&self.direct_keymap, &key) {
+                self.run_cmd(command);
+                return true;
+            }
+        }
+        // WORKSPACES/AGENTS dock focus is explicit and separate from pane focus.
+        if let Some(focus) = self.sidebar_focus {
+            if self.prefix.matches(&key) {
+                self.sidebar_focus = None;
+                self.mode = Mode::Prefix;
+            } else {
+                match focus {
+                    SidebarListFocus::Workspaces => self.handle_workspaces_key(key),
+                    SidebarListFocus::Agents => self.handle_agents_key(key),
+                };
+            }
+            return true;
+        }
+        // FILES/DIFF dock focus is explicit and separate from terminal-pane
+        // focus. The prefix remains available for global commands; ordinary
+        // keys never leak into the pane until Esc/q returns control to it.
+        if self.files_focused {
+            if self.prefix.matches(&key) {
+                self.files_focused = false;
+                self.mode = Mode::Prefix;
+            } else {
+                match self.files_mode {
+                    crate::diff::FilesMode::Files => self.handle_file_tree_key(key),
+                    crate::diff::FilesMode::Diff => self.handle_diff_list_key(key),
+                };
+            }
+            return true;
+        }
         // A focused dashboard tab (git / orch / mission) captures normal-mode keys
         // (its own j/k/⏎/…); the `Ctrl+Space` prefix still works for global ops.
         if self.mode == Mode::Normal
@@ -2639,23 +3892,30 @@ impl App {
                 if self.prefix.matches(&key) {
                     let prefix = self.prefix.key_event();
                     let newline = self.config.shift_enter_bytes().to_vec();
-                    let app_cursor = self.focused().is_some_and(|p| p.application_cursor());
-                    if let (Some(p), Some(bytes)) =
-                        (self.focused(), encode_key(&prefix, &newline, app_cursor))
-                    {
-                        p.send(&bytes);
+                    if let Some(pane) = self.focused() {
+                        let (app_cursor, disambiguate) = pane.key_encoding_modes();
+                        if let Some(bytes) = encode_key(&prefix, &newline, app_cursor, disambiguate)
+                        {
+                            pane.send(&bytes);
+                        }
                     }
                     return true; // left prefix mode → the status bar updates
                 }
-                // Fixed convenience keys (not rebindable): `1`–`9` jump to a tab,
-                // `?` opens the shortcut cheat-sheet.
+                // Fixed convenience keys (not rebindable): unshifted `1`–`9`
+                // jump to a tab, and `?` opens the shortcut cheat-sheet. Shifted
+                // digits continue to the configurable command map below, where
+                // their normalized number-row symbols select workspaces.
                 if let KeyCode::Char(c) = key.code {
-                    if c.is_ascii_digit() && c != '0' {
+                    if c.is_ascii_digit()
+                        && c != '0'
+                        && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    {
                         self.switch_tab(c as usize - '1' as usize);
                         return true;
                     }
                     if c == '?' {
                         self.help_open = true;
+                        self.help_scroll = 0;
                         return true;
                     }
                 }
@@ -2677,9 +3937,8 @@ impl App {
                 }
                 // Everything else resolves through the keybinding registry
                 // (defaults + user overrides; see `app/keys.rs`). `key_string`
-                // ignores modifiers, so the command key works whether you
-                // released Ctrl after the prefix (`Ctrl+Space` then `c`) or kept
-                // it held as a fast chord (`Ctrl+Space`+`Ctrl+c`).
+                // ignores held Ctrl/Alt and normalizes shifted digits, so both
+                // two-step and held-chord input resolve to the configured key.
                 if let Some(cmd) = keys::key_string(&key).and_then(|s| self.keymap.get(&s).copied())
                 {
                     self.run_cmd(cmd);
@@ -2697,6 +3956,9 @@ impl App {
                 match self.views.get(&focus) {
                     Some(crate::app::ViewKind::File(_)) => return self.handle_file_key(focus, key),
                     Some(crate::app::ViewKind::Diff(_)) => return self.handle_diff_key(focus, key),
+                    Some(crate::app::ViewKind::Preview(_)) => {
+                        return self.handle_preview_key(focus, key)
+                    }
                     None => {}
                 }
                 // `Shift+↑` / `Shift+PageUp` enter keyboard scroll mode (no prefix,
@@ -2726,8 +3988,11 @@ impl App {
                 let newline = self.config.shift_enter_bytes();
                 // Cursor keys follow the pane's DECCKM state: a `less` that
                 // turned application cursor mode on only recognizes SS3 codes.
-                let app_cursor = self.focused().is_some_and(|p| p.application_cursor());
-                if let Some(bytes) = encode_key(&key, newline, app_cursor) {
+                let (app_cursor, disambiguate) = self
+                    .focused()
+                    .map(|pane| pane.key_encoding_modes())
+                    .unwrap_or((false, false));
+                if let Some(bytes) = encode_key(&key, newline, app_cursor, disambiguate) {
                     if let Some(p) = self.focused() {
                         // Typing snaps the view back to the live bottom, so you
                         // always see what you type (like every terminal).
@@ -2742,6 +4007,19 @@ impl App {
             Mode::Resize => self.handle_resize_mode_key(key),
         }
     }
+}
+
+fn log_worker_failed(worker: crate::logging::Worker, error_code: &'static str) {
+    let Some(error_code) = crate::logging::SafeId::new(error_code) else {
+        return;
+    };
+    crate::logging::event(
+        crate::logging::EventKind::WorkerFailed,
+        &[
+            crate::logging::Field::Worker(worker),
+            crate::logging::Field::ErrorCode(error_code),
+        ],
+    );
 }
 
 /// Encode one mouse-wheel notch as the bytes a mouse-tracking app expects.
@@ -2834,7 +4112,12 @@ fn mouse_wheel_seq(up: bool, col: u16, row: u16, sgr: bool) -> Vec<u8> {
 /// (`ESC O <letter>`) when the app enabled application cursor mode, exactly as a
 /// real terminal would send them — some apps (`less`) only recognize the SS3
 /// form once they've turned the mode on.
-fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8>> {
+fn encode_key(
+    key: &KeyEvent,
+    newline: &[u8],
+    app_cursor: bool,
+    disambiguate: bool,
+) -> Option<Vec<u8>> {
     // AltGr arrives as Ctrl+Alt on Windows (`keys::is_ctrl_chord`) and types a
     // character — it is neither a Ctrl chord nor an `ESC`-prefixed Alt key.
     let ctrl = super::keys::is_ctrl_chord(key.modifiers);
@@ -2848,16 +4131,28 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
     let bytes: Vec<u8> = match key.code {
         KeyCode::Char(c) => {
             if ctrl {
-                let b = match c.to_ascii_lowercase() {
-                    'a'..='z' => (c.to_ascii_uppercase() as u8) & 0x1f,
-                    ' ' | '@' => 0,
-                    '[' => 0x1b,
-                    '\\' => 0x1c,
-                    ']' => 0x1d,
-                    '^' => 0x1e,
-                    '_' => 0x1f,
-                    _ => return None,
-                };
+                if disambiguate {
+                    // Once the nested application opts into Kitty keyboard
+                    // disambiguation, every Ctrl+character chord uses CSI-u.
+                    // This preserves the protocol's key identity instead of
+                    // mixing negotiated CSI-u with legacy control bytes.
+                    let codepoint = match c {
+                        // Crossterm represents a legacy 0x1f input byte as
+                        // Ctrl+7. The originating terminal could not
+                        // distinguish it from Ctrl+/, so prefer the user-facing
+                        // slash binding for the nested CSI-u client.
+                        '/' | '7' => '/',
+                        // Kitty reports the unshifted codepoint and carries
+                        // Shift in the modifier parameter. Normalize Unicode
+                        // letters too when their lowercase form is one scalar.
+                        character if shift && character.is_alphabetic() => {
+                            single_lowercase_codepoint(character)
+                        }
+                        _ => c,
+                    };
+                    return Some(csi_u_char(codepoint, key.modifiers));
+                }
+                let b = legacy_control_byte(c)?;
                 if alt {
                     vec![0x1b, b]
                 } else {
@@ -2885,7 +4180,13 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
-        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Backspace => {
+            if alt {
+                vec![0x1b, 0x7f]
+            } else {
+                vec![0x7f]
+            }
+        }
         KeyCode::Esc => vec![0x1b],
         // Keep navigation modifiers intact. Crossterm reports these directly
         // from Windows console records, while terminals on Unix report them via
@@ -2929,8 +4230,44 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
     Some(bytes)
 }
 
+/// Lowercase a key identity only when Unicode maps it to exactly one scalar.
+fn single_lowercase_codepoint(character: char) -> char {
+    let mut lowercase = character.to_lowercase();
+    let first = lowercase.next().unwrap_or(character);
+    if lowercase.next().is_none() {
+        first
+    } else {
+        character
+    }
+}
+
+fn legacy_control_byte(character: char) -> Option<u8> {
+    Some(match character.to_ascii_lowercase() {
+        'a'..='z' => (character.to_ascii_uppercase() as u8) & 0x1f,
+        ' ' | '@' => 0,
+        '[' => 0x1b,
+        '\\' => 0x1c,
+        ']' => 0x1d,
+        '^' => 0x1e,
+        // Ctrl+/ is the user-facing chord for the US control byte. Legacy
+        // terminal input arrives through crossterm as Ctrl+7, while enhanced
+        // keyboard protocols preserve `/`.
+        '_' | '/' | '7' => 0x1f,
+        _ => return None,
+    })
+}
+
 fn csi(final_byte: u8) -> Vec<u8> {
     vec![0x1b, b'[', final_byte]
+}
+
+fn csi_u_char(character: char, modifiers: KeyModifiers) -> Vec<u8> {
+    format!(
+        "\x1b[{};{}u",
+        character as u32,
+        key_modifier_param(modifiers)
+    )
+    .into_bytes()
 }
 
 /// Encode a cursor key (arrows / Home / End). In application cursor mode
@@ -2981,6 +4318,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prefix_digits_jump_to_tabs_and_shifted_digits_jump_to_workspaces() {
+        let _env = crate::persist::test_env("prefix-shifted-workspace-jump");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let focus = app.layout().focus;
+        for position in 2..=9 {
+            app.workspaces[0]
+                .tabs
+                .push(Tab::panes(TileLayout::new(focus)));
+            app.workspaces.push(Workspace {
+                id: crate::ids::public_id("workspace"),
+                name: format!("workspace-{position}"),
+                cwd: std::path::PathBuf::from(format!("/tmp/workspace-{position}")),
+                branch: None,
+                git_ahead_behind: None,
+                worktree: None,
+                tabs: vec![Tab::panes(TileLayout::new(focus))],
+                active_tab: 0,
+                pinned: false,
+            });
+        }
+
+        let prefix = || AppEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        let shifted = ['!', '@', '#', '$', '%', '^', '&', '*', '('];
+        for (index, (digit, symbol)) in ('1'..='9').zip(shifted).enumerate() {
+            app.active_ws = 0;
+            app.handle_event(prefix());
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(digit),
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(app.active_ws, 0, "plain digit stays in the workspace");
+            assert_eq!(app.ws().active_tab, index, "plain digit jumps to a tab");
+
+            // Unix legacy input reports the shifted symbol without modifiers,
+            // Windows retains Shift on that symbol, and enhanced Unix input
+            // reports the base digit with Shift. All three travel through the
+            // real prefix path and resolve to the same configurable action.
+            for key in [
+                KeyEvent::new(KeyCode::Char(symbol), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char(symbol), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char(digit), KeyModifiers::SHIFT),
+            ] {
+                app.active_ws = usize::from(index == 0);
+                app.handle_event(prefix());
+                app.handle_event(AppEvent::Key(key));
+                assert_eq!(app.active_ws, index, "{key:?} jumps to workspace");
+            }
+        }
+    }
+
+    #[test]
+    fn command_inspect_fills_only_a_missing_process_root() {
+        let descendant = crate::platform::ProcInfo {
+            pid: 43,
+            depth: 1,
+            command: "worker".into(),
+        };
+        let processes = ensure_process_tree_root(42, "shell --login", vec![descendant.clone()]);
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].pid, 42);
+        assert_eq!(processes[0].depth, 0);
+        assert_eq!(processes[0].command, "shell --login");
+        assert_eq!(processes[1], descendant);
+
+        let existing_root = crate::platform::ProcInfo {
+            pid: 42,
+            depth: 0,
+            command: "os-reported shell --login".into(),
+        };
+        let processes = ensure_process_tree_root(42, "fallback", vec![existing_root.clone()]);
+        assert_eq!(processes, vec![existing_root]);
+        assert!(ensure_process_tree_root(0, "pending", Vec::new()).is_empty());
+    }
+
+    #[test]
     fn text_modal_suppresses_hover_from_covered_bar_geometry() {
         let _env = crate::persist::test_env("modal-bar-hover");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -3011,15 +4424,15 @@ mod tests {
         );
     }
 
-    // A server that has closed its last node keeps running (docs/43 §3.3), so
-    // control-API requests routed through the event channel must still be
-    // answered — otherwise the reply channel drops and the CLI reads EOF.
+    // A server that has closed its last project keeps running with a neutral
+    // home terminal, so control-API requests routed through the event channel
+    // must still be answered rather than dropping the CLI reply channel.
     #[test]
-    fn api_requests_are_answered_with_no_workspace_open() {
+    fn api_requests_are_answered_after_the_last_project_closes() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
         app.close_workspace(0);
-        assert!(app.workspaces.is_empty(), "the only node is gone");
+        assert_eq!(app.workspaces.len(), 1, "the home terminal replaced it");
         let (reply, rx) = std::sync::mpsc::channel();
         let req = crate::ipc::api::ApiRequest {
             id: "ping".into(),
@@ -3033,6 +4446,123 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("an empty server still answers its control API");
         assert!(resp.contains("pong"), "got a real pong, not EOF: {resp}");
+    }
+
+    #[test]
+    fn merge_completion_settles_without_a_workspace() {
+        let _env = crate::persist::test_env("merge-completion-no-workspace");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("merge".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Done)
+            .unwrap();
+        app.orch.begin_merge("t1").unwrap();
+        app.workspaces.clear();
+        let (reply, response) = std::sync::mpsc::channel();
+
+        let dirty = app.handle_event(AppEvent::TaskMergeFinished {
+            task: "t1".into(),
+            branch: "luvus/t1".into(),
+            previous: crate::orch::TaskStatus::Done,
+            integration_branch: "luvus/integration".into(),
+            result: Ok(crate::git::local::MergeOutcome::Merged {
+                commit: "a".repeat(40),
+            }),
+            reply: Some(("merge-no-workspace".into(), reply)),
+        });
+
+        assert!(dirty);
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Merged
+        );
+        let response: serde_json::Value = serde_json::from_str(
+            &response
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("the parked merge request is settled"),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["outcome"], "merged");
+    }
+
+    #[test]
+    fn task_merge_api_parks_until_background_git_finishes() {
+        let _env = crate::persist::test_env("task-merge-api");
+        let (tx, events) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("merge".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Done)
+            .unwrap();
+        let missing = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/nonexistent-orch-merge-repository");
+        app.orch.bind_worktree(
+            "t1",
+            Some(missing.display().to_string()),
+            Some("luvus/t1".into()),
+        );
+        let (reply, response) = std::sync::mpsc::channel();
+
+        app.handle_event(AppEvent::Api(crate::ipc::api::ApiRequest {
+            id: "merge-api".into(),
+            method: "task.merge".into(),
+            params: json!({"id":"t1"}),
+            reply,
+        }));
+
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Merging
+        );
+        assert!(response.try_recv().is_err(), "the API reply is parked");
+        let event = (0..20)
+            .find_map(|_| {
+                events
+                    .recv_timeout(std::time::Duration::from_millis(250))
+                    .ok()
+                    .filter(|event| matches!(event, AppEvent::TaskMergeFinished { .. }))
+            })
+            .expect("the background Git probe reports completion");
+        app.handle_event(event);
+
+        let response: serde_json::Value = serde_json::from_str(
+            &response
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("the parked request receives the merge failure"),
+        )
+        .unwrap();
+        assert_eq!(response["error"]["code"], "merge_error");
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Done,
+            "an infrastructure failure restores the safe pre-merge state"
+        );
+    }
+
+    #[test]
+    fn discarded_cwd_scan_releases_the_inflight_guard() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.cwd_scan_inflight = true;
+        app.close_workspace(0);
+        assert_eq!(app.workspaces.len(), 1, "the home terminal replaced it");
+
+        let dirty = app.handle_event(AppEvent::CwdScanned {
+            panes: Vec::new(),
+            branches: Vec::new(),
+            workspace_candidates: Vec::new(),
+        });
+
+        assert!(!dirty, "an empty scan needs no repaint");
+        assert!(
+            !app.cwd_scan_inflight,
+            "a reopened workspace must be allowed to start another scan"
+        );
     }
 
     #[test]
@@ -3171,7 +4701,8 @@ mod tests {
     fn shift_enter_sends_a_newline_not_a_submit() {
         // The default newline sequence is `ESC CR`.
         let nl = b"\x1b\r";
-        let enter = |m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Enter, m), nl, false);
+        let enter =
+            |m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Enter, m), nl, false, false);
         assert_eq!(
             enter(KeyModifiers::NONE),
             Some(b"\r".to_vec()),
@@ -3192,6 +4723,7 @@ mod tests {
             encode_key(
                 &KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
                 nl,
+                false,
                 false
             ),
             Some(b"\r".to_vec())
@@ -3206,8 +4738,9 @@ mod tests {
     fn altgr_types_its_character_instead_of_a_control_byte() {
         let nl = b"\x1b\r";
         let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        let enc =
-            |c: char, m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl, false);
+        let enc = |c: char, m: KeyModifiers| {
+            encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl, false, false)
+        };
         if cfg!(windows) {
             for c in ['\\', '@', '#', '[', ']', '{', '}', '|', '~', '€'] {
                 assert_eq!(
@@ -3234,7 +4767,7 @@ mod tests {
         // The exception is for characters only: every other key keeps both
         // modifiers, so Ctrl+Alt+Enter is still a modified Enter.
         assert_eq!(
-            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl, false),
+            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl, false, false),
             Some(nl.to_vec()),
             "Ctrl+Alt+Enter still sends the configured newline"
         );
@@ -3245,14 +4778,20 @@ mod tests {
     #[test]
     fn shift_enter_sequence_is_configurable() {
         let shift = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
-        assert_eq!(encode_key(&shift, b"\n", false), Some(b"\n".to_vec()));
         assert_eq!(
-            encode_key(&shift, b"\x1b[13;2u", false),
+            encode_key(&shift, b"\n", false, false),
+            Some(b"\n".to_vec())
+        );
+        assert_eq!(
+            encode_key(&shift, b"\x1b[13;2u", false, false),
             Some(b"\x1b[13;2u".to_vec())
         );
         // Plain Enter ignores the newline sequence and always submits.
         let plain = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(encode_key(&plain, b"\n", false), Some(b"\r".to_vec()));
+        assert_eq!(
+            encode_key(&plain, b"\n", false, false),
+            Some(b"\r".to_vec())
+        );
     }
 
     #[test]
@@ -3261,6 +4800,7 @@ mod tests {
             encode_key(
                 &KeyEvent::new(KeyCode::Char('a'), modifiers),
                 b"\x1b\r",
+                false,
                 false,
             )
         };
@@ -3273,8 +4813,144 @@ mod tests {
     }
 
     #[test]
+    fn alt_backspace_sends_meta_delete_for_word_deletion() {
+        let key = |modifiers, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Backspace, modifiers),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+
+        for disambiguate in [false, true] {
+            assert_eq!(key(KeyModifiers::NONE, disambiguate), Some(vec![0x7f]));
+            assert_eq!(key(KeyModifiers::ALT, disambiguate), Some(vec![0x1b, 0x7f]));
+        }
+    }
+
+    #[test]
+    fn control_slash_reaches_nested_tuis_across_terminal_encodings() {
+        let encode = |character, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+
+        assert_eq!(encode('/', false), Some(vec![0x1f]));
+        assert_eq!(
+            encode('7', false),
+            Some(vec![0x1f]),
+            "crossterm decodes the legacy 0x1f byte as Ctrl+7"
+        );
+        assert_eq!(encode('_', false), Some(vec![0x1f]));
+
+        assert_eq!(encode('/', true), Some(b"\x1b[47;5u".to_vec()));
+        assert_eq!(
+            encode('7', true),
+            Some(b"\x1b[47;5u".to_vec()),
+            "a legacy Ctrl+/ alias regains slash identity for a nested CSI-u client"
+        );
+        assert_eq!(encode('_', true), Some(b"\x1b[95;5u".to_vec()));
+    }
+
+    #[test]
+    fn control_characters_use_full_csi_u_only_after_negotiation() {
+        let encode = |character, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+
+        // Legacy mode retains traditional control bytes and cannot represent
+        // the remaining chords without losing their Ctrl modifier.
+        assert_eq!(encode('a', false), Some(vec![0x01]));
+        assert_eq!(encode('[', false), Some(vec![0x1b]));
+        for character in [';', '\'', ',', '.', '-', '=', '`', '1', '8', '€'] {
+            assert_eq!(
+                encode(character, false),
+                None,
+                "Ctrl+{character} has no legacy representation"
+            );
+        }
+
+        // After the nested application opts in, every Ctrl+character chord is
+        // encoded consistently as CSI-u, including those with legacy bytes.
+        for character in ['a', '[', ';', '\'', ',', '.', '-', '=', '`', '1', '8', '€'] {
+            assert_eq!(
+                encode(character, true),
+                Some(format!("\x1b[{};5u", character as u32).into_bytes()),
+                "Ctrl+{character} should use negotiated CSI-u"
+            );
+        }
+        // Shifted Unicode letters use their unshifted, single-codepoint form
+        // once CSI-u is negotiated. Legacy mode remains unable to represent
+        // this chord and therefore keeps its previous no-output behavior.
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        let unicode = |disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char('É'), ctrl_shift),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+        assert_eq!(unicode(false), None);
+        assert_eq!(
+            unicode(true),
+            Some(format!("\x1b[{};6u", 'é' as u32).into_bytes())
+        );
+    }
+
+    /// `Ctrl+Shift+<letter>` must survive the trip to a nested TUI. The legacy
+    /// fold `to_ascii_uppercase() & 0x1f` is caseless, so it maps Ctrl+Shift+P
+    /// and Ctrl+P onto the same 0x10 and an agent binding the shifted chord
+    /// silently gets the unshifted action instead.
+    #[test]
+    fn control_shift_letters_reach_nested_tuis_distinctly() {
+        let encode = |character, modifiers, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char(character), modifiers),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+        let ctrl = KeyModifiers::CONTROL;
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+
+        // Legacy encoding cannot separate them; this is the collapse itself.
+        assert_eq!(encode('p', ctrl, false), Some(vec![0x10]));
+        assert_eq!(encode('p', ctrl_shift, false), Some(vec![0x10]));
+
+        // A CSI-u client gets full negotiated encoding for both chords. The
+        // codepoint stays lowercase `p` and Shift rides in the modifier param:
+        // 5 = ctrl, 6 = ctrl+shift.
+        assert_eq!(encode('p', ctrl, true), Some(b"\x1b[112;5u".to_vec()));
+        assert_eq!(encode('p', ctrl_shift, true), Some(b"\x1b[112;6u".to_vec()));
+        assert_ne!(encode('p', ctrl, true), encode('p', ctrl_shift, true));
+
+        // Crossterm may report the shifted press as uppercase; it must still
+        // report 112, never 80, or the ambiguity returns.
+        assert_eq!(encode('P', ctrl_shift, true), Some(b"\x1b[112;6u".to_vec()));
+
+        // Plain typing and Shift-only capitals remain untouched by the
+        // negotiated Ctrl encoding.
+        assert_eq!(encode('a', ctrl, true), Some(b"\x1b[97;5u".to_vec()));
+        assert_eq!(encode('A', KeyModifiers::SHIFT, true), Some(b"A".to_vec()));
+        assert_eq!(encode('a', KeyModifiers::NONE, true), Some(b"a".to_vec()));
+    }
+
+    #[test]
     fn navigation_keys_preserve_modifiers_for_nested_prompt_editors() {
-        let key = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false);
+        let key =
+            |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false, false);
 
         // The existing unmodified sequences stay byte-for-byte compatible.
         assert_eq!(
@@ -3322,7 +4998,8 @@ mod tests {
         // When the pane enabled DECCKM (`ESC[?1h`), unmodified cursor keys go out
         // as SS3 (`ESC O <letter>`) — the bytes a real terminal sends once the
         // app turned the mode on. `less` is strict about this and ignores CSI.
-        let app = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", true);
+        let app =
+            |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", true, false);
         assert_eq!(
             app(KeyCode::Up, KeyModifiers::NONE),
             Some(b"\x1bOA".to_vec())
@@ -3361,7 +5038,8 @@ mod tests {
 
     #[test]
     fn tilde_navigation_keys_preserve_modifiers() {
-        let key = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false);
+        let key =
+            |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false, false);
         assert_eq!(
             key(KeyCode::Delete, KeyModifiers::NONE),
             Some(b"\x1b[3~".to_vec())
@@ -3378,8 +5056,14 @@ mod tests {
 
     #[test]
     fn function_keys_encode_to_tilde_codes() {
-        let key =
-            |n, modifiers| encode_key(&KeyEvent::new(KeyCode::F(n), modifiers), b"\x1b\r", false);
+        let key = |n, modifiers| {
+            encode_key(
+                &KeyEvent::new(KeyCode::F(n), modifiers),
+                b"\x1b\r",
+                false,
+                false,
+            )
+        };
         // F1–F4 and F5–F12 carry the standard xterm CSI-tilde codes.
         assert_eq!(key(1, KeyModifiers::NONE), Some(b"\x1b[11~".to_vec()));
         assert_eq!(key(4, KeyModifiers::NONE), Some(b"\x1b[14~".to_vec()));
@@ -3398,6 +5082,8 @@ mod tests {
 
     #[test]
     fn sgr_wheel_encodes_button_and_coords() {
+        // Each physical wheel event produces exactly one complete report.
+        // Fullscreen TUIs may reject multiple reports coalesced into one read.
         // Wheel up = button 64, down = 65; coords are 1-based, pane-local.
         assert_eq!(mouse_wheel_seq(true, 5, 3, true), b"\x1b[<64;5;3M".to_vec());
         assert_eq!(
@@ -3823,6 +5509,371 @@ mod link_click_tests {
     }
 
     #[test]
+    fn wide_orchestration_double_click_jumps_to_the_worker() {
+        let _env = crate::persist::test_env("orch-mouse-actions");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(180, 32, tx).unwrap();
+        app.orch
+            .add_task("mouse task".into(), vec![], vec![], None)
+            .unwrap();
+        let worker = *app.panes.keys().next().unwrap();
+        app.orch.claim("t1", worker.0).unwrap();
+        app.open_orch_board();
+        let mut term = Terminal::new(TestBackend::new(180, 32)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("SELECTED TASK · t1"));
+        let row = app
+            .orch_hits
+            .iter()
+            .find_map(|(hit, rect)| matches!(hit, OrchHit::Task(id) if id == "t1").then_some(*rect))
+            .expect("task row is clickable");
+        let at = (row.x + 1, row.y);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            app.orch_menu.as_ref().map(|menu| menu.task.as_str()),
+            Some("t1")
+        );
+        assert!(app
+            .orch_menu_items("t1")
+            .contains(&crate::app::OrchMenuItem::Details));
+        app.orch_menu = None;
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(!app.active_is_orch());
+        assert_eq!(app.layout().focus, worker);
+    }
+
+    fn add_active_agent_automation(app: &mut App) -> (crate::ids::PaneId, String) {
+        let pane = app.layout().focus;
+        let terminal_id = app
+            .panes
+            .get(&pane)
+            .and_then(|pane| pane.terminal_runtime())
+            .expect("test pane has a live terminal")
+            .terminal_id;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let workspace_id = app.workspace_of_pane(pane).unwrap().id.clone();
+        let definition = app
+            .automation
+            .create(
+                crate::automation::CreateAutomation {
+                    name: "continue review".into(),
+                    enabled: true,
+                    trigger: crate::automation::Trigger::Once {
+                        at_utc: 4_000_000_000,
+                    },
+                    target: crate::automation::AutomationTarget::ActiveAgent {
+                        pane_id: pane.0,
+                        terminal_id,
+                        if_busy: crate::automation::ActiveAgentBusyPolicy::Wait,
+                        durable: None,
+                    },
+                    task: crate::automation::TaskTemplate {
+                        title: "continue review".into(),
+                        prompt: "Review the current changes.".into(),
+                        agent_id: "codex".into(),
+                        workspace_id,
+                        mode: crate::orch::TaskWorkerMode::Workspace,
+                        access: crate::automation::AutomationAccess::Workspace,
+                        paths: Vec::new(),
+                        gate: None,
+                    },
+                    policy: crate::automation::AutomationPolicy::default(),
+                },
+                None,
+                10,
+            )
+            .unwrap();
+        (pane, definition.id)
+    }
+
+    #[test]
+    fn automation_row_opens_details_and_uses_the_live_agent_context() {
+        let _env = crate::persist::test_env("automation-row-actions");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let (pane, automation) = add_active_agent_automation(&mut app);
+        app.open_orch_board();
+        app.orch_view = crate::app::OrchView::Automations;
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let row = app
+            .orch_hits
+            .iter()
+            .find_map(|(hit, rect)| {
+                matches!(hit, OrchHit::Automation(id) if id == &automation).then_some(*rect)
+            })
+            .expect("automation row is clickable");
+        let at = (row.x + 1, row.y);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            app.agent_menu.as_ref().map(|menu| menu.target.clone()),
+            Some(AgentTarget::Live(target)) if target == pane
+        ));
+        assert!(app.orch_detail.is_none());
+        app.agent_menu = None;
+
+        double_click(&mut app, at);
+        assert_eq!(app.orch_detail.as_deref(), Some(automation.as_str()));
+        app.handle_orch_detail_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.orch_detail.is_none());
+        assert!(!app.active_is_orch());
+        assert_eq!(app.layout().focus, pane);
+    }
+
+    #[test]
+    fn automation_detail_enter_follows_a_live_orch_worker() {
+        let _env = crate::persist::test_env("automation-worker-detail");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let worker = app.layout().focus;
+        let workspace_id = app.workspaces[0].id.clone();
+        let definition = app
+            .automation
+            .create(
+                crate::automation::CreateAutomation {
+                    name: "scheduled review".into(),
+                    enabled: true,
+                    trigger: crate::automation::Trigger::Once {
+                        at_utc: 4_000_000_000,
+                    },
+                    target: crate::automation::AutomationTarget::NewWorker,
+                    task: crate::automation::TaskTemplate {
+                        title: "scheduled review".into(),
+                        prompt: "Review changes".into(),
+                        agent_id: "codex".into(),
+                        workspace_id,
+                        mode: crate::orch::TaskWorkerMode::Workspace,
+                        access: crate::automation::AutomationAccess::Workspace,
+                        paths: Vec::new(),
+                        gate: None,
+                    },
+                    policy: crate::automation::AutomationPolicy::default(),
+                },
+                None,
+                10,
+            )
+            .unwrap();
+        let run = app
+            .automation
+            .request_run(&definition.id, None, 20)
+            .unwrap();
+        let task = app
+            .orch
+            .add_task("scheduled review".into(), Vec::new(), Vec::new(), None)
+            .unwrap();
+        app.orch.claim(&task.id, worker.0).unwrap();
+        app.automation
+            .bind_task(&run.id, task.id.clone(), 21)
+            .unwrap();
+        app.open_orch_board();
+        app.open_automation_detail(&definition.id);
+
+        app.handle_orch_detail_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.orch_detail.is_none());
+        assert!(!app.active_is_orch());
+        assert_eq!(app.layout().focus, worker);
+    }
+
+    #[test]
+    fn scheduled_sidebar_uses_detail_on_left_and_agent_menu_on_right() {
+        let _env = crate::persist::test_env("automation-sidebar-actions");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let (pane, automation) = add_active_agent_automation(&mut app);
+        let row = Rect::new(2, 4, 24, 2);
+        app.automation_rects = vec![(automation.clone(), row)];
+        let at = (row.x + 1, row.y);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            app.agent_menu.as_ref().map(|menu| menu.target.clone()),
+            Some(AgentTarget::Live(target)) if target == pane
+        ));
+        assert!(app.orch_detail.is_none());
+        app.agent_menu = None;
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.orch_detail.as_deref(), Some(automation.as_str()));
+        assert!(app.agent_menu.is_none());
+    }
+
+    #[test]
+    fn scheduled_sidebar_opens_automation_menu_without_a_live_pane() {
+        let _env = crate::persist::test_env("automation-sidebar-placeholder-menu");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let workspace_id = app.workspaces[0].id.clone();
+        let definition = app
+            .automation
+            .create(
+                crate::automation::CreateAutomation {
+                    name: "scheduled review".into(),
+                    enabled: true,
+                    trigger: crate::automation::Trigger::Once {
+                        at_utc: 4_000_000_000,
+                    },
+                    target: crate::automation::AutomationTarget::NewWorker,
+                    task: crate::automation::TaskTemplate {
+                        title: "scheduled review".into(),
+                        prompt: "Review changes".into(),
+                        agent_id: "codex".into(),
+                        workspace_id,
+                        mode: crate::orch::TaskWorkerMode::Workspace,
+                        access: crate::automation::AutomationAccess::Workspace,
+                        paths: Vec::new(),
+                        gate: None,
+                    },
+                    policy: crate::automation::AutomationPolicy::default(),
+                },
+                None,
+                10,
+            )
+            .unwrap();
+        let row = Rect::new(2, 4, 24, 2);
+        app.automation_rects = vec![(definition.id.clone(), row)];
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            (row.x + 1, row.y),
+            KeyModifiers::NONE,
+        ));
+
+        let menu = app.agent_menu.as_ref().expect("automation menu opens");
+        assert_eq!(menu.target, AgentTarget::Automation(definition.id.clone()));
+        let items = app.agent_menu_items(menu.target.clone());
+        assert!(items.contains(&crate::app::AgentMenuItem::AutomationDetails));
+        assert!(items.contains(&crate::app::AgentMenuItem::AutomationRun));
+        assert!(items.contains(&crate::app::AgentMenuItem::AutomationToggle));
+        assert!(items.contains(&crate::app::AgentMenuItem::AutomationDelete));
+        assert!(app.orch_detail.is_none());
+
+        app.agent_menu_action(crate::app::AgentMenuItem::AutomationDetails);
+        assert_eq!(app.orch_detail.as_deref(), Some(definition.id.as_str()));
+        assert!(app.agent_menu.is_none());
+    }
+
+    #[test]
+    fn new_task_form_stays_open_inside_and_closes_on_its_backdrop() {
+        let _env = crate::persist::test_env("orch-form-backdrop");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 32, tx).unwrap();
+        app.open_orch_board();
+        app.open_orch_form();
+        let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let modal = app
+            .orch_hits
+            .iter()
+            .find_map(|(hit, rect)| matches!(hit, OrchHit::FormModal).then_some(*rect))
+            .expect("new-task modal surface is published");
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (modal.x, modal.y),
+            KeyModifiers::NONE,
+        ));
+        assert!(
+            app.orch_form.is_some(),
+            "a click inside keeps the form open"
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (modal.x.saturating_sub(1), modal.y),
+            KeyModifiers::NONE,
+        ));
+        assert!(
+            app.orch_form.is_none(),
+            "a click on the dimmed backdrop closes the form"
+        );
+    }
+
+    #[test]
+    fn narrow_orchestration_double_click_also_jumps_to_the_worker() {
+        let _env = crate::persist::test_env("orch-narrow-details");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 28, tx).unwrap();
+        app.orch
+            .add_task("narrow task".into(), vec![], vec![], None)
+            .unwrap();
+        let worker = *app.panes.keys().next().unwrap();
+        app.orch.claim("t1", worker.0).unwrap();
+        app.open_orch_board();
+        let mut term = Terminal::new(TestBackend::new(80, 28)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let row = app
+            .orch_hits
+            .iter()
+            .find_map(|(hit, rect)| matches!(hit, OrchHit::Task(id) if id == "t1").then_some(*rect))
+            .expect("task row is clickable");
+        let at = (row.x + 1, row.y);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+
+        assert!(!app.active_is_orch());
+        assert_eq!(app.layout().focus, worker);
+    }
+
+    #[test]
     fn tab_menu_renders_swap_with_submenu_for_other_tabs() {
         let _env = crate::persist::test_env("tab-switch-submenu");
         let Fixture {
@@ -3894,15 +5945,155 @@ mod link_click_tests {
         (app, term, (content.x + at, content.y))
     }
 
-    /// A path an agent printed opens **in luvus**, in a new tab, not at the OS.
-    /// Tests run from the repo root, so `Cargo.toml` is a real relative path from
-    /// the pane's working directory.
-    #[test]
-    fn ctrl_click_on_a_file_path_opens_it_in_a_tab() {
-        let _env = crate::persist::test_env("link-file");
+    /// A fixture whose visible label and OSC 8 target intentionally differ.
+    fn fixture_showing_osc8(
+        label: &str,
+        uri: &str,
+        at: u16,
+    ) -> (App, Terminal<TestBackend>, (u16, u16)) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let pane = app.layout().focus;
+        let sequence = format!("\x1b[H\x1b[2J\x1b]8;id=agent;{uri}\x1b\\{label}\x1b]8;;\x1b\\\r\n");
+        app.panes
+            .get(&pane)
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .advance(sequence.as_bytes());
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(p, _)| *p == pane)
+            .map(|(_, r)| *r)
+            .expect("pane content rect");
+        (app, term, (content.x + at, content.y))
+    }
+
+    fn double_click(app: &mut App, at: (u16, u16)) {
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+    }
+
+    /// `Ctrl`+click a path, then return the view it landed on. Tests run from
+    /// the repo root, so `Cargo.toml` is a real relative path from the pane's
+    /// working directory.
+    fn click_cargo_toml(mods: KeyModifiers) -> (App, crate::ids::PaneId, usize) {
         let (mut app, _t, at) = fixture_showing("edit Cargo.toml now", 7);
         let tabs = app.ws().tabs.len();
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), at, mods));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), at, mods));
+        assert!(
+            app.pending_open_url.is_none(),
+            "a file never goes to the browser"
+        );
+        let id = app.layout().focus;
+        match app.views.get(&id) {
+            Some(crate::app::ViewKind::File(v)) => {
+                assert!(v.path.ends_with("Cargo.toml"), "showing {:?}", v.path)
+            }
+            _ => panic!("the focus is a file view"),
+        }
+        (app, id, tabs)
+    }
 
+    /// A path an agent printed opens **in luvus**, not at the OS — and where
+    /// `File click behavior` says, which by default is the preview pane beside
+    /// the pane that printed it, so the agent stays on screen.
+    #[test]
+    fn ctrl_click_on_a_file_path_previews_it_beside_the_pane() {
+        let _env = crate::persist::test_env("link-file");
+        let (app, id, tabs) = click_cargo_toml(KeyModifiers::CONTROL);
+        assert_eq!(app.ws().tabs.len(), tabs, "no new tab");
+        assert!(app.preview_views.contains(&id), "it is the preview pane");
+    }
+
+    #[test]
+    fn osc8_file_target_overrides_a_domain_shaped_label() {
+        if crate::terminal::vt::unsupported_by_selected_engine("OSC 8 hyperlink reporting") {
+            return;
+        }
+        let _env = crate::persist::test_env("link-osc8-file");
+        let path = std::env::current_dir().unwrap().join("Cargo.toml");
+        let uri = format!("file://{}", path.display());
+        let (app, _term, at) = fixture_showing_osc8("luvus.dev", &uri, 2);
+
+        match app.link_at_screen(at.0, at.1).map(|hover| hover.target) {
+            Some(LinkTarget::File {
+                path: target,
+                line: None,
+            }) => assert_eq!(target, path),
+            other => panic!("OSC 8 file target must win over its label, got {other:?}"),
+        }
+        assert!(app.pending_open_url.is_none());
+    }
+
+    #[test]
+    fn osc8_file_label_preserves_a_visible_line_number() {
+        if crate::terminal::vt::unsupported_by_selected_engine("OSC 8 hyperlink reporting") {
+            return;
+        }
+        let _env = crate::persist::test_env("link-osc8-line");
+        let path = std::env::current_dir().unwrap().join("Cargo.toml");
+        let uri = format!("file://{}", path.display());
+        let (app, _term, at) = fixture_showing_osc8("Cargo.toml:42", &uri, 3);
+
+        assert!(matches!(
+            app.link_at_screen(at.0, at.1).map(|hover| hover.target),
+            Some(LinkTarget::File {
+                path: target,
+                line: Some(42)
+            }) if target == path
+        ));
+    }
+
+    #[test]
+    fn unsupported_osc8_target_is_inert_without_label_fallback() {
+        let _env = crate::persist::test_env("link-osc8-inert");
+        let (app, _term, at) = fixture_showing_osc8("luvus.dev", "vscode://file/repo/main.rs", 2);
+
+        assert_eq!(app.link_at_screen(at.0, at.1), None);
+    }
+
+    #[test]
+    fn http_osc8_target_opens_even_when_its_label_looks_like_a_file() {
+        if crate::terminal::vt::unsupported_by_selected_engine("OSC 8 hyperlink reporting") {
+            return;
+        }
+        let _env = crate::persist::test_env("link-osc8-http");
+        let (app, _term, at) = fixture_showing_osc8("Cargo.toml", "https://example.com/actual", 2);
+
+        assert_eq!(
+            app.link_at_screen(at.0, at.1).map(|hover| hover.target),
+            Some(LinkTarget::Url("https://example.com/actual".into()))
+        );
+    }
+
+    /// `Open in tab` is the other click behavior, and the only placement that
+    /// can reach a configured editor: the tab path is unchanged for it.
+    #[test]
+    fn ctrl_click_on_a_file_path_opens_a_tab_when_that_is_the_click_behavior() {
+        let _env = crate::persist::test_env("link-file-tab");
+        let (mut app, _t, at) = fixture_showing("edit Cargo.toml now", 7);
+        app.config.layout.file_click = crate::config::FILE_CLICK_TAB.to_string();
+        let tabs = app.ws().tabs.len();
         app.handle_event(mouse(
             MouseEventKind::Down(MouseButton::Left),
             at,
@@ -3913,19 +6104,27 @@ mod link_click_tests {
             at,
             KeyModifiers::CONTROL,
         ));
-
-        assert!(
-            app.pending_open_url.is_none(),
-            "a file never goes to the browser"
-        );
         assert_eq!(app.ws().tabs.len(), tabs + 1, "opened in a new tab");
         let id = app.layout().focus;
-        match app.views.get(&id) {
-            Some(crate::app::ViewKind::File(v)) => {
-                assert!(v.path.ends_with("Cargo.toml"), "showing {:?}", v.path)
-            }
-            _ => panic!("the new tab holds a file view"),
-        }
+        assert!(
+            matches!(app.views.get(&id), Some(crate::app::ViewKind::File(v)) if v.path.ends_with("Cargo.toml")),
+            "the new tab holds the file"
+        );
+        assert!(!app.preview_views.contains(&id), "a tab is permanent");
+    }
+
+    /// `Ctrl`+`Shift`+click is the tree's `Shift`+click: a permanent pane
+    /// beside the focus, whatever the click behavior is set to.
+    #[test]
+    fn ctrl_shift_click_on_a_file_path_opens_a_permanent_pane_beside() {
+        let _env = crate::persist::test_env("link-file-beside");
+        let (app, id, tabs) = click_cargo_toml(KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(app.ws().tabs.len(), tabs, "no new tab");
+        assert!(!app.preview_views.contains(&id), "not the recycled preview");
+        assert!(
+            app.layout().leaves().len() >= 2,
+            "split beside the pane that printed the path"
+        );
     }
 
     /// `src/main.rs:42` is one reference: the whole thing underlines, the path
@@ -4057,59 +6256,74 @@ mod link_click_tests {
         assert_eq!(app.pending_open_url.as_deref(), Some(URL));
     }
 
-    /// Copy-mode skips rows that fell out of retention, so the newline
-    /// separator must track appended rows — comparing against the selection's
-    /// start row would make a skipped leading row start the copy with `\n`.
+    /// The double-click fallback: the whitespace-delimited word under a cell,
+    /// with the single span it covers. Used when a cell isn't a path or URL.
     #[test]
-    fn skipped_leading_rows_do_not_add_a_leading_newline() {
-        let mut out = String::new();
-        let mut appended = false;
-        let range = ((2, 0), (5, 2));
-        // Rows 2 and 3 were evicted and are skipped; row 4 is appended first.
-        append_selected_row(&mut out, &mut appended, "abc", 4, range);
-        append_selected_row(&mut out, &mut appended, "def", 5, range);
+    fn word_at_grid_takes_the_whitespace_word_under_the_cell() {
+        let rows =
+            crate::terminal::vt::AlignedRows::from_rows(vec!["  foo(bar) baz  ".to_string()]);
+        // Anywhere inside the token grabs the whole whitespace-delimited run,
+        // punctuation included, and reports its exact span.
+        for col in 2..=9 {
+            assert_eq!(
+                word_at_grid(&rows, col, 0),
+                Some(("foo(bar)".to_string(), vec![(0, 2, 10)])),
+                "col {col}"
+            );
+        }
+        // A neighbouring word is its own token.
         assert_eq!(
-            finish_selected_text(out).as_deref(),
-            Some("abc\ndef"),
-            "a skipped first row must not produce a leading newline"
+            word_at_grid(&rows, 11, 0),
+            Some(("baz".to_string(), vec![(0, 11, 14)]))
         );
+        // Whitespace and out-of-range cells copy nothing.
+        assert_eq!(word_at_grid(&rows, 1, 0), None, "leading blank");
+        assert_eq!(word_at_grid(&rows, 10, 0), None, "gap between words");
+        assert_eq!(word_at_grid(&rows, 99, 0), None, "past the line");
+        assert_eq!(word_at_grid(&rows, 0, 5), None, "past the last row");
     }
 
     #[test]
-    fn multi_line_copy_keeps_the_drag_left_edge() {
-        // The first column is blank pane-side space before a Markdown list. A
-        // drag beginning on `-` must not add that blank to every middle row.
-        let rows = vec![
-            " - first".to_string(),
-            " - second".to_string(),
-            " - third".to_string(),
-        ];
-        assert_eq!(
-            extract_rows_selection(&rows, ((0, 1), (2, 7))).as_deref(),
-            Some("- first\n- second\n- third")
-        );
+    fn word_at_grid_keeps_wide_glyph_cells_in_one_word() {
+        let spacer = crate::terminal::vt::ALIGNED_WIDE_CELL;
+        let rows = crate::terminal::vt::AlignedRows::from_rows(vec![format!(
+            "你{spacer}好{spacer} code 编{spacer}码{spacer}42"
+        )]);
+
+        for col in 0..4 {
+            assert_eq!(
+                word_at_grid(&rows, col, 0),
+                Some(("你好".to_string(), vec![(0, 0, 4)])),
+                "either cell of each CJK glyph selects the complete word at col {col}"
+            );
+        }
+        for col in 10..16 {
+            assert_eq!(
+                word_at_grid(&rows, col, 0),
+                Some(("编码42".to_string(), vec![(0, 10, 16)])),
+                "mixed wide and narrow characters remain one word at col {col}"
+            );
+        }
     }
 
     #[test]
-    fn mouse_copy_drops_a_uniform_one_cell_pane_margin() {
-        assert_eq!(
-            strip_uniform_single_cell_margin(
-                " Hello, rain on a windowpane\n Hello, wind with a traveling name\n Hello, all things we almost miss"
-                    .into()
-            ),
-            "Hello, rain on a windowpane\nHello, wind with a traveling name\nHello, all things we almost miss"
-        );
-        assert_eq!(
-            strip_uniform_single_cell_margin(
-                "    let preserved = true;\n    run(preserved);".into()
-            ),
-            "    let preserved = true;\n    run(preserved);",
-            "normal code indentation must stay intact"
-        );
+    fn copy_link_at_grid_keeps_unicode_paths_complete() {
+        let spacer = crate::terminal::vt::ALIGNED_WIDE_CELL;
+        let rows = crate::terminal::vt::AlignedRows::from_rows(vec![format!(
+            "dir/日{spacer}本{spacer}語{spacer}.rs next"
+        )]);
+
+        for col in 0..13 {
+            assert_eq!(
+                copy_link_at_grid(&rows, col, 0),
+                Some(("dir/日本語.rs".to_string(), vec![(0, 0, 13)])),
+                "the complete Unicode path is copied from physical column {col}"
+            );
+        }
     }
 
     #[test]
-    fn mouse_drag_copy_drops_the_pane_edge_margin_from_terminal_text() {
+    fn mouse_drag_copy_preserves_selected_terminal_cells() {
         let _env = crate::persist::test_env("mouse-copy-pane-margin");
         let source = " Morning arrives without ceremony,\r\n a thin gold line on the edge of the glass.\r\n The kettle speaks in its private language,";
         let (mut app, mut term, _) = fixture_showing(source, 0);
@@ -4149,7 +6363,7 @@ mod link_click_tests {
         assert_eq!(
             app.selection_text().as_deref(),
             Some(
-                "Morning arrives without ceremony,\na thin gold line on the edge of the glass.\nThe kettle speaks in its private language,"
+                " Morning arrives without ceremony,\n a thin gold line on the edge of the glass.\n The kettle speaks in its private language,"
             )
         );
         app.handle_event(mouse(
@@ -4161,32 +6375,724 @@ mod link_click_tests {
         assert_eq!(
             app.pending_clipboard.as_deref(),
             Some(
-                "Morning arrives without ceremony,\na thin gold line on the edge of the glass.\nThe kettle speaks in its private language,"
+                " Morning arrives without ceremony,\n a thin gold line on the edge of the glass.\n The kettle speaks in its private language,"
             )
         );
+        assert!(
+            app.selection.is_some(),
+            "the copied drag keeps its highlight briefly"
+        );
+        assert!(
+            !app.tick_copy_highlight(Instant::now()),
+            "the highlight stays until the toast cadence elapses"
+        );
+        assert!(app.selection.is_some());
+        assert!(
+            app.tick_copy_highlight(Instant::now() + COPY_HIGHLIGHT_DURATION),
+            "the highlight clears once the timer expires"
+        );
+        assert!(app.selection.is_none());
     }
 
     #[test]
-    fn codex_copy_drops_its_one_cell_transcript_gutter() {
-        let _env = crate::persist::test_env("codex-copy-gutter");
-        let (mut app, _term, _) = fixture_showing("  hello\r\n  world", 0);
+    fn mouse_auto_copy_preserves_reverse_wide_character_selection() {
+        let _env = crate::persist::test_env("mouse-copy-wide-unicode");
+        let (mut app, _term, _) = fixture_showing("你好，hello.", 0);
         let pane = app.layout().focus;
-        app.status.get_mut(&pane).expect("pane status").agent = "codex".into();
         let content = app
             .pane_content_rects
             .iter()
             .find(|(id, _)| *id == pane)
             .map(|(_, rect)| *rect)
             .expect("pane content rect");
-        // The drag starts one cell in, so this verifies Codex detection rather
-        // than the generic pane-edge case above.
+        let (visible_top, row_count) = app
+            .panes
+            .get(&pane)
+            .and_then(|pane| pane.retained_viewport())
+            .expect("retained viewport");
+        let row = (visible_top..row_count)
+            .find(|row| {
+                app.panes
+                    .get(&pane)
+                    .and_then(|pane| pane.retained_row_text(*row))
+                    .as_deref()
+                    == Some("你好，hello.")
+            })
+            .expect("fixture row");
+        let screen_row = content.y + (row - visible_top) as u16;
+        let left = (content.x, screen_row);
+        let right = (content.x + 3, screen_row);
+        app.selection = Some(crate::app::Selection {
+            pane,
+            content,
+            anchor: right,
+            cursor: left,
+            retained: Some(crate::app::RetainedSelection {
+                anchor: (row, 3),
+                cursor: (row, 0),
+            }),
+            scrolled: false,
+            dragging: true,
+        });
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            left,
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(app.pending_clipboard.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn visible_selection_fallback_preserves_wide_characters() {
+        let _env = crate::persist::test_env("mouse-copy-wide-visible-fallback");
+        let (mut app, _term, _) = fixture_showing("你好，hello.", 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let visible_row = {
+            let pane = app.panes.get(&pane).expect("pane");
+            let engine = pane.engine.lock().expect("engine");
+            engine
+                .visible_rows()
+                .iter()
+                .position(|row| row.trim_end() == "你好，hello.")
+                .expect("visible fixture row")
+        };
+        app.selection = Some(crate::app::Selection {
+            pane,
+            content,
+            anchor: (content.x, content.y + visible_row as u16),
+            cursor: (content.x + 3, content.y + visible_row as u16),
+            retained: None,
+            scrolled: false,
+            dragging: false,
+        });
+
+        assert_eq!(app.selection_text().as_deref(), Some("你好"));
+    }
+
+    /// A title-strip click must never arm the double-click detector. Otherwise a
+    /// following body click one row down is read as a double-click, copies the
+    /// token under it, and `return`s before the focus cascade — the exact shape
+    /// that failed Linux CI in `stacked_bottom_pane_title_zoom_and_body_are_all_clickable`.
+    /// Here it is pinned deterministically by putting a token under the body cell,
+    /// so a regressed detector copies on every platform instead of only where the
+    /// body cell happens to be non-empty.
+    #[test]
+    fn a_title_click_then_a_body_click_focuses_the_pane_not_a_double_click() {
+        let _env = crate::persist::test_env("title-then-body-focus");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let top = app.layout().focus;
+        app.run_cmd(crate::app::keys::Cmd::SplitDown);
+        let bottom = app.layout().focus;
+        assert_ne!(top, bottom);
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        // A token under the bottom pane's body: a false double-click would copy it.
+        app.panes
+            .get(&bottom)
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b[H\x1b[2Jhello");
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let (_, title) = *app
+            .pane_title_rects
+            .iter()
+            .max_by_key(|(_, r)| r.y)
+            .expect("bottom pane has a title strip");
+        let body = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == bottom)
+            .map(|(_, r)| *r)
+            .expect("bottom pane has a content rect");
+        // Same column, and the body sits one row under the title, so a detector
+        // that armed on the title would read the body click as a double-click.
+        let col = body.x + 1;
+        assert!(
+            body.y.abs_diff(title.y) <= 1,
+            "body is adjacent to the title"
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (col, title.y),
+            KeyModifiers::NONE,
+        ));
+        assert!(
+            app.cmd_inspect.is_none(),
+            "the title click did not open the command overlay"
+        );
+        assert_eq!(
+            app.layout().focus,
+            bottom,
+            "the title click focused the pane"
+        );
+        // Reset focus *after* the title click, so only the body click can move it.
+        app.layout_mut().focus = top;
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (col, body.y),
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(
+            app.layout().focus,
+            bottom,
+            "the body click focused the pane instead of being a double-click"
+        );
+        assert!(
+            app.pending_clipboard.is_none(),
+            "the body click did not copy — it was not a double-click"
+        );
+    }
+
+    /// A real timed double-click (press, release, press) copies the word under the
+    /// cursor; a lone press first copies nothing.
+    #[test]
+    fn a_double_click_copies_the_word_under_the_cursor() {
+        let _env = crate::persist::test_env("double-click-copy");
+        // Click the second word, well clear of the sidebar-resize divider at the
+        // pane's left edge (a press there grabs the divider, not the grid).
+        let (mut app, _t, at) = fixture_showing("hello world", 6);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(
+            app.pending_clipboard.is_none(),
+            "one press and release copies nothing"
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            app.pending_clipboard.as_deref(),
+            Some("world"),
+            "the second press copies the whitespace word"
+        );
+        assert!(app.selection.is_some(), "and highlights it");
+        let clear_at = app
+            .selection_clear_at
+            .expect("the second press schedules highlight expiry");
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(!app.dbl_click_release, "release closes the gesture");
+        assert_eq!(
+            app.selection_clear_at,
+            Some(clear_at),
+            "release does not restart the press-time expiry"
+        );
+        assert!(app.tick_copy_highlight(clear_at));
+        assert!(app.selection.is_none(), "the press-time deadline clears it");
+    }
+
+    #[test]
+    fn a_new_left_press_clears_a_copied_highlight_before_overlay_handling() {
+        let _env = crate::persist::test_env("copy-highlight-overlay-click");
+        let (mut app, _t, at) = fixture_showing("hello world", 6);
+        let end = (at.0 + 4, at.1);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            end,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            end,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.selection.is_some(), "the copied drag is highlighted");
+        assert!(
+            app.selection_clear_at.is_some(),
+            "the copied drag has a pending expiry"
+        );
+
+        // The help overlay returns near the start of `apply_mouse`. Its click
+        // must still replace the delayed terminal highlight immediately.
+        app.help_open = true;
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (0, 0),
+            KeyModifiers::NONE,
+        ));
+        assert!(!app.help_open, "the overlay handled the click");
+        assert!(app.selection.is_none(), "the old highlight cleared first");
+        assert!(
+            app.selection_clear_at.is_none(),
+            "its obsolete timer cleared with it"
+        );
+    }
+
+    #[test]
+    fn a_double_click_copies_a_word_from_a_native_file_view() {
+        let _env = crate::persist::test_env("double-click-file-view");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let pane = app.layout().focus;
+        let mut view = crate::files::FileView::new(PathBuf::from("sample.txt"));
+        view.wrap = false;
+        view.apply(crate::files::FileLoad::Text(vec![
+            "你好 file-view world".into()
+        ]));
+        app.panes.remove(&pane);
+        app.views.insert(pane, crate::app::ViewKind::File(view));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("file content rect");
+        let text_x = content.x + crate::files::gutter_width(1) + 1;
+
+        // Two wide glyphs occupy four cells before the separating space.
+        double_click(&mut app, (text_x + 6, content.y));
+
+        assert_eq!(app.pending_clipboard.as_deref(), Some("file-view"));
+        assert!(
+            app.selection.is_some(),
+            "the copied file word is highlighted"
+        );
+    }
+
+    #[test]
+    fn a_double_click_copies_a_word_from_a_document_preview() {
+        use crate::files::preview::{
+            layout, Block, DocumentView, LayoutKey, PreviewDocument, PreviewKind, PreviewLoad,
+        };
+
+        let _env = crate::persist::test_env("double-click-document-preview");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let pane = app.layout().focus;
+        let source = Arc::<str>::from("hello rendered-preview world");
+        let document = Arc::new(PreviewDocument::new(
+            Arc::clone(&source),
+            vec![Block::Code {
+                language: None,
+                text: source.to_string(),
+                range: 0..source.len(),
+            }],
+        ));
+        let mut view = DocumentView::new(PathBuf::from("README.md"), PreviewKind::Markdown);
+        view.apply(PreviewLoad::Ready(Arc::clone(&document)));
+        app.panes.remove(&pane);
+        app.views.insert(pane, crate::app::ViewKind::Preview(view));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("preview content rect");
+        let key = LayoutKey {
+            width: content.width,
+            ascii: false,
+        };
+        if let Some(crate::app::ViewKind::Preview(view)) = app.views.get_mut(&pane) {
+            view.apply_layout(key, Arc::new(layout::build(document, key)));
+        }
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        // Code preview rows have a two-cell presentation indent.
+        double_click(&mut app, (content.x + 2 + 7, content.y));
+
+        assert_eq!(app.pending_clipboard.as_deref(), Some("rendered-preview"));
+        assert!(
+            app.selection.is_some(),
+            "the copied preview word is highlighted"
+        );
+    }
+
+    /// The wide-character case for copying: a CJK glyph before a token shifts every
+    /// following terminal column by its spacer cell, so both the copied text and
+    /// the highlight must be addressed by cell column, not string index.
+    #[test]
+    fn a_double_click_copies_a_token_after_wide_characters() {
+        let _env = crate::persist::test_env("double-click-copy-wide");
+        // 你(cols 0-1) 好(cols 2-3) space(col 4), then src/main.rs at cols 5..16.
+        let (mut app, _t, at) = fixture_showing("你好 src/main.rs", 5);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(
+            app.pending_clipboard.as_deref(),
+            Some("src/main.rs"),
+            "the whole path copies, not a wide-char-shifted fragment"
+        );
+        let sel = app.selection.expect("the copied path is highlighted");
+        assert_eq!(
+            (sel.anchor, sel.cursor),
+            ((at.0, at.1), (at.0 + 10, at.1)),
+            "the highlight covers the path's true cells (cols 5..16)"
+        );
+    }
+
+    /// Double-clicking either terminal cell of a wide glyph copies its complete
+    /// whitespace-delimited word, without leaking the internal cell marker.
+    #[test]
+    fn a_double_click_copies_a_wide_character_word() {
+        let _env = crate::persist::test_env("double-click-copy-wide-word");
+        // Click the continuation cell of `你`; `你好` occupies cols 0..4.
+        let (mut app, _t, at) = fixture_showing("你好 next", 1);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(app.pending_clipboard.as_deref(), Some("你好"));
+        let sel = app.selection.expect("the full wide word is highlighted");
+        assert_eq!(
+            (sel.anchor, sel.cursor),
+            ((at.0 - 1, at.1), (at.0 + 2, at.1))
+        );
+    }
+
+    /// Zero-width grapheme components live on the base terminal cell. Copying
+    /// must retain them without letting them shift cell-coordinate lookup.
+    #[test]
+    fn a_double_click_preserves_complete_graphemes() {
+        let _env = crate::persist::test_env("double-click-copy-graphemes");
+        for (shown, expected) in [
+            ("go 👩‍💻 next", "👩‍💻"),
+            ("go 🖥️ next", "🖥️"),
+            ("go e\u{301}lan next", "e\u{301}lan"),
+        ] {
+            // Keep the click clear of the pane-resize target at the left edge.
+            let (mut app, _t, at) = fixture_showing(shown, 3);
+            app.handle_event(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                at,
+                KeyModifiers::NONE,
+            ));
+            app.handle_event(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                at,
+                KeyModifiers::NONE,
+            ));
+            app.handle_event(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                at,
+                KeyModifiers::NONE,
+            ));
+
+            assert_eq!(
+                app.pending_clipboard.as_deref(),
+                Some(expected),
+                "{shown:?}"
+            );
+        }
+    }
+
+    /// The wide-character case for Ctrl-hover/Ctrl-click link resolution, which
+    /// shares the same `visible_rows` indexing: a CJK glyph before a path must not
+    /// shift where the underline lands or which cells open.
+    #[test]
+    fn ctrl_hover_after_wide_characters_underlines_the_real_cells() {
+        let _env = crate::persist::test_env("ctrl-hover-wide");
+        // 你好 then a real on-disk path: Cargo.toml occupies grid cols 5..15.
+        let (app, _t, at) = fixture_showing("你好 Cargo.toml", 5);
+
+        let h = app
+            .link_at_screen(at.0, at.1)
+            .expect("the path after the CJK glyphs resolves");
+        assert!(
+            matches!(&h.target, LinkTarget::File { .. }),
+            "got {:?}",
+            h.target
+        );
+        assert!(
+            h.link.covers(5, 0),
+            "underline starts at the path's true column"
+        );
+        assert!(h.link.covers(14, 0), "and reaches its end");
+        assert!(!h.link.covers(4, 0), "not the space before it");
+    }
+
+    #[test]
+    fn mouse_selection_anchor_survives_scrollback_while_dragging() {
+        let _env = crate::persist::test_env("mouse-selection-scroll-anchor");
+        let source = (0..100)
+            .map(|line| format!("line-{line:03}\r\n"))
+            .collect::<String>();
+        let (mut app, _term, _) = fixture_showing(&source, 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let start = (
+            content.x + "line-000".len() as u16 - 1,
+            content.bottom().saturating_sub(4),
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start,
+            KeyModifiers::NONE,
+        ));
+        let anchor = app
+            .selection
+            .and_then(|selection| selection.retained)
+            .expect("terminal selection uses retained rows")
+            .anchor;
+        let anchor_text = app
+            .panes
+            .get(&pane)
+            .and_then(|pane| pane.retained_row_text(anchor.0))
+            .expect("anchored row")
+            .trim_end()
+            .to_string();
+        assert!(!anchor_text.is_empty(), "fixture anchor contains text");
+
+        // Extend beyond the original viewport. Each wheel event scrolls three
+        // retained rows while the pointer remains part of the active gesture.
+        for _ in 0..8 {
+            app.handle_event(mouse(MouseEventKind::ScrollUp, start, KeyModifiers::NONE));
+        }
+        let end = (content.x, content.y + 1);
+        app.handle_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            end,
+            KeyModifiers::NONE,
+        ));
+
+        let retained = app
+            .selection
+            .and_then(|selection| selection.retained)
+            .expect("retained selection after scrolling");
+        assert_eq!(
+            retained.anchor, anchor,
+            "scrolling must never re-anchor the original press"
+        );
+        assert!(
+            retained.cursor.0 < retained.anchor.0,
+            "dragging after wheel scroll extends into older history"
+        );
+        let selected = app.selection_text().expect("selected history text");
+        assert_eq!(
+            selected.lines().last(),
+            Some(anchor_text.as_str()),
+            "the copied range still ends on the row where the drag began"
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            end,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.pending_clipboard.as_deref(), Some(selected.as_str()));
+    }
+
+    #[test]
+    fn stationary_click_stays_empty_when_output_advances_history() {
+        let _env = crate::persist::test_env("mouse-selection-output-drift");
+        let source = (0..100)
+            .map(|line| format!("line-{line:03}\r\n"))
+            .collect::<String>();
+        let (mut app, _term, _) = fixture_showing(&source, 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let at = (content.x + 2, content.bottom().saturating_sub(2));
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.selection.is_some(), "the press begins a selection");
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .engine
+            .lock()
+            .expect("terminal engine")
+            .advance(b"incoming-output\r\n");
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+
+        assert!(app.pending_clipboard.is_none());
+        assert!(app.toast.is_none());
+        assert!(app.selection.is_none(), "a plain click leaves no highlight");
+    }
+
+    #[test]
+    fn wheel_alone_can_extend_an_active_selection() {
+        let _env = crate::persist::test_env("mouse-selection-wheel-only");
+        let source = (0..100)
+            .map(|line| format!("line-{line:03}\r\n"))
+            .collect::<String>();
+        let (mut app, _term, _) = fixture_showing(&source, 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let at = (content.x + 2, content.bottom().saturating_sub(4));
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.selection.is_some(), "the press begins a selection");
+        app.handle_event(mouse(MouseEventKind::ScrollUp, at, KeyModifiers::NONE));
+        let selection = app.selection.expect("active selection");
+        let retained = selection.retained.expect("retained endpoints");
+        assert!(selection.scrolled);
+        assert_ne!(retained.anchor, retained.cursor);
+        let selected = app.selection_text().expect("wheel-extended text");
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.pending_clipboard.as_deref(), Some(selected.as_str()));
+    }
+
+    #[test]
+    fn wheel_returning_to_the_anchor_does_not_copy_one_cell() {
+        let _env = crate::persist::test_env("mouse-selection-wheel-return");
+        let source = (0..100)
+            .map(|line| format!("line-{line:03}\r\n"))
+            .collect::<String>();
+        let (mut app, _term, _) = fixture_showing(&source, 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let at = (content.x + 2, content.bottom().saturating_sub(4));
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.selection.is_some(), "the press begins a selection");
+        app.handle_event(mouse(MouseEventKind::ScrollUp, at, KeyModifiers::NONE));
+        app.handle_event(mouse(MouseEventKind::ScrollDown, at, KeyModifiers::NONE));
+        let retained = app
+            .selection
+            .and_then(|selection| selection.retained)
+            .expect("retained endpoints");
+        assert_eq!(retained.anchor, retained.cursor);
+        assert!(app.selection_text().is_none());
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.pending_clipboard.is_none());
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn mouse_copy_is_independent_of_detected_agent() {
+        let _env = crate::persist::test_env("mouse-copy-agent-independent");
+        let (mut app, _term, _) = fixture_showing("  hello", 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
         app.selection = Some(crate::app::Selection {
             pane,
             content,
             anchor: (content.x + 1, content.y),
-            cursor: (content.x + 6, content.y + 1),
+            cursor: (content.x + 6, content.y),
+            retained: None,
+            scrolled: false,
+            dragging: false,
         });
 
-        assert_eq!(app.selection_text().as_deref(), Some("hello\nworld"));
+        let shell = app.selection_text();
+        app.status.get_mut(&pane).expect("pane status").agent = "codex".into();
+        assert_eq!(app.selection_text(), shell);
+        assert_eq!(shell.as_deref(), Some(" hello"));
     }
 }

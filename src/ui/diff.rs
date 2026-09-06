@@ -1,7 +1,5 @@
 //! Native DIFF renderer (docs/88). It draws only the visible cached row slice.
 
-use std::collections::HashMap;
-
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -21,6 +19,7 @@ pub(super) struct DiffRenderContext<'a> {
     pub picker: Option<&'a DiffAgentPicker>,
     pub marker_style: DiffMarkerStyle,
     pub color_mode: DiffColorMode,
+    pub mobile: bool,
     pub source_hits: &'a mut Vec<(crate::ids::PaneId, usize, DiffSide, Rect)>,
     pub note_hits: &'a mut Vec<(crate::ids::PaneId, String, Rect)>,
 }
@@ -56,6 +55,7 @@ pub(super) fn draw_diff_view(
         picker,
         marker_style,
         color_mode,
+        mobile,
         source_hits,
         note_hits,
     } = context;
@@ -68,12 +68,14 @@ pub(super) fn draw_diff_view(
         return;
     }
     let header = Rect::new(area.x, area.y, area.width, 1);
+    let show_footer =
+        !mobile || view.note_draft.is_some() || view.note_selecting || view.search_editing;
     let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
     let body = Rect::new(
         area.x,
         area.y.saturating_add(1),
         area.width,
-        area.height.saturating_sub(2),
+        area.height.saturating_sub(1 + u16::from(show_footer)),
     );
     let effective = if view.wrap {
         DiffLayoutPreference::Stack
@@ -176,21 +178,23 @@ pub(super) fn draw_diff_view(
         format!(" SEARCH> {}", view.search.as_deref().unwrap_or_default())
     } else {
         format!(
-            " [s] layout  [/] search  [n] note  [a] send  [m] viewed  {viewed}/{total} · {note_count} notes"
+            " [j/k] move  [q] close  [s] layout  [m] viewed  [/] search  [n] note  [a] send  ·  {viewed}/{total} viewed · {note_count} notes"
         )
     };
     if truncated {
         hint.push_str("  TRUNCATED");
     }
-    f.buffer_mut().set_line(
-        footer.x,
-        footer.y,
-        &Line::from(Span::styled(
-            clip(&hint, footer.width),
-            Style::new().fg(if truncated { t.coral } else { t.overlay0 }),
-        )),
-        footer.width,
-    );
+    if show_footer {
+        f.buffer_mut().set_line(
+            footer.x,
+            footer.y,
+            &Line::from(Span::styled(
+                clip(&hint, footer.width),
+                Style::new().fg(if truncated { t.coral } else { t.overlay0 }),
+            )),
+            footer.width,
+        );
+    }
     if let Some(picker) = picker.filter(|picker| picker.view == id) {
         draw_agent_picker(f, body, picker, t);
     }
@@ -346,15 +350,6 @@ fn draw_split(
     t: &Theme,
 ) {
     let notes = DiffNotes { view, state };
-    let mut stack_indices = HashMap::new();
-    for (index, line) in view.stack_rows.iter().enumerate() {
-        if let Some(number) = line.old_line {
-            stack_indices.insert((DiffSide::Old, number), index);
-        }
-        if let Some(number) = line.new_line {
-            stack_indices.insert((DiffSide::New, number), index);
-        }
-    }
     let selected_anchor = view.stack_rows.get(view.selected).and_then(line_anchor);
     let scroll_anchor = view.stack_rows.get(view.scroll).and_then(line_anchor);
     let start = scroll_anchor
@@ -418,13 +413,13 @@ fn draw_split(
         );
         if hits.interactive {
             if let Some(number) = row.old.as_ref().and_then(|line| line.old_line) {
-                if let Some(index) = stack_indices.get(&(DiffSide::Old, number)) {
+                if let Some(index) = view.stack_indices.get(&(DiffSide::Old, number)) {
                     hits.source
                         .push((hits.pane, *index, DiffSide::Old, old_rect));
                 }
             }
             if let Some(number) = row.new.as_ref().and_then(|line| line.new_line) {
-                if let Some(index) = stack_indices.get(&(DiffSide::New, number)) {
+                if let Some(index) = view.stack_indices.get(&(DiffSide::New, number)) {
                     hits.source
                         .push((hits.pane, *index, DiffSide::New, new_rect));
                 }
@@ -457,13 +452,13 @@ fn draw_split(
             .old
             .as_ref()
             .and_then(|line| line.old_line)
-            .and_then(|number| stack_indices.get(&(DiffSide::Old, number)))
+            .and_then(|number| view.stack_indices.get(&(DiffSide::Old, number)))
             .is_some_and(|index| *index == view.selected)
             || row
                 .new
                 .as_ref()
                 .and_then(|line| line.new_line)
-                .and_then(|number| stack_indices.get(&(DiffSide::New, number)))
+                .and_then(|number| view.stack_indices.get(&(DiffSide::New, number)))
                 .is_some_and(|index| *index == view.selected);
         if selected_here && view.note_draft.is_some() {
             y = draw_note_composer(f, area, y, view, t);
@@ -990,6 +985,19 @@ mod tests {
             false,
             false,
         );
+        view.stack_indices = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(index, line)| {
+                let old = line
+                    .old_line
+                    .map(|n| ((crate::diff::DiffSide::Old, n), index));
+                let new = line
+                    .new_line
+                    .map(|n| ((crate::diff::DiffSide::New, n), index));
+                old.into_iter().chain(new)
+            })
+            .collect();
         view.stack_rows = rows;
         view
     }

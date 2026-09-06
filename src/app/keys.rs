@@ -9,6 +9,15 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::*;
 
+/// Legacy terminals using the US number row report Shift+1 through Shift+9 as
+/// these symbols. Keep this transport representation separate from the label
+/// shown to users, which is `Shift+N` for the matching workspace default.
+const SHIFTED_DIGIT_KEYS: [&str; 9] = ["!", "@", "#", "$", "%", "^", "&", "*", "("];
+
+fn workspace_jump_index(position: u8) -> usize {
+    position.saturating_sub(1).min(8) as usize
+}
+
 /// Is this a real `Ctrl` chord, or is it AltGr typing a character?
 ///
 /// The Windows console reports AltGr as `CONTROL | ALT` — the layout driver
@@ -22,6 +31,27 @@ use super::*;
 /// chord the user meant, so it must keep working.
 pub fn is_ctrl_chord(mods: KeyModifiers) -> bool {
     mods.contains(KeyModifiers::CONTROL) && !(cfg!(windows) && mods.contains(KeyModifiers::ALT))
+}
+
+const SHORTCUT_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
+    .union(KeyModifiers::ALT)
+    .union(KeyModifiers::SHIFT);
+
+/// Ctrl+Space has several equivalent terminal encodings. Prefix and direct
+/// shortcuts must share this compatibility boundary.
+fn matches_ctrl_space_event(key: &KeyEvent) -> bool {
+    let modifiers = key.modifiers & SHORTCUT_MODIFIERS;
+    match key.code {
+        KeyCode::Null => key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL,
+        KeyCode::Char(' ') => modifiers == KeyModifiers::CONTROL,
+        // Some terminals retain the physical Shift used to type `@`; both
+        // Ctrl+@ forms represent NUL/Ctrl+Space.
+        KeyCode::Char('@') => {
+            modifiers == KeyModifiers::CONTROL
+                || modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        }
+        _ => false,
+    }
 }
 
 /// A prefix-mode command — the thing a key triggers after `Ctrl+Space`.
@@ -48,13 +78,23 @@ pub enum Cmd {
     CloseWorkspace,
     NextWorkspace,
     PrevWorkspace,
+    JumpWorkspace(u8),
     NewWorktree,
     OpenGit,
+    OpenDiff,
+    OpenMission,
     OpenBoard,
     OpenSettings,
+    OpenSessions,
     ToggleSidebar,
     ToggleRightSidebar,
+    FocusWorkspaces,
+    /// Focus the AGENTS list. The historical enum/config id remains stable so
+    /// existing user keymaps keep working after the command's UX is refined.
     ToggleAgents,
+    ToggleAgentScope,
+    /// Focus the FILES tree. The historical enum/config id remains stable so
+    /// existing user keymaps keep working after the command's UX is refined.
     ToggleFiles,
     Switcher,
     GlobalSearch,
@@ -85,13 +125,27 @@ impl Cmd {
         Cmd::CloseWorkspace,
         Cmd::NextWorkspace,
         Cmd::PrevWorkspace,
+        Cmd::JumpWorkspace(1),
+        Cmd::JumpWorkspace(2),
+        Cmd::JumpWorkspace(3),
+        Cmd::JumpWorkspace(4),
+        Cmd::JumpWorkspace(5),
+        Cmd::JumpWorkspace(6),
+        Cmd::JumpWorkspace(7),
+        Cmd::JumpWorkspace(8),
+        Cmd::JumpWorkspace(9),
         Cmd::NewWorktree,
         Cmd::OpenGit,
+        Cmd::OpenDiff,
+        Cmd::OpenMission,
         Cmd::OpenBoard,
         Cmd::OpenSettings,
+        Cmd::OpenSessions,
         Cmd::ToggleSidebar,
         Cmd::ToggleRightSidebar,
+        Cmd::FocusWorkspaces,
         Cmd::ToggleAgents,
+        Cmd::ToggleAgentScope,
         Cmd::ToggleFiles,
         Cmd::Switcher,
         Cmd::GlobalSearch,
@@ -122,13 +176,29 @@ impl Cmd {
             Cmd::CloseWorkspace => "close_node",
             Cmd::NextWorkspace => "next_node",
             Cmd::PrevWorkspace => "prev_node",
+            Cmd::JumpWorkspace(position) => [
+                "jump_workspace_1",
+                "jump_workspace_2",
+                "jump_workspace_3",
+                "jump_workspace_4",
+                "jump_workspace_5",
+                "jump_workspace_6",
+                "jump_workspace_7",
+                "jump_workspace_8",
+                "jump_workspace_9",
+            ][workspace_jump_index(position)],
             Cmd::NewWorktree => "new_worktree",
             Cmd::OpenGit => "open_git",
+            Cmd::OpenDiff => "open_diff",
+            Cmd::OpenMission => "open_mission",
             Cmd::OpenBoard => "open_board",
             Cmd::OpenSettings => "open_settings",
+            Cmd::OpenSessions => "open_sessions",
             Cmd::ToggleSidebar => "toggle_sidebar",
             Cmd::ToggleRightSidebar => "toggle_right_sidebar",
+            Cmd::FocusWorkspaces => "focus_workspaces",
             Cmd::ToggleAgents => "toggle_agents",
+            Cmd::ToggleAgentScope => "toggle_agent_scope",
             Cmd::ToggleFiles => "toggle_files",
             Cmd::Switcher => "switcher",
             Cmd::GlobalSearch => "search",
@@ -153,8 +223,7 @@ impl Cmd {
             Cmd::ClosePane => cat.cmd_close_pane,
             Cmd::ZoomPane => cat.cmd_zoom_pane,
             Cmd::ResizeMode => cat.cmd_resize_mode,
-            // The Keys tab's section headings are intentionally English too.
-            Cmd::CopyMode => "Copy terminal text",
+            Cmd::CopyMode => cat.settings.keys_copy_terminal_text,
             Cmd::NewTab => cat.cmd_new_tab,
             Cmd::NextTab => cat.cmd_next_tab,
             Cmd::PrevTab => cat.cmd_prev_tab,
@@ -163,13 +232,19 @@ impl Cmd {
             Cmd::CloseWorkspace => cat.cmd_close_workspace,
             Cmd::NextWorkspace => cat.cmd_next_workspace,
             Cmd::PrevWorkspace => cat.cmd_prev_workspace,
+            Cmd::JumpWorkspace(position) => cat.cmd_jump_workspace[workspace_jump_index(position)],
             Cmd::NewWorktree => cat.cmd_new_worktree,
             Cmd::OpenGit => cat.cmd_open_git,
+            Cmd::OpenDiff => cat.cmd_open_diff,
+            Cmd::OpenMission => cat.mc_open,
             Cmd::OpenBoard => cat.cmd_open_board,
             Cmd::OpenSettings => cat.cmd_open_settings,
+            Cmd::OpenSessions => cat.cmd_open_sessions,
             Cmd::ToggleSidebar => cat.cmd_toggle_sidebar,
             Cmd::ToggleRightSidebar => cat.cmd_toggle_right_sidebar,
+            Cmd::FocusWorkspaces => cat.cmd_focus_workspaces,
             Cmd::ToggleAgents => cat.cmd_toggle_agents,
+            Cmd::ToggleAgentScope => cat.cmd_toggle_agent_scope,
             Cmd::ToggleFiles => cat.cmd_toggle_files,
             Cmd::Switcher => cat.cmd_switcher,
             Cmd::GlobalSearch => cat.cmd_search,
@@ -177,11 +252,9 @@ impl Cmd {
         }
     }
 
-    /// Group heading for the Settings → Keys list. `Cmd::ALL` is ordered so each
-    /// group is contiguous; the Keys tab prints this label when it changes. Kept
-    /// English to match the tab's (English) how-to intro; the per-command
-    /// `label()` stays localized.
-    pub fn section(self) -> &'static str {
+    /// Localized group heading for the Settings → Keys list. `Cmd::ALL` is
+    /// ordered so each group is contiguous.
+    pub fn section(self, cat: &crate::i18n::Catalog) -> &'static str {
         match self {
             Cmd::FocusLeft
             | Cmd::FocusDown
@@ -195,22 +268,29 @@ impl Cmd {
             | Cmd::ClosePane
             | Cmd::ZoomPane
             | Cmd::ResizeMode
-            | Cmd::CopyMode => "Panes",
-            Cmd::NewTab | Cmd::NextTab | Cmd::PrevTab | Cmd::RenameTab => "Tabs",
+            | Cmd::CopyMode => cat.settings.keys_sections[0],
+            Cmd::NewTab | Cmd::NextTab | Cmd::PrevTab | Cmd::RenameTab => {
+                cat.settings.keys_sections[1]
+            }
             Cmd::NewWorkspace
             | Cmd::CloseWorkspace
             | Cmd::NextWorkspace
             | Cmd::PrevWorkspace
-            | Cmd::NewWorktree => "Nodes & worktrees",
+            | Cmd::JumpWorkspace(_)
+            | Cmd::NewWorktree => cat.settings.keys_sections[2],
             Cmd::OpenGit
+            | Cmd::OpenDiff
+            | Cmd::OpenMission
             | Cmd::OpenBoard
             | Cmd::OpenSettings
             | Cmd::ToggleSidebar
             | Cmd::ToggleRightSidebar
+            | Cmd::FocusWorkspaces
             | Cmd::ToggleAgents
+            | Cmd::ToggleAgentScope
             | Cmd::ToggleFiles
-            | Cmd::GlobalSearch => "Views & panels",
-            Cmd::Switcher | Cmd::Detach => "Session",
+            | Cmd::GlobalSearch => cat.settings.keys_sections[3],
+            Cmd::OpenSessions | Cmd::Switcher | Cmd::Detach => cat.settings.keys_sections[4],
         }
     }
 
@@ -237,19 +317,25 @@ impl Cmd {
             Cmd::RenameTab => ",",
             Cmd::NewWorkspace => "N",
             Cmd::CloseWorkspace => "D",
-            Cmd::NextWorkspace => "w",
-            Cmd::PrevWorkspace => "W",
+            Cmd::NextWorkspace => "u",
+            Cmd::PrevWorkspace => "U",
+            Cmd::JumpWorkspace(position) => SHIFTED_DIGIT_KEYS[workspace_jump_index(position)],
             Cmd::NewWorktree => "G",
             Cmd::OpenGit => "g",
+            Cmd::OpenDiff => "i",
+            Cmd::OpenMission => "m",
             Cmd::OpenBoard => "o",
             // `=` opens Settings (`,` now renames the tab, matching tmux). The
             // Menu button is always available too, so this is just the shortcut.
             Cmd::OpenSettings => "=",
+            Cmd::OpenSessions => "t",
             Cmd::ToggleSidebar => "b",
             Cmd::ToggleRightSidebar => "B",
+            Cmd::FocusWorkspaces => "w",
             Cmd::ToggleAgents => "a",
+            Cmd::ToggleAgentScope => "A",
             Cmd::ToggleFiles => "e",
-            Cmd::Switcher => "m",
+            Cmd::Switcher => "M",
             Cmd::GlobalSearch => "/",
             Cmd::Detach => "d",
         }
@@ -261,7 +347,10 @@ impl Cmd {
     /// from `build_keymap` — every binding now flows through this list or a user
     /// override, so nothing is bound behind the user's back.
     pub fn default_keys(self) -> Vec<&'static str> {
-        let mut keys = vec![self.default_key()];
+        let mut keys = match self.default_key() {
+            "" => Vec::new(),
+            key => vec![key],
+        };
         let aliases: &[&str] = match self {
             Cmd::FocusLeft => &["h"],
             Cmd::FocusDown => &["j"],
@@ -279,126 +368,22 @@ impl Cmd {
     }
 }
 
-/// Read-only reference blocks shown below the rebindable commands in Settings →
-/// Keys: the fixed keys and the context-specific shortcuts (scroll mode, the git
-/// tab, the task board, the folder picker, the mouse). Kept in one table so the
-/// count is authoritative for cursor bounds and the renderer just draws it. Each
-/// entry is `(section heading, &[(keys, what it does)])`. English, like the tab's
-/// how-to intro; the rebindable command labels stay localized.
-pub const KEY_REFERENCE: &[(&str, &[(&str, &str)])] = &[
-    (
-        "Always on (not rebindable)",
-        &[
-            ("h j k l", "focus panes (vim aliases)"),
-            ("q", "detach, leave the server running"),
-            ("X", "close pane"),
-            ("-", "split down"),
-            ("⇥ / ⇧⇥", "next / previous tab"),
-            ("prefix ×2", "send the literal configured prefix"),
-        ],
-    ),
-    (
-        "Scroll history  (no prefix)",
-        &[
-            ("Shift+↑", "enter scroll mode on the focused pane"),
-            ("j / k", "line down / up"),
-            ("Space / b", "page down / up"),
-            ("g / G", "top of history / back to live"),
-            ("1–9", "jump through history (1 oldest, 9 newest)"),
-            ("q  esc", "back to live"),
-        ],
-    ),
-    (
-        "Copy mode  (after Copy terminal text)",
-        &[
-            ("arrows  hjkl", "extend the selection by character / line"),
-            ("w / B", "next / previous word"),
-            ("Space / b", "page down / up"),
-            ("v", "reset the selection anchor at the cursor"),
-            ("y  ⏎", "copy and return to live output"),
-            ("q  esc", "cancel and restore the prior viewport"),
-        ],
-    ),
-    (
-        "Resize mode  (after prefix + r)",
-        &[
-            ("arrows  hjkl", "resize the focused pane"),
-            ("Shift+arrow", "bigger step"),
-            ("=  0", "equalize splits"),
-            ("esc", "exit resize mode"),
-        ],
-    ),
-    (
-        "Git tab  (after prefix + g)",
-        &[
-            ("1–6", "Commits Flow Branches PRs Issues Status"),
-            ("⇥ / ⇧⇥", "next / previous view"),
-            ("j / k", "scroll the list"),
-            ("/", "filter the list"),
-            ("d  c", "diff / create a PR"),
-            ("m", "scope: this repo or my work"),
-            ("o", "open on GitHub"),
-            ("r  q", "refresh / close the tab"),
-        ],
-    ),
-    (
-        "Task board  (after prefix + o)",
-        &[
-            ("a", "new task"),
-            ("s  d  m", "start / done / merge"),
-            ("x  D", "release / delete"),
-            ("o  ⏎", "detail / jump to worker pane"),
-            ("j / k", "move the cursor"),
-            ("q", "close the board"),
-        ],
-    ),
-    (
-        "Folder picker  (after prefix + N)",
-        &[
-            ("j / k", "move"),
-            ("→ / ←", "enter folder / go up"),
-            ("⏎", "open the folder as a node"),
-            ("n  w", "new folder / open as a worktree"),
-            ("esc", "cancel"),
-        ],
-    ),
-    (
-        "Copy & paste",
-        &[
-            ("drag", "select text; on release it copies to the clipboard"),
-            (
-                "shift+drag",
-                "select inside a mouse-aware app (e.g. an agent)",
-            ),
-            (
-                "⌘V  Ctrl+⇧V",
-                "your terminal's paste, into the focused pane",
-            ),
-        ],
-    ),
-    (
-        "Mouse",
-        &[
-            ("click", "focus a pane, or hit a row / button"),
-            ("right-click", "context menu: pane, node, agent, tab"),
-            ("wheel", "scroll the pane's history, or a list"),
-            ("drag divider", "resize the split"),
-            ("click branch", "open that node's git tab"),
-            ("tap pane", "zoom it (touch / mobile)"),
-        ],
-    ),
-];
-
 /// Total reference rows (not counting the section headings) — the authoritative
 /// count for the Keys-tab cursor, which steps through commands then these.
 pub fn key_reference_rows() -> usize {
-    KEY_REFERENCE.iter().map(|(_, rows)| rows.len()).sum()
+    crate::i18n::settings::KEY_REFERENCE_KEYS
+        .iter()
+        .map(|rows| rows.len())
+        .sum()
 }
 
 /// Canonical string for a command key after the prefix has been consumed.
 /// Used both to match presses and to display/store bindings.
 pub fn key_string(key: &KeyEvent) -> Option<String> {
     Some(match key.code {
+        KeyCode::Char(c @ '1'..='9') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            SHIFTED_DIGIT_KEYS[c as usize - '1' as usize].into()
+        }
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Left => "←".into(),
         KeyCode::Right => "→".into(),
@@ -430,10 +415,6 @@ impl Default for PrefixSpec {
 }
 
 impl PrefixSpec {
-    const RELEVANT_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
-        .union(KeyModifiers::ALT)
-        .union(KeyModifiers::SHIFT);
-
     /// Parse canonical specs such as `ctrl+space`, `alt+\`, `shift+f12`, or
     /// plain `f12`. Bare text remains invalid because it would swallow typing.
     pub fn parse(s: &str) -> Option<Self> {
@@ -513,21 +494,9 @@ impl PrefixSpec {
             return false;
         }
         if self.code == KeyCode::Char(' ') && self.modifiers == KeyModifiers::CONTROL {
-            if key.code == KeyCode::Null {
-                return key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL;
-            }
-            let modifiers = key.modifiers & Self::RELEVANT_MODIFIERS;
-            if matches!(key.code, KeyCode::Char(' ')) {
-                return modifiers == KeyModifiers::CONTROL;
-            }
-            // Some terminals spell Ctrl+Space as Ctrl+@ and may retain the
-            // physical Shift needed to type `@`; both encodings are NUL.
-            if matches!(key.code, KeyCode::Char('@')) {
-                return modifiers == KeyModifiers::CONTROL
-                    || modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT);
-            }
+            return matches_ctrl_space_event(key);
         }
-        if key.modifiers & Self::RELEVANT_MODIFIERS != self.modifiers {
+        if key.modifiers & SHORTCUT_MODIFIERS != self.modifiers {
             return false;
         }
         match (self.code, key.code) {
@@ -558,6 +527,147 @@ impl PrefixSpec {
         });
         parts.join("+")
     }
+}
+
+/// An opt-in shortcut handled directly in normal mode, without first entering
+/// prefix mode. The configuration stores semantic keys (`alt+right`), never
+/// terminal byte sequences, because the client has already decoded those bytes
+/// into a [`KeyEvent`] before application dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectKeySpec {
+    modifiers: KeyModifiers,
+    code: KeyCode,
+}
+
+impl DirectKeySpec {
+    pub fn parse(spec: &str) -> Option<Self> {
+        let mut modifiers = KeyModifiers::NONE;
+        let mut code = None;
+        for raw in spec.split('+') {
+            let part = raw.trim().to_ascii_lowercase();
+            match part.as_str() {
+                "" => {}
+                "ctrl" | "control" => modifiers.insert(KeyModifiers::CONTROL),
+                "alt" | "option" | "opt" => modifiers.insert(KeyModifiers::ALT),
+                "shift" => modifiers.insert(KeyModifiers::SHIFT),
+                "left" if code.is_none() => code = Some(KeyCode::Left),
+                "right" if code.is_none() => code = Some(KeyCode::Right),
+                "up" if code.is_none() => code = Some(KeyCode::Up),
+                "down" if code.is_none() => code = Some(KeyCode::Down),
+                "home" if code.is_none() => code = Some(KeyCode::Home),
+                "end" if code.is_none() => code = Some(KeyCode::End),
+                "pageup" | "page-up" if code.is_none() => code = Some(KeyCode::PageUp),
+                "pagedown" | "page-down" if code.is_none() => code = Some(KeyCode::PageDown),
+                "tab" if code.is_none() => code = Some(KeyCode::Tab),
+                "enter" | "return" if code.is_none() => code = Some(KeyCode::Enter),
+                "esc" | "escape" if code.is_none() => code = Some(KeyCode::Esc),
+                "delete" | "del" if code.is_none() => code = Some(KeyCode::Delete),
+                "insert" | "ins" if code.is_none() => code = Some(KeyCode::Insert),
+                "space" | "spc" if code.is_none() => code = Some(KeyCode::Char(' ')),
+                "plus" if code.is_none() => code = Some(KeyCode::Char('+')),
+                other if code.is_none() => {
+                    if let Some(number) = other
+                        .strip_prefix('f')
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .filter(|number| (1..=12).contains(number))
+                    {
+                        code = Some(KeyCode::F(number));
+                    } else if other.chars().count() == 1 && other.is_ascii() {
+                        code = Some(KeyCode::Char(other.chars().next()?));
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        let code = code?;
+        if modifiers.is_empty() {
+            return None;
+        }
+        if matches!(code, KeyCode::Char(_))
+            && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        Some(Self { modifiers, code })
+    }
+
+    fn matches(&self, key: &KeyEvent) -> bool {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
+        {
+            return false;
+        }
+        if self.code == KeyCode::Char(' ') && self.modifiers == KeyModifiers::CONTROL {
+            return matches_ctrl_space_event(key);
+        }
+        if key.modifiers & SHORTCUT_MODIFIERS != self.modifiers {
+            return false;
+        }
+        // A Windows AltGr character is reported as Ctrl+Alt. Never turn typed
+        // characters into direct commands merely because their layout needs
+        // AltGr; navigation keys with the same modifiers remain bindable.
+        if cfg!(windows)
+            && matches!(key.code, KeyCode::Char(_))
+            && key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        match (self.code, key.code) {
+            (KeyCode::Char(expected), KeyCode::Char(actual)) => {
+                expected.eq_ignore_ascii_case(&actual)
+            }
+            (KeyCode::Tab, KeyCode::BackTab) => self.modifiers.contains(KeyModifiers::SHIFT),
+            (expected, actual) => expected == actual,
+        }
+    }
+}
+
+pub type DirectKeymap = Vec<(DirectKeySpec, Cmd)>;
+
+/// Build only explicitly configured direct shortcuts. Unlike prefix bindings,
+/// this has no defaults: normal pane input remains untouched after upgrades.
+pub fn build_direct_keymap(overrides: &HashMap<String, String>) -> DirectKeymap {
+    let mut bindings: DirectKeymap = Vec::new();
+    for &cmd in Cmd::ALL {
+        let Some(spec) = overrides
+            .get(cmd.id())
+            .filter(|spec| !spec.is_empty())
+            .and_then(|spec| DirectKeySpec::parse(spec))
+        else {
+            continue;
+        };
+        if let Some(index) = bindings.iter().position(|(existing, _)| *existing == spec) {
+            bindings.remove(index);
+        }
+        bindings.push((spec, cmd));
+    }
+    bindings
+}
+
+pub fn direct_command(bindings: &DirectKeymap, key: &KeyEvent) -> Option<Cmd> {
+    bindings
+        .iter()
+        .find_map(|(spec, command)| spec.matches(key).then_some(*command))
+}
+
+pub fn validate_direct_keybindings(overrides: &HashMap<String, String>) -> Result<(), String> {
+    for &cmd in Cmd::ALL {
+        if let Some(spec) = overrides.get(cmd.id()).filter(|spec| !spec.is_empty()) {
+            if DirectKeySpec::parse(spec).is_none() {
+                return Err(format!(
+                    "direct binding {} must be a modified semantic key such as alt+right",
+                    cmd.id()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build the active `key → Cmd` map from the (id → key) config overrides on top
@@ -605,6 +715,17 @@ pub struct Preset {
     pub binds: &'static [(&'static str, &'static str)],
 }
 
+impl Preset {
+    pub fn localized_label(&self, cat: &crate::i18n::Catalog) -> &'static str {
+        match self.id {
+            "default" => cat.settings.preset_default,
+            "function" => cat.settings.preset_function,
+            "tmux" => cat.settings.preset_tmux,
+            _ => self.label,
+        }
+    }
+}
+
 /// The built-in presets. `default` restores luvus's own keys; `tmux` matches the
 /// muscle memory of a tmux user (`Ctrl+b` prefix, `%`/`"` splits) - most other
 /// tmux keys (`c`/`n`/`p`/`x`/`z`/`d`) already agree with luvus's defaults.
@@ -635,6 +756,13 @@ pub fn presets() -> &'static [Preset] {
                 // `(` / `)` step to the previous / next session (luvus workspace).
                 ("prev_node", "("),
                 ("next_node", ")"),
+                // tmux reserves `w` for its choose-tree equivalent below.
+                ("focus_workspaces", ""),
+                // These workspace defaults use the same legacy terminal symbols
+                // as tmux's split and previous-session keys. Mark them honestly
+                // unbound instead of displaying shortcuts that cannot run.
+                ("jump_workspace_5", ""),
+                ("jump_workspace_9", ""),
                 // `w` opens the jump palette (tmux's choose-window / -tree); the
                 // scope chips inside narrow it to tabs, workspaces, or agents.
                 ("switcher", "w"),
@@ -646,11 +774,18 @@ pub fn presets() -> &'static [Preset] {
 impl App {
     /// The key currently bound to `cmd` (override or default), for display.
     pub fn key_for(&self, cmd: Cmd) -> String {
-        self.config
+        let key = self
+            .config
             .keybindings
             .get(cmd.id())
             .cloned()
-            .unwrap_or_else(|| cmd.default_key().to_string())
+            .unwrap_or_else(|| cmd.default_key().to_string());
+        if let Cmd::JumpWorkspace(position) = cmd {
+            if key == SHIFTED_DIGIT_KEYS[workspace_jump_index(position)] {
+                return format!("Shift+{}", workspace_jump_index(position) + 1);
+            }
+        }
+        key
     }
 
     /// Rebind `cmd` to `key`, persist, and rebuild the active keymap. If `key`
@@ -671,14 +806,14 @@ impl App {
         }
         self.config.keybindings.insert(cmd.id().to_string(), key);
         self.keymap = build_keymap(&self.config.keybindings);
-        crate::config::save(&self.config);
+        self.persist_config();
     }
 
     /// Reset `cmd` to its default key (drop any override), persist, and rebuild.
     pub fn reset_binding(&mut self, cmd: Cmd) {
         self.config.keybindings.remove(cmd.id());
         self.keymap = build_keymap(&self.config.keybindings);
-        crate::config::save(&self.config);
+        self.persist_config();
     }
 
     /// Set the command-mode prefix from a safe spec such as `ctrl+b`, `alt+\`,
@@ -689,7 +824,7 @@ impl App {
             Some(p) => {
                 self.config.prefix = p.spec();
                 self.prefix = p;
-                crate::config::save(&self.config);
+                self.persist_config();
                 true
             }
             None => false,
@@ -712,7 +847,7 @@ impl App {
         }
         self.set_prefix(preset.prefix); // also saves config
         self.keymap = build_keymap(&self.config.keybindings);
-        crate::config::save(&self.config);
+        self.persist_config();
         true
     }
 
@@ -764,14 +899,31 @@ impl App {
             }
             Cmd::NextWorkspace => self.cycle_workspace(1),
             Cmd::PrevWorkspace => self.cycle_workspace(-1),
+            Cmd::JumpWorkspace(position) => {
+                let Some(index) = position.checked_sub(1).filter(|&index| index < 9) else {
+                    return;
+                };
+                if let Some(&(workspace, _)) =
+                    self.workspace_display_order().get(usize::from(index))
+                {
+                    self.active_ws = workspace;
+                }
+            }
             Cmd::NewWorktree => self.open_worktree_prompt(),
             Cmd::OpenGit => self.open_git_tab_active(),
+            Cmd::OpenDiff => self.focus_diff_list(),
+            Cmd::OpenMission => self.open_mission_control(self.active_ws),
             Cmd::OpenBoard => self.open_orch_board(),
             Cmd::OpenSettings => self.open_settings(),
+            Cmd::OpenSessions => self.open_named_session_menu(),
             Cmd::ToggleSidebar => self.toggle_all_sides(),
             Cmd::ToggleRightSidebar => self.toggle_side(crate::app::Side::Right),
-            Cmd::ToggleAgents => self.agents_active_only = !self.agents_active_only,
-            Cmd::ToggleFiles => self.toggle_files_dock(),
+            Cmd::FocusWorkspaces => self.focus_workspaces_dock(),
+            Cmd::ToggleAgents => self.focus_agents_dock(),
+            Cmd::ToggleAgentScope => {
+                self.set_agents_scope(!self.agents_this_workspace);
+            }
+            Cmd::ToggleFiles => self.focus_files_tree(),
             Cmd::Switcher => self.toggle_switcher(),
             Cmd::GlobalSearch => self.toggle_search(),
             Cmd::Detach => self.detach_requested = true,
@@ -828,10 +980,154 @@ mod tests {
         // `,` renames the tab (tmux-compatible); Settings moved to `=`.
         assert_eq!(m.get(","), Some(&Cmd::RenameTab));
         assert_eq!(m.get("="), Some(&Cmd::OpenSettings));
+        assert_eq!(m.get("t"), Some(&Cmd::OpenSessions));
         assert_eq!(m.get("y"), Some(&Cmd::CopyMode));
-        // every command is reachable by its default key
+        assert_eq!(m.get("i"), Some(&Cmd::OpenDiff));
+        assert_eq!(m.get("m"), Some(&Cmd::OpenMission));
+        assert_eq!(m.get("M"), Some(&Cmd::Switcher));
+        assert_eq!(m.get("w"), Some(&Cmd::FocusWorkspaces));
+        assert_eq!(m.get("u"), Some(&Cmd::NextWorkspace));
+        assert_eq!(m.get("U"), Some(&Cmd::PrevWorkspace));
+        assert_eq!(m.get("a"), Some(&Cmd::ToggleAgents));
+        assert_eq!(m.get("A"), Some(&Cmd::ToggleAgentScope));
+        // Every command is reachable by at least one default binding.
         for &c in Cmd::ALL {
-            assert!(m.values().any(|v| *v == c), "{c:?} bound");
+            assert!(m.values().any(|v| *v == c), "{c:?} default binding");
+        }
+    }
+
+    #[test]
+    fn workspace_jump_ids_are_stable_and_rebindable() {
+        let mut overrides = HashMap::new();
+        let defaults = ["!", "@", "#", "$", "%", "^", "&", "*", "("];
+        for (position, default) in (1..=9).zip(defaults) {
+            let command = Cmd::JumpWorkspace(position);
+            assert_eq!(command.id(), format!("jump_workspace_{position}"));
+            assert_eq!(command.default_keys(), vec![default]);
+        }
+
+        overrides.insert("jump_workspace_4".into(), "u".into());
+        assert_eq!(
+            build_keymap(&overrides).get("u"),
+            Some(&Cmd::JumpWorkspace(4))
+        );
+        assert!(!build_keymap(&overrides).contains_key("$"));
+
+        overrides.insert("jump_workspace_4".into(), String::new());
+        assert!(!build_keymap(&overrides)
+            .values()
+            .any(|command| *command == Cmd::JumpWorkspace(4)));
+    }
+
+    #[test]
+    fn workspace_jump_defaults_use_chord_labels_only_for_display() {
+        let _env = crate::persist::test_env("workspace-jump-display-labels");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+
+        for position in 1..=9 {
+            assert_eq!(
+                app.key_for(Cmd::JumpWorkspace(position)),
+                format!("Shift+{position}")
+            );
+        }
+
+        app.config
+            .keybindings
+            .insert("jump_workspace_1".into(), "u".into());
+        app.config
+            .keybindings
+            .insert("jump_workspace_2".into(), String::new());
+        assert_eq!(app.key_for(Cmd::JumpWorkspace(1)), "u");
+        assert_eq!(app.key_for(Cmd::JumpWorkspace(2)), "");
+    }
+
+    #[test]
+    fn workspace_jump_uses_sidebar_order_and_preserves_target_focus() {
+        let _env = crate::persist::test_env("jump-workspace-display-order");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let focus = app.layout().focus;
+        for position in 2..=3 {
+            app.workspaces.push(Workspace {
+                id: crate::ids::public_id("workspace"),
+                name: format!("workspace-{position}"),
+                cwd: std::path::PathBuf::from(format!("/tmp/workspace-{position}")),
+                branch: None,
+                git_ahead_behind: None,
+                worktree: None,
+                tabs: vec![Tab::panes(TileLayout::new(focus))],
+                active_tab: 0,
+                pinned: position == 3,
+            });
+        }
+        app.workspaces[2]
+            .tabs
+            .push(Tab::panes(TileLayout::new(focus)));
+        app.workspaces[2].active_tab = 1;
+
+        assert_eq!(
+            app.workspace_display_order(),
+            vec![(2, false), (0, false), (1, false)]
+        );
+        app.run_cmd(Cmd::JumpWorkspace(1));
+        assert_eq!(app.active_ws, 2, "position resolves through sidebar order");
+        assert_eq!(app.ws().active_tab, 1, "target active tab is preserved");
+        assert_eq!(
+            app.layout().focus,
+            focus,
+            "target focused pane is preserved"
+        );
+
+        app.run_cmd(Cmd::JumpWorkspace(9));
+        assert_eq!(app.active_ws, 2, "an unavailable position is a no-op");
+        app.run_cmd(Cmd::JumpWorkspace(0));
+        assert_eq!(app.active_ws, 2, "position zero is a no-op");
+        app.run_cmd(Cmd::JumpWorkspace(10));
+        assert_eq!(app.active_ws, 2, "an unsupported position is a no-op");
+    }
+
+    #[test]
+    fn open_sessions_command_opens_the_named_session_menu() {
+        let _env = crate::persist::test_env("open-sessions-key");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.server_mode = true;
+
+        app.run_cmd(Cmd::OpenSessions);
+
+        assert!(app.named_session_menu.is_some());
+    }
+
+    #[test]
+    fn legacy_switcher_override_does_not_mask_mission() {
+        let mut config = crate::config::Config {
+            version: 1,
+            ..Default::default()
+        };
+        config.keybindings.insert("switcher".into(), "m".into());
+
+        let config = crate::config::normalize_config(config);
+        let map = build_keymap(&config.keybindings);
+        assert_eq!(map.get("m"), Some(&Cmd::OpenMission));
+        assert_eq!(map.get("M"), Some(&Cmd::Switcher));
+    }
+
+    #[test]
+    fn legacy_m_and_uppercase_m_collisions_keep_both_entrypoints_usable() {
+        for occupied in ["m", "M"] {
+            let mut config = crate::config::Config {
+                version: 1,
+                ..Default::default()
+            };
+            config
+                .keybindings
+                .insert("open_git".into(), occupied.into());
+
+            let config = crate::config::normalize_config(config);
+            let map = build_keymap(&config.keybindings);
+            assert_eq!(map.get("m"), Some(&Cmd::OpenMission));
+            assert_eq!(map.get("M"), Some(&Cmd::Switcher));
         }
     }
 
@@ -924,6 +1220,157 @@ mod tests {
     }
 
     #[test]
+    fn direct_bindings_parse_semantic_modified_keys_only() {
+        let alt = KeyModifiers::ALT;
+        let right = DirectKeySpec::parse("alt+right").unwrap();
+        assert!(right.matches(&KeyEvent::new(KeyCode::Right, alt)));
+        assert!(!right.matches(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        assert!(!right.matches(&KeyEvent::new(KeyCode::Left, alt)));
+
+        assert!(DirectKeySpec::parse("ctrl+alt+left").is_some());
+        assert!(DirectKeySpec::parse("shift+f12").is_some());
+        assert!(DirectKeySpec::parse("alt+space").is_some());
+        assert_eq!(DirectKeySpec::parse("right"), None);
+        assert_eq!(DirectKeySpec::parse("shift+x"), None);
+        assert_eq!(DirectKeySpec::parse("\x1b[1;3C"), None);
+
+        let ctrl_space = DirectKeySpec::parse("ctrl+space").unwrap();
+        assert!(ctrl_space.matches(&KeyEvent::new(KeyCode::Null, KeyModifiers::NONE)));
+        assert!(ctrl_space.matches(&KeyEvent::new(KeyCode::Null, KeyModifiers::CONTROL)));
+        assert!(ctrl_space.matches(&KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL)));
+        assert!(ctrl_space.matches(&KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(!ctrl_space.matches(&KeyEvent::new(KeyCode::Char('@'), KeyModifiers::SHIFT)));
+        assert!(!ctrl_space.matches(&KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL | KeyModifiers::SUPER
+        )));
+    }
+
+    #[test]
+    fn direct_bindings_are_opt_in_and_resolve_command_collisions() {
+        assert!(build_direct_keymap(&HashMap::new()).is_empty());
+
+        let mut configured = HashMap::new();
+        configured.insert(Cmd::PrevTab.id().to_string(), "alt+left".to_string());
+        configured.insert(Cmd::NextTab.id().to_string(), "alt+right".to_string());
+        let bindings = build_direct_keymap(&configured);
+        assert_eq!(
+            direct_command(&bindings, &KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            Some(Cmd::PrevTab)
+        );
+        assert_eq!(
+            direct_command(&bindings, &KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+            Some(Cmd::NextTab)
+        );
+
+        configured.insert(Cmd::PrevTab.id().to_string(), "alt+right".to_string());
+        let bindings = build_direct_keymap(&configured);
+        assert_eq!(
+            direct_command(&bindings, &KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+            Some(Cmd::PrevTab),
+            "the later command in the stable command list owns a duplicate chord"
+        );
+    }
+
+    #[test]
+    fn direct_alt_arrows_switch_tabs_without_changing_prefix_bindings() {
+        let _env = crate::persist::test_env("direct-alt-tab-switch");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.run_cmd(Cmd::NewTab);
+        app.run_cmd(Cmd::NewTab);
+        assert_eq!(app.ws().active_tab, 2);
+
+        app.config
+            .direct_keybindings
+            .insert(Cmd::PrevTab.id().into(), "alt+left".into());
+        app.config
+            .direct_keybindings
+            .insert(Cmd::NextTab.id().into(), "alt+right".into());
+        app.direct_keymap = build_direct_keymap(&app.config.direct_keybindings);
+
+        assert!(app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::ALT,
+        ))));
+        assert_eq!(app.ws().active_tab, 1);
+        assert!(app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::ALT,
+        ))));
+        assert_eq!(app.ws().active_tab, 2);
+
+        app.direct_keymap.clear();
+        assert!(!app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::ALT,
+        ))));
+        assert_eq!(
+            app.ws().active_tab,
+            2,
+            "unbound Alt+Left returns to the pane"
+        );
+    }
+
+    #[test]
+    fn configured_prefix_takes_precedence_over_a_direct_collision() {
+        let _env = crate::persist::test_env("direct-prefix-precedence");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.run_cmd(Cmd::NewTab);
+        let active = app.ws().active_tab;
+        app.config
+            .direct_keybindings
+            .insert(Cmd::PrevTab.id().into(), "ctrl+space".into());
+        app.direct_keymap = build_direct_keymap(&app.config.direct_keybindings);
+
+        assert!(app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL,
+        ))));
+        assert_eq!(app.mode, Mode::Prefix);
+        assert_eq!(app.ws().active_tab, active);
+    }
+
+    #[test]
+    fn direct_shortcuts_remain_global_over_focused_surfaces() {
+        let _env = crate::persist::test_env("direct-global-surfaces");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.run_cmd(Cmd::NewTab);
+        app.config
+            .direct_keybindings
+            .insert(Cmd::PrevTab.id().into(), "alt+left".into());
+        app.direct_keymap = build_direct_keymap(&app.config.direct_keybindings);
+
+        app.files_focused = true;
+        assert!(app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::ALT,
+        ))));
+        assert_eq!(
+            app.ws().active_tab,
+            0,
+            "FILES does not consume the shortcut"
+        );
+
+        app.files_focused = false;
+        app.open_mission_control(0);
+        assert!(app.active_is_mission());
+        assert!(app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::ALT,
+        ))));
+        assert!(
+            !app.active_is_mission(),
+            "dashboard input does not consume the shortcut"
+        );
+    }
+
+    #[test]
     fn apply_tmux_preset_sets_prefix_and_split_keys() {
         let _env = crate::persist::test_env("tmux-preset");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -941,6 +1388,13 @@ mod tests {
         assert_eq!(app.keymap.get(","), Some(&Cmd::RenameTab));
         assert_eq!(app.keymap.get(")"), Some(&Cmd::NextWorkspace));
         assert_eq!(app.keymap.get("("), Some(&Cmd::PrevWorkspace));
+        assert!(app.key_for(Cmd::FocusWorkspaces).is_empty());
+        assert!(app.key_for(Cmd::JumpWorkspace(5)).is_empty());
+        assert!(app.key_for(Cmd::JumpWorkspace(9)).is_empty());
+        assert!(!app
+            .keymap
+            .values()
+            .any(|command| matches!(command, Cmd::JumpWorkspace(5 | 9))));
         // The default split keys are gone under the preset.
         assert_ne!(app.keymap.get("v"), Some(&Cmd::SplitRight));
         // `default` restores luvus's own prefix and keys.
@@ -964,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_question_opens_help_and_any_key_closes() {
+    fn prefix_question_opens_scrollable_help_and_other_keys_close() {
         use crate::event::AppEvent;
         use ratatui::crossterm::event::KeyModifiers;
         let prefix = || AppEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
@@ -976,7 +1430,21 @@ mod tests {
         app.handle_event(prefix());
         app.handle_event(ch('?')); // Ctrl+Space ? opens the cheat-sheet
         assert!(app.help_open, "? opened the help overlay");
-        app.handle_event(ch('x')); // any key dismisses it (and is swallowed)
+        app.handle_event(ch('j'));
+        assert!(app.help_open, "navigation keeps the overlay open");
+        assert_eq!(app.help_scroll, 1);
+        app.help_scroll_max = 40;
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::End,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.help_scroll, 40);
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.help_scroll, 39, "up moves away from the bottom");
+        app.handle_event(ch('x')); // a non-navigation key dismisses it (and is swallowed)
         assert!(!app.help_open, "next key closed the overlay");
         // The swallowed key must not have acted (e.g. closed a pane).
         assert_eq!(app.panes.len(), 1);
@@ -1136,6 +1604,131 @@ mod tests {
         assert!(app.tab_rename.is_none());
         app.run_cmd(Cmd::RenameTab);
         assert!(app.tab_rename.is_some(), "rename tab opened the modal");
+    }
+
+    #[test]
+    fn toggle_agent_scope_command_persists_both_choices() {
+        let _env = crate::persist::test_env("toggle-agent-scope-command");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert!(!app.agents_this_workspace);
+
+        app.agents_scroll = 7;
+        app.run_cmd(Cmd::ToggleAgentScope);
+        assert!(app.agents_this_workspace);
+        assert_eq!(app.agents_scroll, 0);
+        app.flush_config_for_test(&_rx);
+        assert!(crate::config::load().agents_this_workspace);
+
+        app.agents_scroll = 5;
+        app.run_cmd(Cmd::ToggleAgentScope);
+        assert!(!app.agents_this_workspace);
+        assert_eq!(app.agents_scroll, 0);
+        app.flush_config_for_test(&_rx);
+        assert!(!crate::config::load().agents_this_workspace);
+    }
+
+    #[test]
+    fn agents_command_focuses_the_dock_and_filter_key_persists() {
+        let _env = crate::persist::test_env("focus-agents-command");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert!(!app.agents_active_only);
+
+        app.agents_scroll = 7;
+        app.run_cmd(Cmd::ToggleAgents);
+        assert_eq!(app.sidebar_focus, Some(SidebarListFocus::Agents));
+        assert!(!app.agents_active_only, "focus does not change the filter");
+
+        app.handle_agents_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(app.agents_active_only);
+        assert_eq!(app.agents_scroll, 0);
+        app.flush_config_for_test(&_rx);
+        assert!(crate::config::load().agents_active_only);
+
+        app.agents_scroll = 5;
+        app.handle_agents_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(!app.agents_active_only);
+        assert_eq!(app.agents_scroll, 0);
+        app.flush_config_for_test(&_rx);
+        assert!(!crate::config::load().agents_active_only);
+    }
+
+    #[test]
+    fn workspace_focus_navigates_without_switching_until_enter() {
+        let _env = crate::persist::test_env("focus-workspaces-command");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.workspaces.push(Workspace {
+            id: crate::ids::public_id("workspace"),
+            name: "second".into(),
+            cwd: std::env::current_dir().unwrap(),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![Tab::panes(TileLayout::new(pane))],
+            active_tab: 0,
+            pinned: false,
+        });
+
+        app.run_cmd(Cmd::FocusWorkspaces);
+        assert_eq!(app.sidebar_focus, Some(SidebarListFocus::Workspaces));
+        app.handle_workspaces_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.active_ws, 0, "moving the cursor does not switch early");
+        app.handle_workspaces_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.active_ws, 1);
+        assert_eq!(app.sidebar_focus, None);
+    }
+
+    #[test]
+    fn sidebar_action_key_opens_keyboard_selected_context_menus() {
+        let _env = crate::persist::test_env("sidebar-action-menus");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+
+        app.run_cmd(Cmd::FocusWorkspaces);
+        app.handle_workspaces_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.ws_menu.as_ref().and_then(|menu| menu.selected), Some(0));
+        app.handle_ws_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.ws_menu.as_ref().and_then(|menu| menu.selected), Some(1));
+
+        app.ws_menu = None;
+        app.resumable.push(crate::agent::SessionInfo {
+            agent: "claude".into(),
+            session_id: "keyboard-menu".into(),
+            cwd: std::env::current_dir().unwrap(),
+            updated: std::time::SystemTime::now(),
+        });
+        app.run_cmd(Cmd::ToggleAgents);
+        app.handle_agents_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.agent_menu.as_ref().map(|menu| menu.target.clone()),
+            Some(AgentTarget::Session(0))
+        ));
+        assert_eq!(
+            app.agent_menu.as_ref().and_then(|menu| menu.selected),
+            Some(0)
+        );
+        app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            app.agent_menu.as_ref().and_then(|menu| menu.selected),
+            Some(4),
+            "keyboard navigation skips the divider"
+        );
+    }
+
+    #[test]
+    fn mission_command_opens_the_dashboard_in_the_active_workspace() {
+        let _env = crate::persist::test_env("mission-prefix-command");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+
+        assert!(!app.active_is_mission());
+        app.run_cmd(Cmd::OpenMission);
+        assert!(app.active_is_mission());
     }
 
     #[test]

@@ -6,15 +6,21 @@ description: Themes, layout, notifications, keybindings, language, and integrati
 Open with the **Menu** button (top right) or `Ctrl+Space =`. Every change
 applies live and persists to `~/.luvus/config.json`.
 
+Persistence runs off the UI loop. Rapid edits coalesce while an earlier write
+finishes, and unrelated settings saved by another named session are preserved.
+If storage is busy or a write fails, Luvus retains the changes for retry and
+reports the failure. Socket-based config reload waits for pending saves rather
+than replacing the live settings with an older disk copy.
+
 | Tab | What's there |
 |---|---|
-| **General** | **Open files with** (read-only or an editor you have installed, see [Browsing & Opening Files](/docs/guides/files/)), then a **Notify** section: **sound on done** and **sound on blocked**, both off by default, plus a **Test sound** row to hear it first |
+| **General** | **Open files with** (read-only or an editor you have installed) and **File click behavior** (**Preview**, the default, or **Open in tab**), see [Browsing & Opening Files](/docs/guides/files/), then a **Notify** section with Retro, Soft, and Pulse sound styles, separate done and blocked toggles, and a test row for each cue |
 | **Theme** | 17 bundled palettes, installed community/local themes, and the client-derived **Terminal** theme, previewed live as you move; installed rows include a right-aligned remove action |
-| **Layout** | pane gaps, pane titles, resume-into-workspace behavior, sidebar docks, DIFF layout and limits, and `[Top] [Bottom] [Off]` placement for every [Luvus Bar](/docs/guides/bar/) widget |
+| **Layout** | pane gaps, pane titles, automatic mobile width, resume-into-workspace behavior, sidebar docks, DIFF layout and limits, and `[Top] [Bottom] [Off]` placement for every [Luvus Bar](/docs/guides/bar/) widget |
 | **Keys** | every command's binding: click one, press the new key (`⌫` resets to default) |
 | **Modules** | installed extensions: enable/disable, action counts, load warnings |
-| **Integrations** | install/uninstall the per-agent session hook (Claude · Copilot · Codex · opencode · Kimi · Grok) |
-| **Language** | the UI in 8 languages (en · es · pt · fr · de · id · zh · ja), swapped live |
+| **Integrations** | install/uninstall the per-agent session hook (Claude · Copilot · Codex · opencode · Kimi · Grok · OMP) |
+| **Language** | the UI and human CLI information in 9 languages (en · es · pt · fr · de · id · zh · ja · ko), swapped live; command syntax, JSON, and UHP remain canonical |
 
 These docs run on the same palettes: the picker in the header (or in the menu
 on a phone) repaints this site with the theme you are curious about, so you can

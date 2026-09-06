@@ -17,12 +17,13 @@
   bashInteractive,
   coreutils,
   procps,
+  sqlite,
   stdenv,
 }:
 
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "luvus";
-  version = "0.12.0";
+  version = "0.13.4";
 
   # Required for new by-name packages (nixpkgs-vet NPV-166).
   __structuredAttrs = true;
@@ -37,6 +38,14 @@ rustPlatform.buildRustPackage (finalAttrs: {
   cargoHash = lib.fakeHash;
 
   nativeBuildInputs = [ makeWrapper ];
+
+  # On macOS, Cargo.toml deliberately links the SYSTEM sqlite
+  # (/usr/lib/libsqlite3.dylib) instead of bundling it, so the crate passes
+  # `-lsqlite3` at the final link. The Nix build sandbox has no /usr/lib, so
+  # the link fails with `ld: library not found for -lsqlite3`. Provide nixpkgs'
+  # sqlite on Darwin: the link resolves, and the dylib lands in the runtime
+  # closure. Linux keeps rusqlite's bundled engine and needs nothing extra.
+  buildInputs = lib.optionals stdenv.hostPlatform.isDarwin [ sqlite ];
 
   # The test suite spawns real PTYs, `ps`, and child processes and reads $HOME,
   # all awkward inside the Nix sandbox; upstream CI runs the full suite on every
@@ -67,7 +76,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
     description = "Mission control for your AI coding agents";
     homepage = "https://luvus.dev";
     changelog = "https://github.com/RizRiyz/luvus/releases/tag/v${finalAttrs.version}";
-    license = lib.licenses.agpl3Plus;
+    license = lib.licenses.asl20;
     mainProgram = "luvus";
     maintainers = with lib.maintainers; [ rizriyz ];
     platforms = lib.platforms.unix;

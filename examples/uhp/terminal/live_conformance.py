@@ -62,11 +62,6 @@ def main():
             "LUVUS_SESSION",
             "LUVUS_ENV",
             "LUVUS_PANE_ID",
-            "BOHAY_SOCKET_PATH",
-            "BOHAY_SESSION",
-            "BOHAY_ENV",
-            "BOHAY_PANE_ID",
-            "BOHAY_HOME",
         ):
             environment.pop(key, None)
         server = subprocess.Popen(
@@ -170,11 +165,12 @@ def main():
                 "method": "agent.wait",
                 "params": {
                     "pane": runtime["pane_id"],
-                    "status": "working",
+                    "statuses": ["blocked", "working"],
                     "timeout_s": 1,
                 },
             })
             assert waited_agent["result"]["matched"] is True
+            assert waited_agent["result"]["status"] == "working"
             released = request(socket_path, {
                 "id": "agent-release",
                 "method": "agent.release",

@@ -2,8 +2,43 @@
 
 use std::path::{Path, PathBuf};
 
+/// Atomically move a completed same-directory temporary file over `destination`.
+/// Windows needs replace-existing semantics that `std::fs::rename` does not
+/// provide consistently; Unix rename already has the required behavior.
+pub fn atomic_replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::atomic_replace_file(source, destination)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(source, destination)
+    }
+}
+
 #[cfg(windows)]
 mod windows;
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+/// Whether the physical Option modifier is currently held by the local user.
+///
+/// Some macOS terminal emulators consume Option while translating Backspace,
+/// leaving Crossterm with an indistinguishable plain Backspace event. Querying
+/// the combined session flags at that narrow boundary lets the client restore
+/// Option without changing terminal configuration or globally intercepting
+/// keyboard input. Other platforms already report Alt through their terminal
+/// or console event and deliberately return false here.
+#[cfg(target_os = "macos")]
+pub fn option_modifier_pressed() -> bool {
+    macos::option_modifier_pressed()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn option_modifier_pressed() -> bool {
+    false
+}
 
 /// Do two paths name the same folder? (docs/43 WIN-6.)
 ///
@@ -22,6 +57,15 @@ mod windows;
 /// compare unequal. That is the intended trade.
 pub fn same_path(a: &Path, b: &Path) -> bool {
     path_key(a) == path_key(b)
+}
+
+/// True when `child` is `parent` or a folder inside it (docs/43 WIN-6 spelling).
+pub fn is_subpath(child: &Path, parent: &Path) -> bool {
+    let child = path_key(child);
+    let parent = path_key(parent);
+    child == parent
+        || child.starts_with(&format!("{parent}\\"))
+        || child.starts_with(&format!("{parent}/"))
 }
 
 /// The comparison key for [`same_path`] — normalized spelling, never displayed.
@@ -83,7 +127,7 @@ pub fn home_dir() -> Option<PathBuf> {
 /// (`pwsh.exe`, then `powershell.exe`), since `COMSPEC` is always `cmd.exe`
 /// regardless of the shell you launched from and so can't reveal PowerShell.
 pub fn resolve_shell(choice: &str) -> String {
-    if let Some(s) = crate::compat::inherited("LUVUS_SHELL", "BOHAY_SHELL") {
+    if let Some(s) = std::env::var_os("LUVUS_SHELL") {
         if !s.is_empty() {
             return s.to_string_lossy().into_owned();
         }
@@ -261,7 +305,12 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+pub fn process_cwd(pid: u32) -> Option<PathBuf> {
+    windows::process_cwd(pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
@@ -314,6 +363,129 @@ pub fn process_start_marker(_pid: u32) -> Option<String> {
 #[cfg(windows)]
 pub fn process_belongs_to_current_user(pid: u32) -> bool {
     windows::process_belongs_to_current_user(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buffer` is writable for the size passed to `proc_pidpath`, and
+    // the returned byte count is checked before constructing the path.
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    buffer.truncate(len as usize);
+    Some(PathBuf::from(String::from_utf8_lossy(&buffer).into_owned()))
+}
+
+/// True when `pid` is another Luvus process owned by this account.
+/// `server stop` uses this before force-killing an unresponsive server.
+pub fn is_stoppable_luvus_pid(pid: u32) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        if !process_belongs_to_current_user(pid) {
+            return false;
+        }
+        windows::process_executable(pid).is_some_and(|executable| {
+            let name = executable.rsplit(['\\', '/']).next().unwrap_or(&executable);
+            name.eq_ignore_ascii_case("luvus.exe")
+        })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .is_ok_and(|comm| comm.trim() == "luvus")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        process_executable(pid).is_some_and(|executable| {
+            executable
+                .file_name()
+                .is_some_and(|name| name == std::ffi::OsStr::new("luvus"))
+        })
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    {
+        let Some(info) = process_tree(pid).into_iter().next() else {
+            return false;
+        };
+        let name = info
+            .command
+            .split_whitespace()
+            .next()
+            .unwrap_or(&info.command);
+        let base = name.rsplit('/').next().unwrap_or(name);
+        base == "luvus"
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        false
+    }
+}
+
+/// End `pid` and its children. Used only after [`is_stoppable_luvus_pid`].
+pub fn force_terminate(pid: u32) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let status = no_window(
+            std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .status()?;
+        if status.success() || !is_stoppable_luvus_pid(pid) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "taskkill exited with {status}"
+            )))
+        }
+    }
+    #[cfg(unix)]
+    {
+        let pid_t = pid as libc::pid_t;
+        let mut tree = process_tree(pid);
+        if tree.is_empty() {
+            tree.push(ProcInfo {
+                pid,
+                depth: 0,
+                command: String::new(),
+            });
+        }
+        let pgid = unsafe { libc::getpgid(pid_t) };
+        if pgid == pid_t {
+            let _ = unsafe { libc::kill(-pid_t, libc::SIGKILL) };
+        }
+        let mut root_error = None;
+        for proc in tree.iter().rev() {
+            let result = unsafe { libc::kill(proc.pid as libc::pid_t, libc::SIGKILL) };
+            if result != 0 && proc.pid == pid {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    root_error = Some(error);
+                }
+            }
+        }
+        match root_error {
+            Some(error) if is_stoppable_luvus_pid(pid) => Err(error),
+            _ => Ok(()),
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
 }
 
 /// One process running under a pane, for the "what is actually running?" overlay.
@@ -415,6 +587,21 @@ fn proc_fs_table() -> Option<PsTable> {
 /// The process table from one `ps` invocation — the portable fallback and the
 /// path macOS/BSD always take. See [`ps_table`] for why Linux prefers `/proc`.
 #[cfg(unix)]
+fn parse_ps_command_line(line: &str) -> Option<(u32, u32, &str)> {
+    let line = line.trim_start();
+    let pid_end = line.find(char::is_whitespace)?;
+    let (pid, rest) = line.split_at(pid_end);
+    let rest = rest.trim_start();
+    let ppid_end = rest.find(char::is_whitespace)?;
+    let (ppid, command) = rest.split_at(ppid_end);
+    let command = command.trim_start();
+    if command.is_empty() {
+        return None;
+    }
+    Some((pid.parse().ok()?, ppid.parse().ok()?, command))
+}
+
+#[cfg(unix)]
 fn ps_command_table() -> Option<PsTable> {
     use std::collections::HashMap;
     let out = match std::process::Command::new("ps")
@@ -428,67 +615,110 @@ fn ps_command_table() -> Option<PsTable> {
     let mut cmd: HashMap<u32, String> = HashMap::new();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for line in text.lines() {
-        let mut it = line.split_whitespace();
-        let (Some(pid), Some(ppid)) = (it.next(), it.next()) else {
+        let Some((pid, ppid, command)) = parse_ps_command_line(line) else {
             continue;
         };
-        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
-            continue;
-        };
-        // Everything after the two numeric columns is the command, spaces intact.
-        let rest = line
-            .splitn(3, |c: char| c.is_whitespace())
-            .nth(2)
-            .unwrap_or("")
-            .trim_start();
-        if rest.is_empty() {
-            continue;
-        }
-        cmd.insert(pid, rest.to_string());
+        cmd.insert(pid, command.to_string());
         children.entry(ppid).or_default().push(pid);
     }
     Some((cmd, children))
 }
 
-/// Process identities running under each of `roots` (the root's own included),
-/// from one platform snapshot: command lines on Unix and executable names on
-/// Windows. This batched form lets agent detection cover every pane without one
-/// process-table operation per pane. `None` means the platform cannot tell.
+type ProcessTrees = std::collections::HashMap<u32, Vec<(u32, u16)>>;
+type ProcessCommands = std::collections::HashMap<u32, Vec<String>>;
+
+/// Capture one bounded platform process table and project every requested pane
+/// root into descendant pid trees and, when requested, command lines. Keeping
+/// both projections behind this boundary lets periodic CWD and agent scans
+/// share the expensive OS snapshot without coupling their app-level cadence.
 #[cfg(unix)]
-pub fn descendant_commands(roots: &[u32]) -> Option<std::collections::HashMap<u32, Vec<String>>> {
+fn pane_process_snapshot(
+    roots: &[u32],
+    include_trees: bool,
+    include_commands: bool,
+) -> (ProcessTrees, Option<ProcessCommands>) {
     use std::collections::{HashMap, HashSet};
-    let (cmd, children) = ps_table()?;
-    let mut out: HashMap<u32, Vec<String>> = HashMap::new();
-    for &root in roots {
-        let mut found = Vec::new();
-        let mut seen = HashSet::new();
-        let mut stack = vec![root];
-        while let Some(pid) = stack.pop() {
-            // Same bounds as `process_tree`: a visited set survives pid reuse,
-            // and the cap stops a pathological tree from being unbounded work.
-            if !seen.insert(pid) || found.len() >= 64 {
-                continue;
-            }
-            if let Some(c) = cmd.get(&pid) {
-                found.push(c.clone());
-            }
-            if let Some(kids) = children.get(&pid) {
-                stack.extend(kids.iter().copied());
-            }
-        }
-        out.insert(root, found);
-    }
-    Some(out)
+    let Some((commands_by_pid, children)) = ps_table() else {
+        return (HashMap::new(), None);
+    };
+    let trees: ProcessTrees = if include_trees {
+        roots
+            .iter()
+            .copied()
+            .map(|root| {
+                let mut nodes = Vec::new();
+                let mut seen = HashSet::new();
+                let mut stack = vec![(root, 0_u16)];
+                while let Some((pid, depth)) = stack.pop() {
+                    if !seen.insert(pid) || nodes.len() >= 64 {
+                        continue;
+                    }
+                    nodes.push((pid, depth));
+                    if let Some(kids) = children.get(&pid) {
+                        for &child in kids.iter().rev() {
+                            stack.push((child, depth.saturating_add(1)));
+                        }
+                    }
+                }
+                (root, nodes)
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let commands = include_commands.then(|| {
+        roots
+            .iter()
+            .copied()
+            .map(|root| {
+                // Preserve the command projection's established traversal
+                // order independently of the depth-first CWD projection.
+                let mut found = Vec::new();
+                let mut seen = HashSet::new();
+                let mut stack = vec![root];
+                while let Some(pid) = stack.pop() {
+                    if !seen.insert(pid) || found.len() >= 64 {
+                        continue;
+                    }
+                    if let Some(command) = commands_by_pid.get(&pid) {
+                        found.push(command.clone());
+                    }
+                    if let Some(kids) = children.get(&pid) {
+                        stack.extend(kids.iter().copied());
+                    }
+                }
+                (root, found)
+            })
+            .collect()
+    });
+    (trees, commands)
 }
 
 #[cfg(windows)]
-pub fn descendant_commands(roots: &[u32]) -> Option<std::collections::HashMap<u32, Vec<String>>> {
-    windows::descendant_commands(roots)
+fn pane_process_snapshot(
+    roots: &[u32],
+    include_trees: bool,
+    include_commands: bool,
+) -> (ProcessTrees, Option<ProcessCommands>) {
+    windows::pane_process_snapshot(roots, include_trees, include_commands)
+        .unwrap_or_else(|| (ProcessTrees::new(), None))
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn descendant_commands(_roots: &[u32]) -> Option<std::collections::HashMap<u32, Vec<String>>> {
-    None
+fn pane_process_snapshot(
+    _roots: &[u32],
+    _include_trees: bool,
+    _include_commands: bool,
+) -> (ProcessTrees, Option<ProcessCommands>) {
+    (ProcessTrees::new(), None)
+}
+
+/// Process identities running under each of `roots` (the root's own included),
+/// from one platform snapshot. This batched form lets agent detection cover
+/// every pane without one process-table operation per pane. `None` means the
+/// platform cannot tell.
+pub fn descendant_commands(roots: &[u32]) -> Option<ProcessCommands> {
+    pane_process_snapshot(roots, false, true).1
 }
 
 /// Every process running under `root` (inclusive), depth-first, newest branch
@@ -539,6 +769,133 @@ pub fn process_tree(root: u32) -> Vec<ProcInfo> {
 #[cfg(not(any(unix, windows)))]
 pub fn process_tree(_root: u32) -> Vec<ProcInfo> {
     Vec::new()
+}
+
+/// One pane's live cwd evidence from a shared process snapshot.
+///
+/// The PTY child owns the pane cwd. A descendant git cwd is a candidate
+/// override (Pi and similar `chdir` in a child) and must be held stable by
+/// the app before it can rehome the pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneCwdEvidence {
+    pub pid: u32,
+    pub owner_cwd: Option<PathBuf>,
+    pub owner_git_root: Option<PathBuf>,
+    pub descendant_git_cwd: Option<PathBuf>,
+    pub descendant_git_root: Option<PathBuf>,
+}
+
+/// Resolve CWD evidence and, optionally, process identities from one platform
+/// snapshot. The optional command projection is used only when the independent
+/// agent-detection deadline coincides with this CWD scan.
+#[cfg(test)]
+pub fn scan_pane_runtime(
+    roots: &[u32],
+    include_commands: bool,
+) -> (Vec<PaneCwdEvidence>, Option<ProcessCommands>) {
+    scan_pane_runtime_scoped(roots, include_commands.then_some(roots))
+}
+
+/// One OS snapshot, with independent CWD and command-projection demands.
+pub fn scan_pane_runtime_scoped(
+    cwd_roots: &[u32],
+    command_roots: Option<&[u32]>,
+) -> (Vec<PaneCwdEvidence>, Option<ProcessCommands>) {
+    let mut roots = cwd_roots.to_vec();
+    if let Some(commands) = command_roots {
+        roots.extend_from_slice(commands);
+        roots.sort_unstable();
+        roots.dedup();
+    }
+    let mut cache = std::collections::HashMap::new();
+    let (trees, commands) = pane_process_snapshot(&roots, true, command_roots.is_some());
+    let evidence = cwd_roots
+        .iter()
+        .map(|&root| {
+            let nodes = trees.get(&root).map(Vec::as_slice).unwrap_or(&[]);
+            evidence_from_tree(root, nodes, &mut cache)
+        })
+        .collect();
+    (evidence, commands)
+}
+
+/// Resolve every pane root from **one** process-table snapshot. Git-root
+/// probes are cached per directory for this scan. Call off the app loop.
+#[cfg(test)]
+pub fn scan_pane_cwds(roots: &[u32]) -> Vec<PaneCwdEvidence> {
+    scan_pane_runtime(roots, false).0
+}
+
+fn evidence_from_tree(
+    root: u32,
+    nodes: &[(u32, u16)],
+    cache: &mut std::collections::HashMap<String, Option<PathBuf>>,
+) -> PaneCwdEvidence {
+    let mut owner_cwd = None;
+    let mut best_git: Option<(u16, PathBuf, PathBuf)> = None;
+    for &(pid, depth) in nodes {
+        let Some(cwd) = process_cwd(pid).filter(|cwd| !is_system_cwd(cwd)) else {
+            continue;
+        };
+        if depth == 0 {
+            owner_cwd = Some(cwd.clone());
+        }
+        if let Some(git_root) = cached_git_root(&cwd, cache) {
+            if best_git
+                .as_ref()
+                .is_none_or(|(best_depth, _, _)| depth >= *best_depth)
+            {
+                best_git = Some((depth, cwd, git_root));
+            }
+        }
+    }
+    if owner_cwd.is_none() {
+        owner_cwd = process_cwd(root).filter(|cwd| !is_system_cwd(cwd));
+    }
+    let owner_git_root = owner_cwd
+        .as_ref()
+        .and_then(|cwd| cached_git_root(cwd, cache));
+    let (descendant_git_cwd, descendant_git_root) = match best_git {
+        Some((_, cwd, git_root)) => (Some(cwd), Some(git_root)),
+        None => (None, None),
+    };
+    PaneCwdEvidence {
+        pid: root,
+        owner_cwd,
+        owner_git_root,
+        descendant_git_cwd,
+        descendant_git_root,
+    }
+}
+
+fn cached_git_root(
+    cwd: &Path,
+    cache: &mut std::collections::HashMap<String, Option<PathBuf>>,
+) -> Option<PathBuf> {
+    let key = path_key(cwd);
+    if let Some(hit) = cache.get(&key) {
+        return hit.clone();
+    }
+    let root = git_root(cwd);
+    cache.insert(key, root.clone());
+    root
+}
+
+fn is_system_cwd(cwd: &Path) -> bool {
+    let key = path_key(cwd);
+    key == "c:\\windows"
+        || key.starts_with("c:\\windows\\")
+        || key.starts_with("c:\\program files")
+        || key.starts_with("c:\\programdata")
+}
+
+/// Nearest `.git` dir or worktree `.git` file in `cwd` or any ancestor.
+/// Filesystem probe only — no `git` subprocess — so a home folder like
+/// `C:\Users\Administrator` cannot block the UI thread on `git rev-parse`.
+pub fn git_root(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(|dir| dir.to_path_buf())
 }
 
 /// Raise the OS timer resolution so the event loop's timed waits (`recv_timeout`,
@@ -700,6 +1057,117 @@ mod tests {
         let _ = child.wait();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ps_command_line_handles_padded_numeric_columns() {
+        assert_eq!(
+            super::parse_ps_command_line(" 5555 91833 /bin/zsh"),
+            Some((5555, 91833, "/bin/zsh"))
+        );
+        assert_eq!(
+            super::parse_ps_command_line(" 6647  5555 opencode2 --model  gpt"),
+            Some((6647, 5555, "opencode2 --model  gpt"))
+        );
+        assert_eq!(
+            super::parse_ps_command_line("15818 91833 /bin/zsh"),
+            Some((15818, 91833, "/bin/zsh"))
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn pane_runtime_scan_projects_cwd_and_commands_from_one_snapshot() {
+        let pid = std::process::id();
+        let (evidence, commands) = super::scan_pane_runtime(&[pid], true);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].pid, pid);
+        assert!(
+            evidence[0].owner_cwd.is_some(),
+            "the current process cwd is visible"
+        );
+        let commands = commands.expect("the process table is supported");
+        assert!(
+            commands.get(&pid).is_some_and(|items| !items.is_empty()),
+            "the same snapshot includes the root command"
+        );
+
+        let (cwd_only, commands) = super::scan_pane_runtime(&[pid], false);
+        assert_eq!(cwd_only.len(), 1);
+        assert!(commands.is_none(), "command projection is demand-driven");
+        let (no_cwds, commands) = super::scan_pane_runtime_scoped(&[], Some(&[pid]));
+        assert!(
+            no_cwds.is_empty(),
+            "unrequested CWDs do not receive Git probes"
+        );
+        assert!(
+            commands.unwrap().contains_key(&pid),
+            "independent process demand remains represented"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_stoppable_pid_rejects_self_and_missing() {
+        assert!(!super::is_stoppable_luvus_pid(0));
+        assert!(!super::is_stoppable_luvus_pid(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_stoppable_pid_accepts_a_luvus_executable_with_arguments() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("stoppable-pid-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test executable directory");
+        let executable = dir.join("luvus");
+        let _ = std::fs::remove_file(&executable);
+        std::fs::copy("/bin/sleep", &executable).expect("luvus-named executable");
+        let mut child = std::process::Command::new(&executable)
+            .arg("30")
+            .spawn()
+            .expect("spawn luvus-named process");
+
+        let mut stoppable = false;
+        for _ in 0..20 {
+            if super::is_stoppable_luvus_pid(child.id()) {
+                stoppable = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&executable);
+        let _ = std::fs::remove_dir(&dir);
+        assert!(
+            stoppable,
+            "a live luvus executable must pass the kill guard"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_terminate_kills_a_setsid_child() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sleep");
+        command
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn sleep");
+        super::force_terminate(child.id()).expect("kill setsid child");
+        let status = child.wait().expect("reap sleep");
+        assert!(!status.success());
+    }
+
     #[test]
     fn run_then_interactive_covers_shell_families() {
         // POSIX shells must start normally and receive the command through their
@@ -831,5 +1299,57 @@ mod tests {
         }
         // An unknown keyword falls back to itself.
         assert_eq!(super::shell_label("nu"), "nu");
+    }
+
+    #[test]
+    fn git_root_walks_every_ancestor() {
+        let root = std::env::temp_dir().join(format!(
+            "luvus-git-deep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut nested = root.clone();
+        for i in 0..12 {
+            nested = nested.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+        std::fs::create_dir_all(root.join(".git")).expect("git root");
+        let found = super::git_root(&nested).expect("uncapped ancestor walk");
+        assert!(
+            super::same_path(&found, &root),
+            "git_root={found:?} repo={root:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_root_recognizes_worktree_git_file() {
+        let root = std::env::temp_dir().join(format!(
+            "luvus-git-wt-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let gitdir = root.join("main.git");
+        let worktree = root.join("linked");
+        std::fs::create_dir_all(&gitdir).expect("gitdir");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/feat\n").expect("HEAD");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect("worktree git file");
+        let found = super::git_root(&worktree).expect("worktree .git file");
+        assert!(
+            super::same_path(&found, &worktree),
+            "git_root={found:?} worktree={worktree:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

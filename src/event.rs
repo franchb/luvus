@@ -22,6 +22,7 @@ pub enum ClientInput {
 }
 
 pub enum AppEvent {
+    IoCompleted(crate::app::io_jobs::Completion),
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
@@ -30,6 +31,8 @@ pub enum AppEvent {
     PtyData(PaneId),
     /// The given pane's child process exited.
     PtyExit(PaneId),
+    /// Coalesced overload notification for all input sources, including replies.
+    PtyInputRejected(PaneId),
     /// A deferred pane finished opening its PTY and now owns a root process and
     /// stable terminal-backend identity. Pending panes are deliberately absent
     /// from public inventory until this event is applied by the app loop.
@@ -129,6 +132,23 @@ pub enum AppEvent {
         session: String,
         result: Result<(), String>,
     },
+    /// A user-requested snapshot of known named sessions completed off-loop.
+    NamedSessionsLoaded {
+        generation: u64,
+        result: Result<Vec<crate::session::SessionInfo>, String>,
+    },
+    /// A stop request for a named session finished (from the session-menu context menu).
+    NamedSessionStopped {
+        generation: u64,
+        name: String,
+        result: Result<(), String>,
+    },
+    /// A selected named session is ready for this client to attach.
+    NamedSessionPrepared {
+        generation: u64,
+        name: String,
+        result: Result<(), crate::app::session_menu::NamedSessionOpenError>,
+    },
     /// One structured Git status scan feeds FILES tint and DIFF (docs/88).
     DiffStatus {
         token: u64,
@@ -162,28 +182,74 @@ pub enum AppEvent {
     DiffProgressSaved {
         result: Result<(), String>,
     },
-    /// A file-view read finished (docs/38 FILE-3): applied to the view leaf `id`.
+    /// A file-view read finished (docs/38 FILE-3): applied to the view leaf `id`,
+    /// but only if it is still the newest read that leaf asked for.
+    ///
+    /// A preview leaf is repointed at a new file without cancelling the read
+    /// already in flight (`set_view_file`), and reads finish out of order.
+    /// `token` is the `FileView::read_token` the read was issued with and is the
+    /// invariant: newest wins. `path` is the file it carries — redundant while
+    /// every scheduler bumps the token, kept as a cheap backstop so a future one
+    /// that forgets cannot put another file's contents in this view.
     FileRead {
         id: PaneId,
+        path: std::path::PathBuf,
+        token: u64,
         load: crate::files::FileLoad,
     },
     /// Per-line git change markers for a file view finished computing
-    /// (docs/38 + docs/30).
+    /// (docs/38 + docs/30). Guarded exactly like `FileRead`, and it matters more
+    /// here: markers ride the *same* worker after the text, so they are the
+    /// later of the two to land.
     FileChanges {
         id: PaneId,
+        path: std::path::PathBuf,
+        token: u64,
         changes: Vec<crate::git::local::ChangeSpan>,
+    },
+    /// An explicit Markdown/Mermaid preview finished reading and parsing.
+    /// Token + path + kind make stale results harmless when a view changes.
+    PreviewRead {
+        id: PaneId,
+        path: std::path::PathBuf,
+        kind: crate::files::preview::PreviewKind,
+        token: u64,
+        load: crate::files::preview::PreviewLoad,
+    },
+    /// A width-specific immutable preview layout finished off the app loop.
+    PreviewLayout {
+        id: PaneId,
+        path: std::path::PathBuf,
+        kind: crate::files::preview::PreviewKind,
+        token: u64,
+        key: crate::files::preview::LayoutKey,
+        layout: std::sync::Arc<crate::files::preview::PreviewLayout>,
     },
     /// The periodic process scan finished: command lines running under each
     /// pane's child pid, from one `ps`. `None` means the platform cannot tell
     /// (Windows) or `ps` failed — detection then falls back to text heuristics
     /// rather than concluding that no agent is running.
     ProcScanned(Option<std::collections::HashMap<u32, Vec<String>>>),
+    /// One process-table snapshot resolved every pane cwd, plus workspace
+    /// branches and complete git-workspace candidates. Process and git probes
+    /// run off-loop; the app loop only validates and mutates.
+    CwdScanned {
+        panes: Vec<(crate::ids::PaneId, crate::platform::PaneCwdEvidence)>,
+        branches: Vec<(String, Option<String>)>,
+        workspace_candidates: Vec<crate::git::GitRootInfo>,
+    },
     /// A Mission Control usage scan finished (docs/54, MC-2/MC-4): best-effort
     /// tokens/context/cost keyed by agent + session id, read off-loop from native
     /// agent stores, plus each ledger's mtime so unchanged sessions stay cached.
     UsageScanned {
+        scope: crate::mission::MissionScope,
+        scanned: Vec<crate::mission::UsageKey>,
         usage: std::collections::HashMap<crate::mission::UsageKey, crate::mission::AgentUsage>,
         mtimes: std::collections::HashMap<crate::mission::UsageKey, std::time::SystemTime>,
+        /// Integration-owned keys excluded when this worker started. Carrying
+        /// the snapshot prevents a late result from reclassifying report data
+        /// as native after pane ownership changes.
+        report_owned: Vec<crate::mission::UsageKey>,
     },
     /// A git-tab fetch finished; apply it to the matching `GitView`.
     GitData {
@@ -196,6 +262,17 @@ pub enum AppEvent {
         task: String,
         code: Option<i32>,
         out: String,
+    },
+    /// A task branch finished integrating in the dedicated background
+    /// worktree. Git runs off-loop; the app owner validates and commits the
+    /// resulting task transition, event, and optional API reply.
+    TaskMergeFinished {
+        task: String,
+        branch: String,
+        previous: crate::orch::TaskStatus,
+        integration_branch: String,
+        result: Result<crate::git::local::MergeOutcome, String>,
+        reply: Option<(String, Sender<String>)>,
     },
     /// The background update check found a newer release than this build (the
     /// version string, e.g. `"0.9.3"`). Shows the indicator by the version number.
@@ -218,7 +295,10 @@ pub enum AppEvent {
     /// only validates and swaps the resulting live configuration.
     ConfigReloaded {
         id: String,
-        config: crate::config::Config,
+        /// Boxed: the whole config is by far the largest thing any event
+        /// carries, and every other `AppEvent` in the channel would otherwise
+        /// be padded to its size.
+        config: Box<crate::config::Config>,
         reply: Sender<String>,
     },
     /// Agent manifest IO and parsing completed on the socket worker.
@@ -250,7 +330,7 @@ pub enum AppEvent {
     AgentWait {
         id: String,
         pane: String,
-        state: String,
+        states: Vec<String>,
         timeout: Option<std::time::Duration>,
         reply: Sender<String>,
         cancelled: Arc<AtomicBool>,
@@ -273,4 +353,9 @@ pub enum AppEvent {
         reply: Sender<String>,
         cancelled: Arc<AtomicBool>,
     },
+    /// A termination signal arrived. The handler only writes a self-pipe; this
+    /// event wakes a sleeping event loop so shutdown does not wait on a timer.
+    /// Windows has no POSIX signals; the detached server stops via `server stop`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Shutdown,
 }

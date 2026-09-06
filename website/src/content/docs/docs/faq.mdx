@@ -29,8 +29,9 @@ Run `luvus doctor`. Local views need `git`. PRs/issues need an authenticated
 
 luvus identifies an agent by the program running in the pane, matched against a
 list of names it knows (Claude Code, Copilot, Codex, opencode, Kimi, Cursor,
-Gemini, Aider, Amp, Droid, Grok, Qwen, Kiro). If your agent runs under a name
-luvus does not know, teach it one in `~/.luvus/manifests/<agent>.toml`:
+Gemini, Aider, Amp, Droid, Grok, Hermes, Muse, Qwen, Kiro). If your agent runs
+under a name luvus does not know, teach it one in
+`~/.luvus/manifests/<agent>.toml`:
 
 ```toml
 agent = "myagent"
@@ -50,6 +51,19 @@ screen, so a pane that merely printed "amp" or "cursor" was mistaken for that
 agent. Identity now comes from the running process instead. If you still see it,
 please [open an issue](https://github.com/RizRiyz/luvus/issues) with what the
 pane was running.
+
+## Where can I find runtime diagnostics?
+
+Luvus keeps private structured diagnostics in the selected session directory at
+the `info` level by default. The default session writes
+`~/.luvus/logs/server.log` and `~/.luvus/logs/client.log`. Read recent records
+with ordinary tools such as `tail -n 200 ~/.luvus/logs/server.log`. Named
+sessions keep the same files under `~/.luvus/sessions/<name>/logs/`. Set
+`LUVUS_LOG=off` before starting a process only when you need to disable logging.
+
+Logs never include pane output, prompts, keystrokes, file contents, command
+arguments, or UHP request bodies. They can still describe your local runtime,
+so review them before attaching them to a public issue.
 
 ## Where did my scrollback go?
 

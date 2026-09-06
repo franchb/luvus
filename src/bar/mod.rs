@@ -578,31 +578,6 @@ impl BarState {
         changed
     }
 
-    pub fn has_visible_working(&self, config: &crate::config::BarConfig, compact: bool) -> bool {
-        let widgets = self.widgets.iter().filter_map(|(key, widget)| {
-            let visible = if key == CORE_AGENTS {
-                compact
-            } else {
-                config.region_for(key, widget.region).is_some()
-            };
-            visible.then_some(widget)
-        });
-        let notifications = (!compact)
-            .then_some(
-                self.notifications
-                    .iter()
-                    .map(|notification| &notification.widget),
-            )
-            .into_iter()
-            .flatten();
-        widgets
-            .chain(notifications)
-            .flat_map(|widget| widget.content.iter().chain(&widget.compact_content))
-            .any(|segment| {
-                matches!(&segment.kind, BarSegmentKind::State { state, .. } if state == "working")
-            })
-    }
-
     pub fn declaration(&self, canonical: &str) -> Option<&BarDeclaration> {
         self.declarations.get(canonical)
     }
@@ -685,6 +660,37 @@ impl BarState {
 }
 
 impl crate::app::App {
+    pub fn mobile_bar_notification(&self) -> Option<String> {
+        self.bar
+            .notifications
+            .back()
+            .map(|notification| mobile_segment_text(&notification.widget.content))
+            .filter(|text| !text.is_empty())
+    }
+
+    pub fn mobile_agent_summary(&self) -> Option<(String, crate::ui::theme::State)> {
+        let widget = self.bar.widgets.get(CORE_AGENTS)?;
+        widget.content.iter().find_map(|segment| {
+            let BarSegmentKind::State { state, label } = &segment.kind else {
+                return None;
+            };
+            let parsed = match state.as_str() {
+                "blocked" => crate::ui::theme::State::Blocked,
+                "working" => crate::ui::theme::State::Working,
+                "done" => crate::ui::theme::State::Done,
+                "idle" => crate::ui::theme::State::Idle,
+                _ => crate::ui::theme::State::Unknown,
+            };
+            Some((
+                label
+                    .as_deref()
+                    .map(|count| format!("{count} {}", parsed.label()))
+                    .unwrap_or_else(|| parsed.label().to_string()),
+                parsed,
+            ))
+        })
+    }
+
     /// Refresh the two built-ins from already-cached application state. This is
     /// pure in-process composition: no IO, manifest lookup, or subprocess work.
     pub fn refresh_core_bar_widgets(&mut self) {
@@ -826,6 +832,38 @@ impl crate::app::App {
         }
         true
     }
+}
+
+fn mobile_segment_text(segments: &[BarSegment]) -> String {
+    let mut output = String::new();
+    for segment in segments {
+        match &segment.kind {
+            BarSegmentKind::Text { text } | BarSegmentKind::Symbol { symbol: text } => {
+                output.push_str(text)
+            }
+            BarSegmentKind::State { state, label } => {
+                output.push_str(match state.as_str() {
+                    "blocked" | "working" | "done" => "●",
+                    _ => "○",
+                });
+                if let Some(label) = label {
+                    output.push(' ');
+                    output.push_str(label);
+                }
+            }
+            BarSegmentKind::Badge { text } => {
+                output.push('[');
+                output.push_str(text);
+                output.push(']');
+            }
+            BarSegmentKind::Progress { value, total, .. } => {
+                output.push_str(&format!("{value}/{total}"));
+            }
+            BarSegmentKind::Spacer { width } => output.push_str(&" ".repeat(*width as usize)),
+            BarSegmentKind::Separator => output.push_str("  ·  "),
+        }
+    }
+    output
 }
 
 pub struct WidgetCandidate<'a> {
@@ -1126,33 +1164,6 @@ mod tests {
             1,
         );
         assert!(bad.unwrap_err().contains("control"));
-    }
-
-    #[test]
-    fn spinner_work_only_tracks_widgets_visible_in_the_current_chrome() {
-        let mut state = BarState::default();
-        let working = BarWidget::new(
-            BarWidgetKey::new("test", "job"),
-            BarRegion::TopRight,
-            vec![BarSegment {
-                kind: BarSegmentKind::State {
-                    state: "working".into(),
-                    label: None,
-                },
-                tone: BarTone::Normal,
-                action: None,
-                value: None,
-            }],
-            Vec::new(),
-            1,
-        )
-        .unwrap();
-        state.push_widget(working).unwrap();
-
-        let mut config = crate::config::BarConfig::default();
-        assert!(state.has_visible_working(&config, false));
-        config.place("test:job", None);
-        assert!(!state.has_visible_working(&config, false));
     }
 
     #[test]

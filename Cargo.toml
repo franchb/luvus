@@ -1,14 +1,14 @@
 [package]
 name = "luvus"
-version = "0.12.0"
+version = "0.13.4"
 edition = "2021"
 # ratatui 0.30 (and ratatui-core) use Rust edition 2024, so the dependency tree
 # needs rustc 1.88+. Keep this honest — a lower value makes `cargo install` fail
 # with a cryptic `edition2024` error instead of a clear "requires a newer Rust".
 rust-version = "1.88"
 description = "Mission control for your AI coding agents"
-authors = ["Riz <rizflagz@gmail.com>"]
-license = "AGPL-3.0-or-later"
+authors = ["Riz <riz@skyrizz.com>"]
+license = "Apache-2.0"
 readme = "README.md"
 homepage = "https://github.com/RizRiyz/luvus"
 repository = "https://github.com/RizRiyz/luvus"
@@ -33,7 +33,6 @@ exclude = [
     "/SECURITY.md",
     "/install.sh",
     "/install.ps1",
-    "/migrate.sh",
     "/RELEASING.md",
     "/scripts",
     "/website",
@@ -63,18 +62,14 @@ portable-pty = "0.9"
 alacritty_terminal = { package = "luvus-alacritty-terminal", version = "0.26" }
 shitty-vt = { version = "0.5", optional = true }
 unicode-width = "0.2"
+# Explicit terminal-native document previews. The parser is pure Rust and only
+# runs after the user chooses a Markdown/Mermaid preview action.
+pulldown-cmark = { version = "0.13", default-features = false }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# OpenCode 1.18+ stores per-session token and cost aggregates in SQLite.  Read
-# it in-process and read-only: spawning the OpenCode/Bun runtime every Mission
-# Control refresh is both slower and substantially heavier.
-rusqlite = { version = "0.40", features = ["bundled"] }
-# Agent skills are distributed separately from the runtime. Manifests are
-# authenticated with Ed25519, artifact/package hashes use SHA-256, and semver
-# keeps independently released skills inside their declared Luvus range.
-base64 = "0.22"
-ed25519-dalek = "2"
+# SHA-256 tracks managed skill files and verifies release, theme, and diff
+# artifacts. The canonical Luvus skill itself is bundled with this release.
 semver = "1"
 sha2 = "0.10"
 # Module manifests (`luvus-module.toml`).
@@ -91,7 +86,10 @@ fs2 = "0.4"
 # protocol. This calls the operating-system RNG directly; identifiers are not
 # derived from pane routes, PIDs, clocks, or process-global counters.
 getrandom = "0.3"
-
+# Calendar-safe IANA timezone conversion for daily and weekly automations.
+# Jiff is local-only: it reads the OS timezone database (with a Windows bundle)
+# and performs no runtime network access.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
 # `libc` (setsid + macOS proc_pidinfo) is only needed on Unix.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -102,10 +100,15 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 widestring = "1"
 windows-sys = { version = "0.61", features = [
+    "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Console",
+    "Win32_System_Kernel",
     "Win32_System_Threading",
 ] }
 

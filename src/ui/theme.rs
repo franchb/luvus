@@ -6,12 +6,6 @@ use ratatui::style::Color;
 
 // ── Theme derivation from terminal colors ───────────────────────────────────
 
-fn luminance(rgb: [u8; 3]) -> f32 {
-    0.2126 * (rgb[0] as f32 / 255.0)
-        + 0.7152 * (rgb[1] as f32 / 255.0)
-        + 0.0722 * (rgb[2] as f32 / 255.0)
-}
-
 fn blend_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> Color {
     let f = |i: usize| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).clamp(0.0, 255.0) as u8;
     Color::Rgb(f(0), f(1), f(2))
@@ -65,7 +59,7 @@ impl Theme {
 
     pub fn from_terminal(c: &TerminalColors) -> Self {
         let (bg, fg) = (c.bg, c.fg);
-        let is_dark = luminance(bg) < luminance(fg);
+        let is_dark = crate::terminal::appearance::ColorScheme::from_terminal_colors(c).is_dark();
         // palette[8] (bright black) is the terminal designer's chosen "dim/elevated"
         // color — blend toward it for surfaces so the tint matches the scheme.
         let dim = c.palette[8];
@@ -73,9 +67,12 @@ impl Theme {
 
         if is_dark {
             Theme {
-                crust: blend_rgb(bg, [0, 0, 0], 0.15),
-                mantle: blend_rgb(bg, [0, 0, 0], 0.07),
-                surface0: blend_rgb(bg, dim, 0.35),
+                // OSC 11 reports only RGB, not the terminal background's alpha.
+                // Painting that RGB explicitly makes transparent terminals
+                // opaque, so primary surfaces must keep using the default color.
+                crust: Color::Reset,
+                mantle: Color::Reset,
+                surface0: Color::Reset,
                 surface1: blend_rgb(bg, dim, 0.70),
                 subtext0: blend_rgb(bg, fg, 0.62),
                 subtext1: blend_rgb(bg, fg, 0.78),
@@ -86,9 +83,9 @@ impl Theme {
             }
         } else {
             Theme {
-                crust: blend_rgb(bg, [255, 255, 255], 0.40),
-                mantle: blend_rgb(bg, [255, 255, 255], 0.20),
-                surface0: blend_rgb(bg, dim, 0.30),
+                crust: Color::Reset,
+                mantle: Color::Reset,
+                surface0: Color::Reset,
                 surface1: blend_rgb(bg, dim, 0.60),
                 subtext0: blend_rgb(bg, fg, 0.55),
                 subtext1: blend_rgb(bg, fg, 0.70),
@@ -105,7 +102,7 @@ impl Theme {
         Theme {
             crust: Color::Reset,
             mantle: Color::Reset,
-            base: pal(bg),
+            base: Color::Reset,
             surface0: Color::Reset,
             surface1: Color::Reset,
             overlay0: blend_rgb(bg, fg, 0.28),
@@ -786,45 +783,6 @@ impl State {
     }
 }
 
-/// The working spinner's frames: a braille mark rotating around the **middle**
-/// of the cell, so it sits level with the `○`/`●` dots on neighbouring rows.
-///
-/// A braille cell has four dot rows, and which rows a glyph uses decides where it
-/// sits vertically. The classic CLI spinner (`⠋⠙⠹…`) uses dots 1-6 (the upper
-/// three rows) and visibly rides high; the bottom two rows (dots 3/6/7/8) ride
-/// just as visibly low. These frames use dots **2/3/5/6** — rows two and three —
-/// which is the vertical centre of the cell.
-///
-/// Each frame is one edge of that 2x2 dot square, so the mark sweeps clockwise:
-/// left → top → right → bottom. Every frame is exactly two dots, so the spinner
-/// keeps constant weight as it turns (no pulsing).
-///
-/// Glyph choice matters for alignment, so don't swap these casually:
-///
-/// * **Every frame is the same width.** Braille (U+2800..=U+28FF) is East Asian
-///   *Neutral* — exactly one column in every terminal, whatever its
-///   ambiguous-width setting. The old half-circle set (`◐◓◑◒`) mixed classes:
-///   `◐`/`◑` are *Ambiguous* (2 cells wherever a terminal draws ambiguous glyphs
-///   wide) while `◒`/`◓` are Narrow, so the icon changed size every other frame
-///   and drifted against the 1-column slot ratatui reserves for it.
-/// * **Every frame carries the same ink.** All ten are six-dot patterns, so the
-///   spinner never looks like it grows or shrinks as it turns.
-/// * **Font coverage is effectively universal.** Braille is *the* spinner block,
-///   so there is no fallback to another face at a different size.
-///
-/// [`state_glyphs_are_one_column`] guards these properties.
-const FRAMES: [&str; 4] = ["⠆", "⠒", "⠰", "⠤"];
-
-/// Frames in one full revolution. Iterate this instead of hardcoding a count so
-/// changing the animation can't silently desync a caller or a test.
-pub const SPINNER_FRAMES: u64 = FRAMES.len() as u64;
-
-/// One frame of the "working" spinner, advanced by `App.spinner` while an agent
-/// is working — a busy agent shows live motion instead of a static `●`.
-pub fn spinner_frame(n: u64) -> &'static str {
-    FRAMES[(n % SPINNER_FRAMES) as usize]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,12 +791,11 @@ mod tests {
     // with `UnicodeWidthStr::width` (== 1 for all of these), so any glyph a
     // terminal draws two cells wide pushes the label right and breaks the column.
     // Requiring `width_cjk == 1` too keeps every icon *unambiguously* narrow, so
-    // the slot is honored even where ambiguous-width glyphs render wide — and
-    // every spinner frame stays exactly the same size as the static dots.
+    // the slot is honored even where ambiguous-width glyphs render wide.
     #[test]
     fn state_glyphs_are_one_column() {
         use unicode_width::UnicodeWidthStr;
-        let mut glyphs: Vec<&str> = [
+        let glyphs: Vec<&str> = [
             State::Blocked,
             State::Working,
             State::Done,
@@ -848,29 +805,11 @@ mod tests {
         .iter()
         .map(|s| s.dot())
         .collect();
-        glyphs.extend((0..SPINNER_FRAMES).map(spinner_frame));
-
         for g in glyphs {
             assert_eq!(g.chars().count(), 1, "{g:?} must be a single glyph");
             assert_eq!(g.width(), 1, "{g:?} must occupy one column");
         }
 
-        // The regression this guards: the spinner animates *in place*, so if its
-        // frames disagree on East Asian width the icon visibly changes size as it
-        // turns (the old `◐◓◑◒` mixed Ambiguous `◐`/`◑` with Narrow `◒`/`◓`).
-        // Every frame must sit in the same width class as every other.
-        let widths: std::collections::HashSet<usize> = (0..SPINNER_FRAMES)
-            .map(|i| spinner_frame(i).width_cjk())
-            .collect();
-        assert_eq!(
-            widths.len(),
-            1,
-            "spinner frames disagree on East Asian width, so the icon changes \
-             size mid-animation: {:?}",
-            (0..SPINNER_FRAMES)
-                .map(|i| (spinner_frame(i), spinner_frame(i).width_cjk()))
-                .collect::<Vec<_>>()
-        );
         // The static dots must likewise agree with each other, so an idle row and
         // a blocked row never sit at different widths.
         assert_eq!(
@@ -878,17 +817,6 @@ mod tests {
             State::Blocked.dot().width_cjk(),
             "the idle and active dots must be the same width class"
         );
-
-        // The four frames must be distinct, or the spinner would stutter…
-        let frames: std::collections::HashSet<&str> =
-            (0..SPINNER_FRAMES).map(spinner_frame).collect();
-        assert_eq!(
-            frames.len() as u64,
-            SPINNER_FRAMES,
-            "spinner frames must all differ"
-        );
-        // …and it must cycle with that period.
-        assert_eq!(spinner_frame(0), spinner_frame(SPINNER_FRAMES));
     }
 
     #[test]
@@ -939,8 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn from_terminal_does_not_panic() {
-        // Dark terminal.
+    fn from_terminal_preserves_the_default_background() {
         let dark = TerminalColors {
             fg: [0xee, 0xee, 0xee],
             bg: [0x1a, 0x1a, 0x2e],
@@ -949,9 +876,6 @@ mod tests {
                 [0x1a, 0x1a, 0x2e],
             ),
         };
-        let _ = Theme::from_terminal(&dark);
-
-        // Light terminal.
         let light = TerminalColors {
             fg: [0x33, 0x33, 0x33],
             bg: [0xf5, 0xf5, 0xf0],
@@ -960,7 +884,16 @@ mod tests {
                 [0xf5, 0xf5, 0xf0],
             ),
         };
-        let _ = Theme::from_terminal(&light);
+
+        for colors in [&dark, &light] {
+            let theme = Theme::from_terminal(colors);
+            assert_eq!(theme.crust, Color::Reset);
+            assert_eq!(theme.mantle, Color::Reset);
+            assert_eq!(theme.base, Color::Reset);
+            assert_eq!(theme.surface0, Color::Reset);
+            assert_eq!(theme.text, pal(colors.fg));
+            assert_eq!(theme.accent, pal(colors.palette[4]));
+        }
     }
 
     #[test]

@@ -3,6 +3,9 @@
 Thanks for helping make Luvus better. Bug fixes, documentation, tests, and new
 features are all welcome.
 
+Unless explicitly stated otherwise, contributions submitted for inclusion in
+Luvus are provided under the Apache License, Version 2.0.
+
 ## Before you start
 
 Small fixes can go directly to a pull request. For a large UI, architecture, or
@@ -61,6 +64,11 @@ because the outer process handles the keys first.
   Keep operating-system code in `platform.rs` behind `cfg` gates when possible.
 - **Update related documentation.** CLI, API, configuration, or visible behavior
   changes should update the matching public documentation.
+- **Keep CLI translations complete.** Command names, flags, JSON, and UHP stay
+  canonical. Add human CLI text to `src/i18n/cli.rs` with all eight language
+  values, preserve placeholders and literal user data, and run the focused CLI
+  localization tests. Do not add a partial English fallback for a registered
+  language.
 
 ## Tests and checks
 
@@ -80,17 +88,74 @@ PTYs without requiring an interactive terminal. Test visible changes manually,
 measure performance changes before and after, and test platform-specific code on
 the affected platform when available.
 
-For terminal engine work there is a harness for that last point:
+Lifecycle tests must isolate the state home and clear inherited socket/session
+selectors before spawning a server. Use an explicit shell when testing process
+behavior rather than shell integration. Bound startup and socket waits, check
+early child exits, retain a bounded excerpt of failure diagnostics, and use a
+child-handle cleanup guard. Tests that change process-global configuration must
+hold `persist::test_env(...)` for their entire lifetime.
+
+Detailed terminal-history inspection has an opt-in, in-process benchmark:
+
+```bash
+cargo test --locked history_inspection_benchmark -- --ignored --nocapture
+```
+
+It reports three warmed trials for 1, 20, and 50 engines with 10,000 retained
+rows each. These are engine-accounting timings, not end-to-end API latency or
+process memory measurements. Record the commit and build profile when comparing
+runs. Ordinary test runs do not execute this workload.
+
+To isolate cold-history maintenance from ingestion, run:
+
+```bash
+cargo test --release --locked history_maintenance_benchmark -- --ignored --nocapture
+```
+
+This uses 80x24 engines with 10,000 retained rows, both printable text and
+per-cell RGB styling, and three trials per corpus. It reports total maintenance,
+turn count, and per-turn p95/p99/maximum lock-held work, not end-to-end
+input/scroll latency. Run separate live
+latency checks before changing maintenance scheduling, especially on Windows.
+
+To compare the VT engines themselves, through Luvus's own code paths rather
+than the parsers in isolation:
 
 ```bash
 scripts/bench-engines.sh
 ```
 
-It times feeding, grid reads and captures through Luvus's own code paths, and
-reports memory per retained row, once per `VtEngine` implementation. Run it
-before and after a change on the same machine; numbers from different machines
-are not comparable. `src/terminal/vt/bench.rs` documents what each figure
-measures and what it is worth.
+It runs once per `VtEngine` implementation, in separate processes, and reports
+feed throughput, grid reads, captures, and memory per retained row. Build the
+shitty core first; the script's header says how. Numbers are comparable between
+engines and between commits on one machine, and not between machines.
+`src/terminal/vt/bench.rs` documents what each figure measures and what it is
+worth.
+
+To check CLI/UHP responsiveness while configuration storage is locked (Unix):
+
+```bash
+cargo build --locked
+python3 examples/uhp/terminal/io_responsiveness.py --luvus target/debug/luvus
+```
+
+This starts its own isolated development server, reports baseline and contended
+request timings, deliberately exercises the lock timeout, and verifies that retry
+persists the setting. It never attaches to an existing session. Timings are host
+measurements, not hard CI thresholds or proof of Windows/TUI rendering latency.
+
+## Adding agent support
+
+Use a detection manifest when an agent only needs identity and live-state
+recognition. Built-in session discovery, resume, fork, usage, or lifecycle
+integration belongs in one modular adapter under `src/agent/<agent>/`; do not
+spread new agent-name branches across the UI, CLI, IPC, or Settings.
+
+The [Adding Agent Support](website/src/content/docs/docs/extend/adding-agent-support.mdx)
+guide covers the descriptor fields, scoped interpreter packages, manifests,
+session and integration boundaries, registry entry, documentation parity, and
+required cross-platform tests. Detection must work without installing a skill
+or hook, and optional integrations must preserve unrelated user configuration.
 
 ## Commits
 

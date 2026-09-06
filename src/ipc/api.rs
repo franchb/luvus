@@ -3,6 +3,7 @@
 //! requests are marshalled onto the single-threaded app loop; `events.subscribe`
 //! streams from a simple broadcast bus. See docs/08.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -73,6 +74,7 @@ const MAX_ACTIVE_CONNECTIONS: usize = 80;
 const API_WORKER_STACK_BYTES: usize = 256 * 1024;
 const EVENT_FORWARDER_STACK_BYTES: usize = 128 * 1024;
 const INITIAL_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(not(windows))]
 const INITIAL_FRAME_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_REQUEST_ID_BYTES: usize = 128;
 
@@ -475,6 +477,9 @@ fn read_initial_frame(
     timeout: std::time::Duration,
 ) -> Result<Vec<u8>, FrameError> {
     let deadline = std::time::Instant::now() + timeout;
+    // Windows named pipes reject PIPE_NOWAIT after a write (`ERROR_PIPE_BUSY`).
+    // Peek for inbound bytes and keep the handle blocking.
+    #[cfg(not(windows))]
     let timeout_mode = stream
         .set_recv_timeout(INITIAL_FRAME_POLL)
         .map_err(|_| FrameError::Io)?;
@@ -484,14 +489,24 @@ fn read_initial_frame(
         if std::time::Instant::now() >= deadline {
             return Err(FrameError::Timeout);
         }
-        match stream.read(&mut chunk) {
-            Ok(0)
-                if timeout_mode == transport::TimeoutMode::Nonblocking
-                    && transport::nonblocking_zero_is_pending() =>
-            {
+        #[cfg(windows)]
+        match stream.recv_has_data() {
+            Ok(false) => {
                 thread::sleep(std::time::Duration::from_millis(10));
+                continue;
             }
+            Ok(true) => {}
+            Err(_) => return Err(FrameError::Io),
+        }
+        match stream.read(&mut chunk) {
             Ok(0) => {
+                #[cfg(not(windows))]
+                if timeout_mode == transport::TimeoutMode::Nonblocking
+                    && transport::nonblocking_zero_is_pending()
+                {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
                 return Err(if frame.is_empty() {
                     FrameError::Eof
                 } else {
@@ -516,14 +531,24 @@ fn read_initial_frame(
                 if matches!(
                     error.kind(),
                     io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) || (timeout_mode == transport::TimeoutMode::Nonblocking
-                    && transport::nonblocking_read_pending(&error)) =>
+                ) =>
             {
+                #[cfg(not(windows))]
                 if timeout_mode == transport::TimeoutMode::Nonblocking {
                     thread::sleep(std::time::Duration::from_millis(10));
                 }
             }
-            Err(_) => return Err(FrameError::Io),
+            Err(error) => {
+                #[cfg(not(windows))]
+                if timeout_mode == transport::TimeoutMode::Nonblocking
+                    && transport::nonblocking_read_pending(&error)
+                {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                let _ = error;
+                return Err(FrameError::Io);
+            }
         }
     }
 }
@@ -617,6 +642,65 @@ pub(crate) fn read_stream_frame(reader: &mut impl BufRead) -> io::Result<Option<
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "event frame is not UTF-8"))
 }
 
+/// Read one event-stream frame without allowing byte dribbles or unrelated
+/// frames to extend an absolute deadline. A receive timeout is refreshed from
+/// the remaining deadline immediately before every underlying socket read;
+/// bytes already buffered are consumed first.
+pub(crate) fn read_stream_frame_with_deadline(
+    reader: &mut BufReader<Conn>,
+    deadline: std::time::Instant,
+) -> io::Result<Option<String>> {
+    let connection = reader.get_ref().clone();
+    let mut frame = Vec::new();
+    loop {
+        if reader.buffer().is_empty() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "event frame timed out",
+                ));
+            }
+            if connection.set_recv_timeout(remaining)? != transport::TimeoutMode::Kernel {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "event stream transport has no kernel receive timeout",
+                ));
+            }
+        }
+
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if frame.is_empty() {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "event frame is missing LF",
+            ));
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if frame.len().saturating_add(take) > crate::terminal::backend::MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event frame is too large",
+            ));
+        }
+        frame.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if frame.last() == Some(&b'\n') {
+            return String::from_utf8(frame[..frame.len() - 1].to_vec())
+                .map(Some)
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "event frame is not UTF-8")
+                });
+        }
+    }
+}
+
 /// Read one bounded ordinary API request for CLI bridge callers.
 pub(crate) fn read_request_frame(reader: &mut impl BufRead) -> io::Result<String> {
     read_text_frame(reader, "request")
@@ -638,18 +722,225 @@ pub(crate) fn read_response_frame_with_deadline(
     frame_text(frame, "response")
 }
 
-fn write_response(writer: &mut impl Write, id: &str, response: &str) -> io::Result<()> {
-    RESPONSE_BYTES_OUT.fetch_add(response.len().saturating_add(1) as u64, Ordering::Relaxed);
-    if response.len().saturating_add(1) <= crate::terminal::backend::MAX_FRAME_BYTES {
-        writeln!(writer, "{response}")?;
-    } else {
-        writeln!(
-            writer,
-            "{}",
-            json!({"id":id,"error":{"code":"internal","message":"response exceeded protocol frame limit"}})
-        )?;
+struct ConnectionLogGuard;
+
+impl ConnectionLogGuard {
+    fn new() -> Self {
+        crate::logging::event(crate::logging::EventKind::UhpConnectionOpen, &[]);
+        Self
     }
-    writer.flush()
+}
+
+impl Drop for ConnectionLogGuard {
+    fn drop(&mut self) {
+        finish_abandoned_request_log();
+        crate::logging::event(crate::logging::EventKind::UhpConnectionClose, &[]);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RequestLog {
+    id: Option<crate::logging::SafeId>,
+    method: Option<crate::logging::SafeId>,
+    started: std::time::Instant,
+    subscription: bool,
+}
+
+thread_local! {
+    static REQUEST_LOG: RefCell<Option<RequestLog>> = const { RefCell::new(None) };
+}
+
+fn begin_request_log(id: Option<&str>, method: &str) {
+    let request = RequestLog {
+        id: id.and_then(crate::logging::SafeId::new),
+        method: crate::logging::SafeId::new(method),
+        started: std::time::Instant::now(),
+        subscription: false,
+    };
+    let mut fields = [crate::logging::Field::IdOmitted(false); 3];
+    let mut count = 0;
+    if let Some(id) = request.id {
+        fields[count] = crate::logging::Field::RequestId(id);
+        count += 1;
+    }
+    if let Some(method) = request.method {
+        fields[count] = crate::logging::Field::Method(method);
+        count += 1;
+    }
+    if request.id.is_none() || request.method.is_none() {
+        fields[count] = crate::logging::Field::IdOmitted(true);
+        count += 1;
+    }
+    crate::logging::event(crate::logging::EventKind::UhpRequestStart, &fields[..count]);
+    REQUEST_LOG.with(|slot| *slot.borrow_mut() = Some(request));
+}
+
+fn finish_request_log(response: &str) {
+    let Some(mut request) = REQUEST_LOG.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    let response = serde_json::from_str::<Value>(response).ok();
+    let is_subscription = response.as_ref().is_some_and(|response| {
+        response.pointer("/result/type").and_then(Value::as_str) == Some("subscription_started")
+    });
+    if is_subscription {
+        let mut fields = [crate::logging::Field::IdOmitted(false); 3];
+        let count = request_id_method_fields(request, &mut fields);
+        crate::logging::event(
+            crate::logging::EventKind::UhpSubscriptionOpen,
+            &fields[..count],
+        );
+        request.subscription = true;
+        REQUEST_LOG.with(|slot| *slot.borrow_mut() = Some(request));
+        return;
+    }
+
+    let error_code = response
+        .as_ref()
+        .and_then(|response| response.pointer("/error/code"))
+        .and_then(Value::as_str)
+        .and_then(crate::logging::SafeId::new);
+    let rejected = error_code.is_some_and(|code| {
+        matches!(
+            code.as_str(),
+            "invalid_request" | "invalid_params" | "forbidden" | "server_busy"
+        )
+    });
+    if rejected {
+        let mut fields = [crate::logging::Field::IdOmitted(false); 5];
+        let mut count = request_id_method_fields(request, &mut fields);
+        if let Some(code) = error_code {
+            fields[count] = crate::logging::Field::ErrorCode(code);
+            count += 1;
+        }
+        fields[count] = crate::logging::Field::DurationMs(
+            request
+                .started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        count += 1;
+        crate::logging::event(
+            crate::logging::EventKind::UhpRequestRejected,
+            &fields[..count],
+        );
+        return;
+    }
+    let outcome = if response
+        .as_ref()
+        .is_some_and(|response| response.get("error").is_some())
+    {
+        crate::logging::Outcome::Error
+    } else {
+        crate::logging::Outcome::Ok
+    };
+    let mut fields = [crate::logging::Field::IdOmitted(false); 6];
+    let mut count = request_id_method_fields(request, &mut fields);
+    fields[count] = crate::logging::Field::Outcome(outcome);
+    count += 1;
+    if let Some(code) = error_code {
+        fields[count] = crate::logging::Field::ErrorCode(code);
+        count += 1;
+    }
+    fields[count] = crate::logging::Field::DurationMs(
+        request
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
+    count += 1;
+    let event = if outcome == crate::logging::Outcome::Error {
+        crate::logging::EventKind::UhpRequestFailed
+    } else {
+        crate::logging::EventKind::UhpRequestComplete
+    };
+    crate::logging::event(event, &fields[..count]);
+}
+
+fn request_id_method_fields(request: RequestLog, fields: &mut [crate::logging::Field]) -> usize {
+    let mut count = 0;
+    if let Some(id) = request.id {
+        fields[count] = crate::logging::Field::RequestId(id);
+        count += 1;
+    }
+    if let Some(method) = request.method {
+        fields[count] = crate::logging::Field::Method(method);
+        count += 1;
+    }
+    if request.id.is_none() || request.method.is_none() {
+        fields[count] = crate::logging::Field::IdOmitted(true);
+        count += 1;
+    }
+    count
+}
+
+fn finish_subscription_log(reason: crate::logging::Reason) {
+    let Some(request) = REQUEST_LOG.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    if !request.subscription {
+        return;
+    }
+    let mut fields = [crate::logging::Field::IdOmitted(false); 4];
+    let mut count = request_id_method_fields(request, &mut fields);
+    fields[count] = crate::logging::Field::Reason(reason);
+    count += 1;
+    crate::logging::event(
+        crate::logging::EventKind::UhpSubscriptionClose,
+        &fields[..count],
+    );
+}
+
+fn finish_abandoned_request_log() {
+    let Some(request) = REQUEST_LOG.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    if request.subscription {
+        let mut fields = [crate::logging::Field::IdOmitted(false); 4];
+        let mut count = request_id_method_fields(request, &mut fields);
+        fields[count] = crate::logging::Field::Reason(crate::logging::Reason::Io);
+        count += 1;
+        crate::logging::event(
+            crate::logging::EventKind::UhpSubscriptionClose,
+            &fields[..count],
+        );
+        return;
+    }
+    let mut fields = [crate::logging::Field::IdOmitted(false); 5];
+    let mut count = request_id_method_fields(request, &mut fields);
+    fields[count] = crate::logging::Field::ErrorCode(
+        crate::logging::SafeId::new("io").expect("static id is valid"),
+    );
+    count += 1;
+    fields[count] = crate::logging::Field::DurationMs(
+        request
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
+    count += 1;
+    crate::logging::event(
+        crate::logging::EventKind::UhpRequestRejected,
+        &fields[..count],
+    );
+}
+
+fn write_response(writer: &mut impl Write, id: &str, response: &str) -> io::Result<()> {
+    let fallback;
+    let emitted = if response.len().saturating_add(1) <= crate::terminal::backend::MAX_FRAME_BYTES {
+        response
+    } else {
+        fallback = json!({"id":id,"error":{"code":"internal","message":"response exceeded protocol frame limit"}}).to_string();
+        &fallback
+    };
+    RESPONSE_BYTES_OUT.fetch_add(emitted.len().saturating_add(1) as u64, Ordering::Relaxed);
+    writeln!(writer, "{emitted}")?;
+    writer.flush()?;
+    finish_request_log(emitted);
+    Ok(())
 }
 
 fn write_event_frame(writer: &mut impl Write, event: &str) -> io::Result<()> {
@@ -766,6 +1057,19 @@ pub fn new_bus() -> EventBus {
 /// Current event sequence. Snapshot responses use this as a consistency fence.
 pub fn current_sequence(bus: &EventBus) -> u64 {
     bus.0.lock().map(|state| state.sequence).unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn replayed_events_after(bus: &EventBus, sequence: u64) -> Vec<Value> {
+    let Ok(state) = bus.0.lock() else {
+        return Vec::new();
+    };
+    state
+        .replay
+        .iter()
+        .filter(|(event_sequence, _)| *event_sequence > sequence)
+        .filter_map(|(_, line)| serde_json::from_str(line).ok())
+        .collect()
 }
 
 /// Publish one structured event without blocking the app loop.
@@ -1297,6 +1601,13 @@ pub fn socket_path_env() -> Option<String> {
     SOCKET.get().map(|p| p.to_string_lossy().to_string())
 }
 
+/// Platform-native address for integrations that connect directly rather than
+/// invoking the CLI. Unix returns the socket path; Windows returns the complete
+/// named-pipe address derived by the server transport.
+pub fn socket_address_env() -> Option<String> {
+    SOCKET.get().map(|path| transport::discovery_address(path))
+}
+
 /// Reclaim a proven-stale API socket and bind its listener. The caller holds
 /// the per-state-directory startup lock across both API and client binds.
 pub fn bind_server(
@@ -1350,6 +1661,7 @@ fn handle_conn(
     bus: EventBus,
     _permit: ConnectionPermit,
 ) {
+    let _connection_log = ConnectionLogGuard::new();
     let mut writer = stream.clone();
     let initial_frame = read_initial_frame(&mut stream, INITIAL_FRAME_TIMEOUT);
     // Windows implements the initial-frame deadline with PIPE_NOWAIT because
@@ -1410,6 +1722,12 @@ fn handle_conn(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    begin_request_log(
+        raw_id
+            .and_then(Value::as_str)
+            .filter(|raw_id| valid_request_id(raw_id)),
+        &method,
+    );
     if !raw_id.and_then(Value::as_str).is_some_and(valid_request_id) {
         let response = json!({"id":id,"error":{"code":"invalid_request",
             "message":"id must contain 1 to 128 ASCII letters, digits, '.', '_', ':', or '-'"}})
@@ -1842,6 +2160,7 @@ fn handle_conn(
         if let Some(fwd) = fwd {
             let _ = fwd.join(); // its sender just left the bus → the rx loop ends
         }
+        finish_subscription_log(crate::logging::Reason::Eof);
         return;
     }
 
@@ -1919,7 +2238,7 @@ fn handle_conn(
         if params.as_object().is_none_or(|object| {
             object
                 .keys()
-                .any(|key| !matches!(key.as_str(), "pane" | "status" | "timeout_s"))
+                .any(|key| !matches!(key.as_str(), "pane" | "status" | "statuses" | "timeout_s"))
         }) {
             let response = json!({"id":id,"error":{"code":"invalid_request",
                     "message":"agent.wait contains an unknown parameter"}})
@@ -1928,7 +2247,16 @@ fn handle_conn(
             return;
         }
         let pane = params.get("pane").and_then(Value::as_str).unwrap_or("");
-        let state = params.get("status").and_then(Value::as_str).unwrap_or("");
+        let states = match parse_agent_wait_states(&params) {
+            Ok(states) => states,
+            Err(message) => {
+                let response =
+                    json!({"id":id,"error":{"code":"invalid_request","message":message}})
+                        .to_string();
+                let _ = write_response(&mut writer, &id, &response);
+                return;
+            }
+        };
         let timeout = match parse_timeout_s(&params) {
             Ok(timeout) => timeout,
             Err(message) => {
@@ -1939,9 +2267,16 @@ fn handle_conn(
                 return;
             }
         };
-        if pane.is_empty() || !matches!(state, "idle" | "working" | "blocked" | "done") {
+        if timeout.is_some_and(|timeout| timeout > std::time::Duration::from_secs(3600)) {
             let response = json!({"id":id,"error":{"code":"invalid_request",
-                    "message":"agent.wait needs a pane and status idle|working|blocked|done"}})
+                    "message":"timeout_s must be between 0 and 3600 seconds"}})
+            .to_string();
+            let _ = write_response(&mut writer, &id, &response);
+            return;
+        }
+        if pane.is_empty() {
+            let response = json!({"id":id,"error":{"code":"invalid_request",
+                    "message":"agent.wait needs a pane"}})
             .to_string();
             let _ = write_response(&mut writer, &id, &response);
             return;
@@ -1952,7 +2287,7 @@ fn handle_conn(
             .send(AppEvent::AgentWait {
                 id: id.clone(),
                 pane: pane.to_string(),
-                state: state.to_string(),
+                states,
                 timeout,
                 reply,
                 cancelled: cancelled.clone(),
@@ -1999,7 +2334,7 @@ fn handle_conn(
         if event_tx
             .send(AppEvent::ConfigReloaded {
                 id: id.clone(),
-                config,
+                config: Box::new(config),
                 reply,
             })
             .is_err()
@@ -2133,6 +2468,38 @@ fn parse_timeout_s(params: &Value) -> Result<Option<std::time::Duration>, &'stat
     }
 }
 
+fn parse_agent_wait_states(params: &Value) -> Result<Vec<String>, &'static str> {
+    let state = params.get("status");
+    let states = params.get("statuses");
+    let values: Vec<&str> = match (state, states) {
+        (Some(Value::String(state)), None) => vec![state.as_str()],
+        (None, Some(Value::Array(states))) if (1..=4).contains(&states.len()) => states
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .ok_or("statuses must contain only strings")?,
+        (Some(_), Some(_)) => return Err("agent.wait accepts status or statuses, not both"),
+        (None, Some(Value::Array(_))) => {
+            return Err("statuses must contain between 1 and 4 states")
+        }
+        _ => return Err("agent.wait needs status or statuses"),
+    };
+    if values
+        .iter()
+        .any(|state| !matches!(*state, "idle" | "working" | "blocked" | "done"))
+    {
+        return Err("statuses must contain only idle, working, blocked, or done");
+    }
+    let mut unique: Vec<String> = Vec::with_capacity(values.len());
+    for state in values {
+        if unique.iter().any(|existing| existing == state) {
+            return Err("statuses must not contain duplicates");
+        }
+        unique.push(state.to_string());
+    }
+    Ok(unique)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2172,6 +2539,37 @@ mod tests {
 
         assert_eq!(writer.bytes, b"{\"id\":\"test\",\"result\":{}}\n");
         assert_eq!(writer.flushes, 1);
+    }
+
+    #[test]
+    fn oversized_response_emits_the_bounded_fallback() {
+        let mut writer = FlushProbe::default();
+        let oversized = "x".repeat(crate::terminal::backend::MAX_FRAME_BYTES);
+        write_response(&mut writer, "request-1", &oversized).unwrap();
+
+        let emitted: Value = serde_json::from_slice(&writer.bytes).unwrap();
+        assert_eq!(emitted["id"], "request-1");
+        assert_eq!(emitted["error"]["code"], "internal");
+        assert_eq!(writer.flushes, 1);
+        assert!(writer.bytes.len() < crate::terminal::backend::MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn request_log_preserves_missing_and_valid_id_state() {
+        begin_request_log(None, "pane.list");
+        let missing = REQUEST_LOG.with(|slot| slot.borrow_mut().take()).unwrap();
+        assert!(missing.id.is_none());
+        assert_eq!(
+            missing.method.as_ref().map(crate::logging::SafeId::as_str),
+            Some("pane.list")
+        );
+
+        begin_request_log(Some("request-1"), "pane.list");
+        let valid = REQUEST_LOG.with(|slot| slot.borrow_mut().take()).unwrap();
+        assert_eq!(
+            valid.id.as_ref().map(crate::logging::SafeId::as_str),
+            Some("request-1")
+        );
     }
 
     #[test]
@@ -2225,6 +2623,59 @@ mod tests {
             "deadline reader blocked too long"
         );
         worker.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn deadline_response_reader_returns_a_written_frame() {
+        let path = std::env::temp_dir().join(format!(
+            "luvus-response-written-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = transport::bind(&path).expect("bind test control socket");
+        let worker = std::thread::spawn(move || {
+            let mut connection = transport::incoming(&listener)
+                .next()
+                .expect("accept test connection");
+            let mut request = String::new();
+            BufReader::new(connection.clone())
+                .read_line(&mut request)
+                .expect("read request");
+            writeln!(connection, r#"{{"id":"1","result":"pong"}}"#).unwrap();
+        });
+
+        let mut client = transport::connect(&path).expect("connect test control socket");
+        writeln!(client, "request").unwrap();
+        let line =
+            read_response_frame_with_deadline(&mut client, std::time::Duration::from_secs(2))
+                .expect("written frame must arrive");
+        assert!(line.contains("pong"), "{line}");
+        worker.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn deadline_response_reader_times_out_before_accept() {
+        let path = std::env::temp_dir().join(format!(
+            "luvus-response-before-accept-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _listener = transport::bind(&path).expect("bind test control socket");
+        let mut client =
+            transport::connect(&path).expect("Windows can finish CreateFile before accept");
+        let started = std::time::Instant::now();
+        let error =
+            read_response_frame_with_deadline(&mut client, std::time::Duration::from_millis(200))
+                .expect_err("unread pipe must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "deadline reader blocked too long before accept"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -2612,7 +3063,7 @@ mod tests {
             writeln!(
                 stream,
                 "{}",
-                json!({"id":"agent-wait-1","method":"agent.wait","params":{"pane":"7","status":"blocked","timeout_s":1.5}})
+                json!({"id":"agent-wait-1","method":"agent.wait","params":{"pane":"7","statuses":["working","blocked"],"timeout_s":1.5}})
             )
             .unwrap();
             let mut response = String::new();
@@ -2622,7 +3073,7 @@ mod tests {
         let AppEvent::AgentWait {
             id,
             pane,
-            state,
+            states,
             timeout,
             reply,
             ..
@@ -2632,12 +3083,79 @@ mod tests {
         };
         assert_eq!(id, "agent-wait-1");
         assert_eq!(pane, "7");
-        assert_eq!(state, "blocked");
+        assert_eq!(states, vec!["working", "blocked"]);
         assert_eq!(timeout, Some(std::time::Duration::from_millis(1500)));
         reply
             .send(json!({"id":id,"result":{"type":"agent_wait","matched":true}}).to_string())
             .unwrap();
         assert!(client.join().unwrap().contains("\"matched\":true"));
+    }
+
+    #[test]
+    fn agent_wait_status_sets_are_nonempty_unique_and_known() {
+        for state in ["idle", "working", "blocked", "done"] {
+            assert_eq!(
+                parse_agent_wait_states(&json!({"status":state})).unwrap(),
+                vec![state]
+            );
+        }
+        assert_eq!(
+            parse_agent_wait_states(&json!({"statuses":["working","done"]})).unwrap(),
+            vec!["working", "done"]
+        );
+        for invalid in [
+            json!({}),
+            json!({"statuses":[]}),
+            json!({"statuses":["done","done"]}),
+            json!({"statuses":["done",7]}),
+            json!({"statuses":["unknown"]}),
+            json!({"status":"done","statuses":["done"]}),
+        ] {
+            assert!(parse_agent_wait_states(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn invalid_agent_wait_requests_do_not_reach_the_app_loop() {
+        // Keep the macOS Unix-domain socket below sockaddr_un::sun_path.
+        let _env = crate::persist::test_env("aw-invalid");
+        let root = crate::persist::ensure_config_dir();
+        let path = root.join("wait.sock");
+        let lock = transport::acquire_server_startup_lock(&root).unwrap();
+        let listener = bind_server(&path, &lock).unwrap();
+        let (events, rx) = mpsc::channel();
+        start_server(listener, events, new_bus());
+        drop(lock);
+
+        let invalid = [
+            json!({"pane":"7"}),
+            json!({"pane":"7","status":"unknown"}),
+            json!({"pane":"7","statuses":[]}),
+            json!({"pane":"7","statuses":["done","done"]}),
+            json!({"pane":"7","statuses":["done",7]}),
+            json!({"pane":"7","status":"done","statuses":["done"]}),
+            json!({"status":"done"}),
+            json!({"pane":7,"status":"done"}),
+            json!({"pane":"7","status":"done","timeout_s":3600.1}),
+            json!({"pane":"7","status":"done","extra":true}),
+        ];
+        for (index, params) in invalid.into_iter().enumerate() {
+            let mut client = transport::connect(&path).unwrap();
+            writeln!(
+                client,
+                "{}",
+                json!({"id":format!("invalid-{index}"),"method":"agent.wait","params":params})
+            )
+            .unwrap();
+            let mut response = String::new();
+            BufReader::new(client).read_line(&mut response).unwrap();
+            let value: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(value["error"]["code"], "invalid_request", "{params}");
+            assert!(
+                matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "{params}"
+            );
+        }
     }
 
     #[test]
@@ -2827,6 +3345,11 @@ mod tests {
         let secret = created["result"]["token"].as_str().unwrap();
         let token_id = created["result"]["id"].as_str().unwrap();
         assert!(authorize_request("workspace.get", Some(secret)).is_ok());
+        assert!(authorize_request("automation.preview", Some(secret)).is_ok());
+        assert_eq!(
+            authorize_request("automation.create", Some(secret)),
+            Err("auth token scope denied")
+        );
         assert_eq!(
             authorize_request("workspace.close", Some(secret)),
             Err("auth token scope denied")

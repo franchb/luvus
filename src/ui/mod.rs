@@ -26,21 +26,7 @@ pub struct RenderTarget<'a> {
     buf: &'a mut Buffer,
     area: Rect,
     cursor: Option<(u16, u16)>,
-    animation_mask: AnimationMask,
-}
-
-/// Allocation-free record of animated surfaces that were actually drawn into a
-/// client projection. The server uses this instead of global agent state, which
-/// avoids repainting when every working indicator is clipped or hidden.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AnimationMask(u8);
-
-impl AnimationMask {
-    const WORKING_SPINNER: u8 = 1 << 0;
-
-    pub fn has_working_spinner(self) -> bool {
-        self.0 & Self::WORKING_SPINNER != 0
-    }
+    cursor_visible: bool,
 }
 
 impl<'a> RenderTarget<'a> {
@@ -50,7 +36,7 @@ impl<'a> RenderTarget<'a> {
             buf,
             area,
             cursor: None,
-            animation_mask: AnimationMask::default(),
+            cursor_visible: false,
         }
     }
     pub fn area(&self) -> Rect {
@@ -65,18 +51,17 @@ impl<'a> RenderTarget<'a> {
     pub fn set_cursor_position<P: Into<Position>>(&mut self, position: P) {
         let p = position.into();
         self.cursor = Some((p.x, p.y));
+        self.cursor_visible = true;
+    }
+    pub fn set_cursor_anchor(&mut self, x: u16, y: u16, visible: bool) {
+        self.cursor = Some((x, y));
+        self.cursor_visible = visible;
     }
     pub fn cursor(&self) -> Option<(u16, u16)> {
         self.cursor
     }
-
-    /// Mark that this projection contains a live working-state spinner.
-    pub fn mark_working_animation(&mut self) {
-        self.animation_mask.0 |= AnimationMask::WORKING_SPINNER;
-    }
-
-    pub fn animation_mask(&self) -> AnimationMask {
-        self.animation_mask
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor_visible
     }
 }
 
@@ -90,11 +75,15 @@ mod git;
 mod help;
 mod menu;
 mod mission;
+mod mobile;
 mod panes;
 mod picker;
+mod preview;
 mod search;
+mod session_menu;
 mod settings;
 mod sidebar;
+pub(crate) use sidebar::SIDEBAR_CHROME_ROWS;
 mod status;
 pub(crate) mod switcher;
 mod tabbar;
@@ -103,18 +92,20 @@ mod tabbar;
 /// `RenderTarget`, render, then copy the resulting cursor back onto the frame.
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let cursor = {
+    let (cursor, visible) = {
         let mut target = RenderTarget {
             buf: f.buffer_mut(),
             area,
             cursor: None,
-            animation_mask: AnimationMask::default(),
+            cursor_visible: false,
         };
         render_into(&mut target, app);
-        target.cursor
+        (target.cursor, target.cursor_visible)
     };
     if let Some(p) = cursor {
-        f.set_cursor_position(p);
+        if visible {
+            f.set_cursor_position(p);
+        }
     }
 }
 
@@ -133,7 +124,9 @@ pub fn render_into(f: &mut RenderTarget, app: &mut App) {
 /// clamps a handful of scroll offsets as part of an ordinary interactive draw;
 /// preserve those values here so a passive projection cannot move the active
 /// client's cursor, scroll position, compact mode, or click targets.
-pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
+/// Return the passive client's content geometry before restoring all active
+/// hit-test state. Each client owns this baseline, never the shared App.
+pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(PaneId, Rect)> {
     let compact = app.compact;
     let last_main_area = app.last_main_area;
     let last_pane_area = app.last_pane_area;
@@ -144,14 +137,19 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let agents_scroll = app.agents_scroll;
     let last_active_ws_shown = app.last_active_ws_shown;
     let switcher_scroll = app.switcher_scroll;
+    let named_session_scroll = app.named_session_menu.as_ref().map(|menu| menu.scroll);
     let orch_scroll = app.orch_scroll;
     let orch_detail_scroll = app.orch_detail_scroll;
     let orch_area = app.orch_area;
+    let orch_hits = std::mem::take(&mut app.orch_hits);
     let mission_scroll = app.mission_scroll;
     let mission_area = app.mission_area;
     let mission_refresh_rect = app.mission_refresh_rect;
     let changelog_scroll = app.changelog_scroll;
     let file_tree_scroll = app.file_tree.scroll;
+    // Popup scroll offsets and geometry are recorded by an ordinary draw, and a
+    // projection renders at its own size — so keep them out of its way.
+    let menu_scroll = std::mem::take(&mut app.menu_scroll);
 
     // Geometry collections are write-only outputs of a render. Move the active
     // client's values aside instead of cloning them on every secondary frame.
@@ -161,17 +159,20 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let tab_rects = std::mem::take(&mut app.tab_rects);
     let tab_close_rects = std::mem::take(&mut app.tab_close_rects);
     let ws_rects = std::mem::take(&mut app.ws_rects);
-    let workspace_branch_rects = std::mem::take(&mut app.workspace_branch_rects);
     let git_section_rects = std::mem::take(&mut app.git_section_rects);
     let agents_filter_rects = std::mem::take(&mut app.agents_filter_rects);
+    let agents_elsewhere_rect = app.agents_elsewhere_rect;
     let agent_rects = std::mem::take(&mut app.agent_rects);
+    let automation_rects = std::mem::take(&mut app.automation_rects);
     let session_rects = std::mem::take(&mut app.session_rects);
     let file_tree_rects = std::mem::take(&mut app.file_tree_rects);
     let files_mode_rects = std::mem::take(&mut app.files_mode_rects);
     let diff_row_rects = std::mem::take(&mut app.diff_row_rects);
     let diff_source_rects = std::mem::take(&mut app.diff_source_rects);
     let diff_note_rects = std::mem::take(&mut app.diff_note_rects);
+    let preview_link_rects = std::mem::take(&mut app.preview_link_rects);
     let module_dock_rects = std::mem::take(&mut app.module_dock_rects);
+    let dock_dividers = std::mem::take(&mut app.dock_dividers);
     let picker_rects = std::mem::take(&mut app.picker_rects);
     let settings_tab_rects = std::mem::take(&mut app.settings_tab_rects);
     let settings_ctl_rects = std::mem::take(&mut app.settings_ctl_rects);
@@ -181,8 +182,11 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let changelog_copy_rects = std::mem::take(&mut app.changelog_copy_rects);
     let switcher_rects = std::mem::take(&mut app.switcher_rects);
     let switcher_scope_rects = std::mem::take(&mut app.switcher_scope_rects);
+    let named_session_row_rects = std::mem::take(&mut app.named_session_row_rects);
     let mission_rows = std::mem::take(&mut app.mission_rows);
     let mission_scope_rects = std::mem::take(&mut app.mission_scope_rects);
+    let mission_automation_rects = std::mem::take(&mut app.mission_automation_rects);
+    let mission_row_rects = std::mem::take(&mut app.mission_row_rects);
     let bar_hits = std::mem::take(&mut app.bar.hits);
     let bar_overflow_hits = std::mem::take(&mut app.bar.overflow_hits);
     let bar_overflow = app.bar.overflow.clone();
@@ -220,6 +224,10 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
         .diff_menu
         .as_mut()
         .map(|menu| std::mem::take(&mut menu.items));
+    let orch_menu_items = app
+        .orch_menu
+        .as_mut()
+        .map(|menu| std::mem::take(&mut menu.items));
     let dock_menu_rects = app
         .dock_menu
         .as_mut()
@@ -238,6 +246,12 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let tab_next_rect = app.tab_next_rect;
     let new_ws_rect = app.new_ws_rect;
     let switcher_button_rect = app.switcher_button_rect;
+    let mobile_pane_prev_rect = app.mobile_pane_prev_rect;
+    let mobile_pane_next_rect = app.mobile_pane_next_rect;
+    let switcher_close_rect = app.switcher_close_rect;
+    let named_session_button_rect = app.named_session_button_rect;
+    let named_session_menu_rect = app.named_session_menu_rect;
+    let named_session_close_rect = app.named_session_close_rect;
     let settings_modal_rect = app.settings_modal_rect;
     let settings_close_rect = app.settings_close_rect;
     let changelog_modal_rect = app.changelog_modal_rect;
@@ -268,31 +282,39 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.agents_scroll = agents_scroll;
     app.last_active_ws_shown = last_active_ws_shown;
     app.switcher_scroll = switcher_scroll;
+    if let (Some(scroll), Some(menu)) = (named_session_scroll, app.named_session_menu.as_mut()) {
+        menu.scroll = scroll;
+    }
     app.orch_scroll = orch_scroll;
     app.orch_detail_scroll = orch_detail_scroll;
     app.orch_area = orch_area;
+    app.orch_hits = orch_hits;
     app.mission_scroll = mission_scroll;
     app.mission_area = mission_area;
     app.mission_refresh_rect = mission_refresh_rect;
     app.changelog_scroll = changelog_scroll;
     app.file_tree.scroll = file_tree_scroll;
+    app.menu_scroll = menu_scroll;
     app.pane_rects = pane_rects;
-    app.pane_content_rects = pane_content_rects;
+    let projected_content = std::mem::replace(&mut app.pane_content_rects, pane_content_rects);
     app.pane_title_rects = pane_title_rects;
     app.tab_rects = tab_rects;
     app.tab_close_rects = tab_close_rects;
     app.ws_rects = ws_rects;
-    app.workspace_branch_rects = workspace_branch_rects;
     app.git_section_rects = git_section_rects;
     app.agents_filter_rects = agents_filter_rects;
+    app.agents_elsewhere_rect = agents_elsewhere_rect;
     app.agent_rects = agent_rects;
+    app.automation_rects = automation_rects;
     app.session_rects = session_rects;
     app.file_tree_rects = file_tree_rects;
     app.files_mode_rects = files_mode_rects;
     app.diff_row_rects = diff_row_rects;
     app.diff_source_rects = diff_source_rects;
     app.diff_note_rects = diff_note_rects;
+    app.preview_link_rects = preview_link_rects;
     app.module_dock_rects = module_dock_rects;
+    app.dock_dividers = dock_dividers;
     app.picker_rects = picker_rects;
     app.settings_tab_rects = settings_tab_rects;
     app.settings_ctl_rects = settings_ctl_rects;
@@ -302,11 +324,17 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.changelog_copy_rects = changelog_copy_rects;
     app.switcher_rects = switcher_rects;
     app.switcher_scope_rects = switcher_scope_rects;
+    app.named_session_row_rects = named_session_row_rects;
     app.mission_rows = mission_rows;
     app.mission_scope_rects = mission_scope_rects;
+    app.mission_automation_rects = mission_automation_rects;
+    app.mission_row_rects = mission_row_rects;
     app.bar.hits = bar_hits;
     app.bar.overflow_hits = bar_overflow_hits;
     app.bar.overflow = bar_overflow;
+    app.named_session_button_rect = named_session_button_rect;
+    app.named_session_menu_rect = named_session_menu_rect;
+    app.named_session_close_rect = named_session_close_rect;
     if let (Some(rects), Some(search)) = (search_rects, app.search.as_mut()) {
         search.rects = rects;
     }
@@ -336,6 +364,9 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     if let (Some(items), Some(menu)) = (diff_menu_items, app.diff_menu.as_mut()) {
         menu.items = items;
     }
+    if let (Some(items), Some(menu)) = (orch_menu_items, app.orch_menu.as_mut()) {
+        menu.items = items;
+    }
     if let (Some(rects), Some(menu)) = (dock_menu_rects, app.dock_menu.as_mut()) {
         menu.rects = rects;
     }
@@ -352,6 +383,9 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.tab_next_rect = tab_next_rect;
     app.new_ws_rect = new_ws_rect;
     app.switcher_button_rect = switcher_button_rect;
+    app.mobile_pane_prev_rect = mobile_pane_prev_rect;
+    app.mobile_pane_next_rect = mobile_pane_next_rect;
+    app.switcher_close_rect = switcher_close_rect;
     app.settings_modal_rect = settings_modal_rect;
     app.settings_close_rect = settings_close_rect;
     app.changelog_modal_rect = changelog_modal_rect;
@@ -366,6 +400,64 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
             git.contributors_more_rect = contributors_more_rect;
         }
     }
+    projected_content
+}
+
+/// Whether a PTY-only frame may reuse a client's complete UI buffer.
+/// Every state that draws over pane content or changes terminal styling forces
+/// the ordinary full renderer. Conservative false negatives cost one full
+/// frame; a false positive could corrupt visible output.
+pub(crate) fn retained_pty_eligible(app: &App) -> bool {
+    app.mode == Mode::Normal
+        // The VT damage contract forces a full projection when title chrome
+        // changes. Enabling titles alone need not disable retained rendering.
+        && app.selection.is_none()
+        && app.copy_mode.is_none()
+        && app.hover_link.is_none()
+        && app.search_flash.is_none()
+        && app.settings.is_none()
+        && app.picker.is_none()
+        && !app.help_open
+        && !app.changelog_open
+        && app.cmd_inspect.is_none()
+        && app.worktree_prompt.is_none()
+        && app.tab_rename.is_none()
+        && app.tab_menu.is_none()
+        && app.ws_rename.is_none()
+        && app.pane_rename.is_none()
+        && app.ws_menu.is_none()
+        && app.pane_menu.is_none()
+        && app.agent_menu.is_none()
+        && app.file_menu.is_none()
+        && app.diff_menu.is_none()
+        && app.orch_menu.is_none()
+        && app.dock_menu.is_none()
+        && app.file_prompt.is_none()
+        && app.file_delete.is_none()
+        && app.worktree_delete.is_none()
+        && !app.switcher
+        && app.named_session_menu.is_none()
+        && app.search.is_none()
+        && app.orch_form.is_none()
+        && app.orch_start.is_none()
+        && app.orch_detail.is_none()
+        && app.mission_detail.is_none()
+        && app.mission_answer.is_none()
+        && app.bar.overflow.is_none()
+        && app.toast.is_none()
+        && !app.active_is_git()
+        && !app.active_is_orch()
+        && !app.active_is_mission()
+}
+
+/// Apply owned VT damage to an already complete active-client projection.
+pub(crate) fn patch_terminal_damage(
+    target: &mut RenderTarget,
+    app: &App,
+    content_rects: &[(PaneId, Rect)],
+    snapshots: &std::collections::HashMap<PaneId, crate::terminal::vt::DamageSnapshot>,
+) -> Result<(), ()> {
+    panes::patch_terminal_damage(target, app, content_rects, snapshots)
 }
 
 fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
@@ -377,6 +469,18 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     f.render_widget(Block::new().style(Style::new().bg(t.mantle)), area);
     app.bar.hits.clear();
     app.bar.overflow_hits.clear();
+    app.menu_scroll.begin_frame();
+    app.mission_row_rects.clear();
+    app.mission_automation_rects.clear();
+    app.automation_rects.clear();
+    app.orch_hits.clear();
+    // Cleared with the other per-frame hit geometry, above every early return:
+    // a frame that bails out (window too small, no workspace yet) must not
+    // leave a dock divider behind as a live drag target.
+    app.dock_dividers.clear();
+    app.agents_elsewhere_rect = None;
+    app.mobile_pane_prev_rect = None;
+    app.mobile_pane_next_rect = None;
 
     // An absurdly small window can't hold the chrome — say so instead of
     // drawing degraded fragments. (Every draw fn is underflow-safe regardless;
@@ -393,29 +497,37 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         return;
     }
 
-    // No nodes at all (docs/43 §3.3): the last one was closed, so the session is
-    // over and every client has been told to detach. A client can still be
-    // attached for the frame or two before it goes (or attach fresh via
-    // `luvus attach` / `--remote` before opening a folder), and every draw fn
-    // below assumes an active node — `app.ws()` indexes `workspaces[active_ws]`.
-    // One guard here covers the whole tree rather than each call site.
+    // Restore or shell startup can fail before a workspace exists. Keep this
+    // guard before every renderer that indexes `app.ws()`. Normal close paths
+    // immediately create a real home terminal and never use this surface.
     if app.workspaces.is_empty() {
-        let msg = "no folders open — run `luvus` in a folder";
-        let y = area.y + area.height / 2;
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, Style::new().fg(t.overlay1))))
-                .alignment(ratatui::layout::Alignment::Center),
-            Rect::new(area.x, y, area.width, 1),
-        );
+        f.render_widget(Block::new().style(Style::new().bg(t.mantle)), area);
+        app.pane_rects.clear();
+        app.pane_content_rects.clear();
+        app.pane_title_rects.clear();
+        app.tab_rects.clear();
+        app.tab_close_rects.clear();
+        app.ws_rects.clear();
+        app.agents_filter_rects.clear();
+        app.agents_elsewhere_rect = None;
+        app.agent_rects.clear();
+        app.automation_rects.clear();
+        app.session_rects.clear();
+        app.new_ws_rect = None;
+        app.last_cursor = None;
+        if let Some((text, _)) = &app.toast {
+            draw_toast(f, area, text, &t);
+        }
         return;
     }
 
-    // Compact (touch) mode on a narrow phone screen (docs/18): no sidebars, one
-    // full-screen pane, a `≡` switcher for navigation. A vertical split doesn't
-    // change the width, so decide it from `area.width` here — early enough that
-    // it can also drop the bottom status bar (a dense, keyboard-oriented row that
-    // just eats space on a phone) and give that row back to the content.
-    app.compact = area.width < app.config.layout.compact_width;
+    // Automatic mobile presentation is derived from this client's viewport.
+    // `app.compact` remains a compatibility flag for existing compact renderers,
+    // but it is never persisted and projection rendering restores it afterward.
+    app.compact = matches!(
+        mobile::resolve_profile(area.width, app.config.layout.mobile_width),
+        mobile::MobileProfile::Mobile
+    );
     app.refresh_core_bar_widgets();
     let status_h = if app.compact { 0 } else { 1 };
     let [main, status] =
@@ -462,8 +574,14 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.left_seam = sidebar_left.map(|a| Rect::new(a.right().saturating_sub(1), a.y, 1, a.height));
     app.right_seam = sidebar_right.map(|a| Rect::new(a.x, a.y, 1, a.height));
 
-    let [tabbar, pane_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
+    let mobile_layout = app.compact.then(|| mobile::compute_layout(content));
+    let (tabbar, pane_area) = if let Some(layout) = mobile_layout {
+        (layout.header, layout.content)
+    } else {
+        let [tabbar, pane_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
+        (tabbar, pane_area)
+    };
 
     app.last_pane_area = pane_area;
 
@@ -483,7 +601,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     let bordered = rects.len() > 1;
     if resize_panes {
         for (id, rect) in &rects {
-            let Some(content) = pane_content(*rect, bordered) else {
+            let Some(content) = pane_content(*rect, bordered, app.compact) else {
                 continue;
             };
             let resized = app
@@ -507,13 +625,14 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     // set its own. A dock mounted nowhere (or a hidden sidebar) leaves its rects
     // zeroed, so nothing fires from under a widened pane area (docs/29).
     app.settings_icon_rect = None;
+    app.named_session_button_rect = None;
     app.sidebar_toggle_rect = None;
     app.right_sidebar_toggle_rect = None;
     app.version_rect = None;
     app.workspaces_area = Rect::ZERO;
     app.agents_area = Rect::ZERO;
     app.agents_filter_rects.clear();
-    app.workspace_branch_rects.clear();
+    app.agents_elsewhere_rect = None;
     app.module_dock_rects.clear();
     // The FILES dock's geometry must be zeroed here too, or its row rects go stale
     // when it isn't drawn this frame (its sidebar hidden, or the dock moved/off as
@@ -528,18 +647,27 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.diff_note_rects.clear();
     let mut ws_rects = Vec::new();
     let mut agent_rects = Vec::new();
+    let mut automation_rects = Vec::new();
     let mut session_rects = Vec::new();
     let mut new_ws_rect = None;
     for (opt, side) in [(sidebar_left, Side::Left), (sidebar_right, Side::Right)] {
         if let Some(s) = opt {
-            let (w, a, se, n) = sidebar::draw_sidebar(f, side, s, app, &t);
+            let (w, a, scheduled, se, n) = sidebar::draw_sidebar(f, side, s, app, &t);
             ws_rects.extend(w);
             agent_rects.extend(a);
+            automation_rects.extend(scheduled);
             session_rects.extend(se);
             new_ws_rect = new_ws_rect.or(n);
         }
     }
-    let (tab_rects, tab_close_rects, tab_prev, tab_next) = tabbar::draw_tabbar(f, tabbar, app, &t);
+    let (tab_rects, tab_close_rects, tab_prev, tab_next) = if let Some(layout) = mobile_layout {
+        app.sidebar_toggle_rect = None;
+        app.right_sidebar_toggle_rect = None;
+        mobile::render_header(f, layout, app, &t);
+        (Vec::new(), Vec::new(), None, None)
+    } else {
+        tabbar::draw_tabbar(f, tabbar, app, &t)
+    };
     // Behind the panes, use the (dark) pane background.
     f.render_widget(Block::new().style(Style::new().bg(t.mantle)), pane_area);
     // The focused pane's ✕ close and ⤢ zoom buttons, for mouse hit-testing.
@@ -569,32 +697,23 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     let compact = app.compact;
     let cursor = if app.active_is_orch() {
         app.orch_area = pane_area;
-        // Each task's live worker state (detection) rides along on its row.
-        let live: Vec<Option<board::RowLive>> = app
-            .orch
-            .tasks
-            .iter()
-            .map(|task| {
-                task.assignee
-                    .map(crate::ids::PaneId)
-                    .and_then(|pid| app.status.get(&pid))
-                    .map(|st| board::RowLive {
-                        agent: st.agent.clone(),
-                        state: st.state,
-                    })
-            })
-            .collect();
-        app.orch_scroll = board::render(
+        let rendered = board::render(
             f,
             pane_area,
             &app.orch,
-            &live,
+            &app.automation,
             app.orch_scroll,
             app.orch_cursor,
+            app.orch_automation_cursor,
+            app.orch_view,
+            app.orch_flow_mode,
             compact,
+            app.hover,
             cat,
             &t,
         );
+        app.orch_scroll = rendered.scroll;
+        app.orch_hits = rendered.hits;
         None
     } else if app.active_is_mission() {
         // Mission Control (docs/54): rows are precomputed from `App` first (so the
@@ -602,6 +721,8 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         // drawn; the scroll offset is written back.
         app.mission_area = pane_area;
         let rows = app.build_mission_rows();
+        let automation_health = app.automation.health();
+        let automation_rows = app.automation_views();
         let rendered = mission::render(
             f,
             pane_area,
@@ -612,6 +733,8 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
             app.mission_usage_refreshing(),
             app.mission_burn,
             app.config.mission_budget,
+            automation_health,
+            &automation_rows,
             compact,
             cat,
             &t,
@@ -619,12 +742,23 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         app.mission_scroll = rendered.scroll;
         app.mission_scope_rects = rendered.scope_rects;
         app.mission_refresh_rect = rendered.refresh_rect;
+        app.mission_automation_rects = rendered.automation_rects;
+        app.mission_row_rects = rendered.row_rects;
         app.mission_rows = rows;
         None
     } else if let Some(g) = app.active_git_mut() {
         git_section_rects = git::render(f, pane_area, g, compact, cat, &t);
         None
     } else {
+        let preview_rects: Vec<(PaneId, Rect)> = rects
+            .iter()
+            .filter_map(|(id, rect)| {
+                pane_content(*rect, bordered, app.compact).map(|content| (*id, content))
+            })
+            .collect();
+        if resize_panes {
+            app.ensure_preview_layouts(&preview_rects);
+        }
         let cursor = panes::draw_panes(f, &rects, bordered, app, &t);
         // Draw all pane borders in one overlay pass (manual cell-by-cell), then
         // the dot+path+close titles ON each top border row.
@@ -646,7 +780,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         } else {
             rects
                 .iter()
-                .filter_map(|(id, r)| pane_content(*r, bordered).map(|c| (*id, c)))
+                .filter_map(|(id, r)| pane_content(*r, bordered, app.compact).map(|c| (*id, c)))
                 .collect()
         };
     status::draw_status(f, status, app, &t);
@@ -685,7 +819,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     let picker_open = app.picker.is_some();
     let mut picker_rects = Vec::new();
     if let Some(p) = &app.picker {
-        picker_rects = picker::draw_picker(f, area, p, cat, &t);
+        picker_rects = picker::draw_picker(f, area, p, app.compact, cat, &t);
     }
     app.picker_rects = picker_rects;
 
@@ -704,7 +838,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         app.changelog_link_rects.clear();
         app.changelog_copy_rects.clear();
     }
-    // The running-command overlay (click a pane title) draws above that.
+    // The running-command overlay from the pane context menu draws above that.
     if let Some(c) = app.cmd_inspect.as_ref() {
         cmdinfo::draw(f, area, c, &t);
     }
@@ -754,10 +888,13 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
     // The FILES-dock context menu + its create/rename/delete modals (docs/38).
     if app.file_menu.is_some() {
-        menu::draw_file_menu(f, area, app, &t);
+        menu::draw_file_menu(f, area, app, cat, &t);
     }
     if app.diff_menu.is_some() {
         menu::draw_diff_menu(f, area, app, &t);
+    }
+    if app.orch_menu.is_some() {
+        menu::draw_orch_menu(f, area, app, cat, &t);
     }
     // A module dock row's own context menu (docs/52).
     if app.dock_menu.is_some() {
@@ -803,11 +940,11 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
     // The board's new-task form (docs/22 ORCH-7).
     if let Some(form) = &app.orch_form {
-        board::draw_form(f, area, form, cat, &t);
+        app.orch_hits = board::draw_form(f, area, form, cat, &t);
     }
     // The board's start-worker picker and task detail overlay.
     if let Some(start) = &app.orch_start {
-        board::draw_start(f, area, start, cat, &t);
+        app.orch_hits = board::draw_start(f, area, start, cat, &t);
     }
     if let Some(id) = &app.orch_detail {
         let clamped = app
@@ -815,9 +952,26 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
             .tasks
             .iter()
             .find(|task| &task.id == id)
-            .map(|task| board::draw_detail(f, area, task, app.orch_detail_scroll, cat, &t));
-        if let Some(s) = clamped {
-            app.orch_detail_scroll = s;
+            .map(|task| board::draw_detail(f, area, task, app.orch_detail_scroll, cat, &t))
+            .or_else(|| {
+                app.automation.automation(id).map(|automation| {
+                    board::draw_automation_detail(
+                        f,
+                        area,
+                        board::AutomationDetail {
+                            automation,
+                            state: &app.automation,
+                            preview: &app.orch_automation_preview,
+                        },
+                        app.orch_detail_scroll,
+                        cat,
+                        &t,
+                    )
+                })
+            });
+        if let Some(rendered) = clamped {
+            app.orch_detail_scroll = rendered.scroll;
+            app.orch_hits = rendered.hits;
         }
     }
     // Mission Control's row-detail overlay and inline answer input (docs/54).
@@ -833,9 +987,27 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
     // The touch switcher overlay (docs/18), above the chrome but below a toast.
     if app.switcher {
-        switcher::draw_switcher(f, area, app, &t);
+        if app.compact {
+            mobile::render_navigator(f, area, app, &t);
+        } else {
+            app.switcher_close_rect = None;
+            switcher::draw_switcher(f, area, app, &t);
+        }
     } else {
         app.switcher_rects.clear();
+        app.switcher_scope_rects.clear();
+        app.switcher_close_rect = None;
+    }
+    if app.named_session_menu.is_some() {
+        session_menu::draw_session_menu(f, area, app, &t);
+        if app.session_menu.is_some() {
+            menu::draw_session_menu(f, area, app, cat, &t);
+        }
+    } else {
+        app.named_session_menu_rect = None;
+        app.named_session_close_rect = None;
+        app.named_session_row_rects.clear();
+        app.session_menu = None;
     }
     // The global scrollback-search overlay (docs/63), above the chrome.
     if app.search.is_some() {
@@ -847,9 +1019,11 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
 
     let cursor = if settings_hits.is_some()
+        || app.search.is_some()
         || picker_open
         || app.bar.overflow.is_some()
         || app.help_open
+        || app.named_session_menu.is_some()
         || app.worktree_prompt.is_some()
         || app.tab_rename.is_some()
         || app.tab_menu.is_some()
@@ -858,8 +1032,10 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         || app.ws_menu.is_some()
         || app.pane_menu.is_some()
         || app.agent_menu.is_some()
+        || app.session_menu.is_some()
         || app.file_menu.is_some()
         || app.diff_menu.is_some()
+        || app.orch_menu.is_some()
         || app.dock_menu.is_some()
         || app.file_prompt.is_some()
         || app.file_delete.is_some()
@@ -873,10 +1049,10 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     } else {
         cursor
     };
-    if let Some(p) = cursor {
-        f.set_cursor_position(p);
+    if let Some((x, y, visible)) = cursor {
+        f.set_cursor_anchor(x, y, visible);
     }
-    app.last_cursor = cursor;
+    app.last_cursor = cursor.map(|(x, y, _)| (x, y));
     app.pane_rects = rects;
     app.tab_rects = tab_rects;
     app.tab_close_rects = tab_close_rects;
@@ -884,6 +1060,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.tab_next_rect = tab_next;
     app.ws_rects = ws_rects;
     app.agent_rects = agent_rects;
+    app.automation_rects = automation_rects;
     app.session_rects = session_rects;
     app.new_ws_rect = new_ws_rect;
 }
@@ -960,10 +1137,43 @@ pub(crate) fn display_width(s: &str) -> usize {
     s.width()
 }
 
+/// Shared dashboard panel chrome used by Mission Control and ORCH. Keeping the
+/// border, title, and surface treatment in one place prevents full-tab views
+/// from drifting into separate visual systems.
+pub(super) fn dashboard_block(
+    title: impl Into<String>,
+    t: &Theme,
+    focus: bool,
+) -> ratatui::widgets::Block<'static> {
+    use ratatui::widgets::{Block, BorderType, Borders};
+
+    let border = if focus { t.border_focus } else { t.surface1 };
+    Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(border).bg(t.mantle))
+        .title(Span::styled(
+            format!(" {} ", title.into()),
+            Style::new()
+                .fg(if focus { t.accent } else { t.overlay1 })
+                .bold(),
+        ))
+        .style(Style::new().bg(t.mantle))
+}
+
 /// Truncate `s` to at most `max` display columns, ending in a `…` when it does not
 /// fit. Width-aware like `display_width` (a CJK glyph counts as two, and is never
 /// split), so a narrowed sidebar clips long node/agent/branch names gracefully
 /// instead of hard-cutting mid-glyph (docs/29).
+/// Format a UTC Unix timestamp for sidebar, board, and Mission Control labels.
+pub(crate) fn format_utc(seconds: u64) -> String {
+    i64::try_from(seconds)
+        .ok()
+        .and_then(|seconds| jiff::Timestamp::from_second(seconds).ok())
+        .map(|instant| instant.to_string())
+        .unwrap_or_else(|| seconds.to_string())
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -1028,9 +1238,12 @@ pub(super) fn lone_pad(width: u16) -> u16 {
 /// The terminal content area: inside the box when bordered (the dot+path+close
 /// live on the top border row as a title), else just below the header row with a
 /// small horizontal pad so it aligns with the tab bar.
-fn pane_content(rect: Rect, bordered: bool) -> Option<Rect> {
+fn pane_content(rect: Rect, bordered: bool, mobile: bool) -> Option<Rect> {
     if bordered {
         return pane_inner(rect, true);
+    }
+    if mobile {
+        return (rect.width > 0 && rect.height > 0).then_some(rect);
     }
     let pad = lone_pad(rect.width);
     let c = Rect::new(
@@ -1103,6 +1316,155 @@ fn short_path(p: &Path, max: u16) -> String {
 }
 
 #[cfg(test)]
+mod retained_render_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+
+    use crate::terminal::appearance::PaneAppearance;
+    use crate::terminal::vt::{create_engine, VtEngineKind};
+
+    #[test]
+    fn damaged_rows_match_a_forced_full_projection() {
+        let _env = crate::persist::test_env("retained-render-equivalence");
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(100, 30, app_tx).expect("app starts");
+        let focus = app.layout().focus;
+        let (response_tx, _response_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            100,
+            30,
+            response_tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+        );
+        app.panes.get_mut(&focus).expect("focused pane").engine = engine.clone();
+
+        {
+            let mut engine = engine.lock().expect("engine lock");
+            engine.advance("hello 界\r\nsecond line".as_bytes());
+        }
+        let area = Rect::new(0, 0, 100, 30);
+        let mut retained = Buffer::empty(area);
+        let mut initial_target = RenderTarget::new(&mut retained, area);
+        render_into(&mut initial_target, &mut app);
+        let content_rects = app.pane_content_rects.clone();
+        {
+            let mut engine = engine.lock().expect("engine lock");
+            let initial = engine.damage_snapshot();
+            assert!(engine.acknowledge_damage(initial.generation));
+            engine.recycle_damage_snapshot(initial);
+            engine.advance(b"\rA\x1b[K");
+        }
+        let snapshot = engine.lock().expect("engine lock").damage_snapshot();
+        assert_eq!(snapshot.kind, crate::terminal::vt::DamageKind::Partial);
+        let snapshots = HashMap::from([(focus, snapshot)]);
+
+        let partial_cursor = {
+            let mut target = RenderTarget::new(&mut retained, area);
+            patch_terminal_damage(&mut target, &app, &content_rects, &snapshots)
+                .expect("partial projection eligible");
+            (target.cursor(), target.cursor_visible())
+        };
+
+        let mut forced = Buffer::empty(area);
+        let full_cursor = {
+            let mut target = RenderTarget::new(&mut forced, area);
+            render_into(&mut target, &mut app);
+            (target.cursor(), target.cursor_visible())
+        };
+        assert_eq!(retained, forced);
+        assert_eq!(partial_cursor, full_cursor);
+        let snapshot = snapshots.into_values().next().expect("damage snapshot");
+        engine
+            .lock()
+            .expect("engine lock")
+            .recycle_damage_snapshot(snapshot);
+    }
+
+    /// Projection-only evidence for docs/115. Ignored in the ordinary suite
+    /// because wall-clock ratios are machine dependent; run in release mode.
+    #[test]
+    #[ignore]
+    fn retained_projection_benchmark() {
+        let _env = crate::persist::test_env("retained-render-benchmark");
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(160, 40, app_tx).expect("app starts");
+        let focus = app.layout().focus;
+        let (response_tx, _response_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            160,
+            40,
+            response_tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+        );
+        app.panes.get_mut(&focus).expect("focused pane").engine = engine.clone();
+        let area = Rect::new(0, 0, 160, 40);
+        let mut retained = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut retained, area);
+        render_into(&mut target, &mut app);
+        let content_rects = app.pane_content_rects.clone();
+        let initial = engine.lock().expect("engine lock").damage_snapshot();
+        assert!(engine
+            .lock()
+            .expect("engine lock")
+            .acknowledge_damage(initial.generation));
+        engine
+            .lock()
+            .expect("engine lock")
+            .recycle_damage_snapshot(initial);
+
+        const ITERATIONS: usize = 2_000;
+        let partial_started = std::time::Instant::now();
+        for index in 0..ITERATIONS {
+            engine
+                .lock()
+                .expect("engine lock")
+                .advance(format!("\rrow {index:04}").as_bytes());
+            let snapshot = engine.lock().expect("engine lock").damage_snapshot();
+            let generation = snapshot.generation;
+            let snapshots = HashMap::from([(focus, snapshot)]);
+            let mut target = RenderTarget::new(&mut retained, area);
+            patch_terminal_damage(&mut target, &app, &content_rects, &snapshots).unwrap();
+            assert!(engine
+                .lock()
+                .expect("engine lock")
+                .acknowledge_damage(generation));
+            let snapshot = snapshots.into_values().next().expect("damage snapshot");
+            engine
+                .lock()
+                .expect("engine lock")
+                .recycle_damage_snapshot(snapshot);
+            std::hint::black_box(target.cursor());
+        }
+        let partial = partial_started.elapsed();
+
+        let mut forced = Buffer::empty(area);
+        let full_started = std::time::Instant::now();
+        for index in 0..ITERATIONS {
+            engine
+                .lock()
+                .expect("engine lock")
+                .advance(format!("\rfull {index:04}").as_bytes());
+            forced.reset();
+            let mut target = RenderTarget::new(&mut forced, area);
+            render_into(&mut target, &mut app);
+            std::hint::black_box(target.cursor());
+        }
+        let full = full_started.elapsed();
+        eprintln!(
+            "retained_projection iterations={ITERATIONS} partial_ns={} full_ns={} ratio={:.3}",
+            partial.as_nanos(),
+            full.as_nanos(),
+            partial.as_secs_f64() / full.as_secs_f64()
+        );
+    }
+}
+
+#[cfg(test)]
 mod bar_projection_tests {
     use super::*;
 
@@ -1133,5 +1495,94 @@ mod bar_projection_tests {
 
         assert_eq!(app.bar.hits, vec![hit]);
         assert_eq!(app.bar.overflow.as_ref().unwrap().rect, expected_popup);
+    }
+
+    #[test]
+    fn mobile_projection_does_not_leak_profile_or_mobile_hits() {
+        let _env = crate::persist::test_env("mobile-projection");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.config.layout.mobile_width = 80;
+        app.open_switcher();
+
+        let desktop_area = Rect::new(0, 0, 120, 40);
+        let mut desktop_buffer = Buffer::empty(desktop_area);
+        let mut desktop = RenderTarget::new(&mut desktop_buffer, desktop_area);
+        render_into(&mut desktop, &mut app);
+        assert!(!app.compact);
+        assert!(app.switcher_close_rect.is_none());
+        let desktop_content = app.pane_content_rects.clone();
+        let focus = app.layout().focus;
+        let pty_size = app.panes[&focus].size();
+
+        let phone_area = Rect::new(0, 0, 79, 35);
+        let mut phone_buffer = Buffer::empty(phone_area);
+        let mut phone = RenderTarget::new(&mut phone_buffer, phone_area);
+        render_projection(&mut phone, &mut app);
+
+        assert!(
+            !app.compact,
+            "passive phone projection cannot replace desktop profile"
+        );
+        assert!(app.switcher_close_rect.is_none());
+        assert_eq!(app.pane_content_rects, desktop_content);
+        assert_eq!(app.panes[&focus].size(), pty_size);
+    }
+}
+
+#[cfg(test)]
+mod dock_projection_tests {
+    use super::*;
+
+    /// A secondary or differently sized client must not overwrite the active
+    /// client's dock-divider hit targets. After projections at a much smaller
+    /// and a much larger size, `begin_dock_resize` still grabs the recorded row.
+    #[test]
+    fn render_projection_preserves_active_dock_dividers() {
+        let _env = crate::persist::test_env("dock-divider-projection");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.sidebars.left.docks = vec![DockKind::Workspaces, DockKind::Agents];
+        app.sidebars.left.visible = true;
+        app.sidebars.left.weights = Vec::new();
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buffer = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut buffer, area);
+        render_into(&mut target, &mut app);
+
+        let recorded = app.dock_dividers.clone();
+        assert!(
+            !recorded.is_empty(),
+            "two stacked docks publish a divider hit target"
+        );
+        let (side, _, dy) = recorded[0];
+        let col = match side {
+            Side::Left => app.left_seam.expect("left seam after render").x,
+            Side::Right => app.right_seam.expect("right seam after render").x,
+        };
+
+        let small = Rect::new(0, 0, 40, 12);
+        let mut small_buffer = Buffer::empty(small);
+        let mut small_target = RenderTarget::new(&mut small_buffer, small);
+        render_projection(&mut small_target, &mut app);
+        assert_eq!(
+            app.dock_dividers, recorded,
+            "a smaller projection cannot replace the active divider hits"
+        );
+
+        let large = Rect::new(0, 0, 200, 80);
+        let mut large_buffer = Buffer::empty(large);
+        let mut large_target = RenderTarget::new(&mut large_buffer, large);
+        render_projection(&mut large_target, &mut app);
+        assert_eq!(
+            app.dock_dividers, recorded,
+            "a larger projection cannot replace the active divider hits"
+        );
+
+        assert!(
+            app.begin_dock_resize(col, dy),
+            "the recorded divider row is still a hit target after projection"
+        );
     }
 }

@@ -3,15 +3,18 @@
 //! has a serde default, so old/new configs round-trip and a missing or corrupt
 //! file just yields defaults.
 
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::app::{SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
 
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -58,10 +61,27 @@ pub struct Config {
     /// (`--permission-mode bypassPermissions`), so switching it on is deliberate.
     #[serde(default)]
     pub resume_launch_flags: bool,
+    /// Show only live agents in the AGENTS dock. Missing values retain the
+    /// historical All default so resumable sessions never appear lost after an
+    /// upgrade. The visible All / Active control updates this preference.
+    #[serde(default)]
+    pub agents_active_only: bool,
+    /// Scope the AGENTS dock to the active workspace. This is a second axis,
+    /// independent of All / Active: that one selects lifecycle, this one selects
+    /// which project's rows are visible. Missing values keep the All-workspaces
+    /// default, so an upgrade never hides rows the user was already seeing. The
+    /// visible scope chip updates this preference.
+    #[serde(default)]
+    pub agents_this_workspace: bool,
     /// Custom keybindings: command id → key string (overrides the defaults).
     /// An empty value means the command is explicitly unbound.
     #[serde(default)]
     pub keybindings: std::collections::HashMap<String, String>,
+    /// Opt-in shortcuts handled without the command prefix: command id →
+    /// structured chord such as `alt+right`. Empty by default so normal shell
+    /// and nested-TUI input is never intercepted unless the user requests it.
+    #[serde(default)]
+    pub direct_keybindings: std::collections::HashMap<String, String>,
     /// The safe prefix that opens command mode (docs/64): an F1-F12 key or a
     /// Ctrl/Alt character chord such as `ctrl+space`, `ctrl+b`, or `alt+\\`.
     /// Plain text keys are rejected so normal terminal typing is never swallowed.
@@ -198,15 +218,41 @@ pub struct LayoutConfig {
     /// useful title.
     #[serde(default)]
     pub agent_title: bool,
+    /// Show the cwd line beneath each WORKSPACES entry. On by default to retain
+    /// the established two-row presentation; the row context menu persists the
+    /// compact one-row preference when this is disabled.
+    #[serde(default = "yes")]
+    pub workspace_paths: bool,
+    /// Show the workspace/path detail line beneath each AGENTS entry. On by
+    /// default; the row context menu can hide it for a denser one-row list.
+    #[serde(default = "yes")]
+    pub agent_paths: bool,
     /// Resume a session into its own workspace (else a new tab in the current one).
     #[serde(default = "yes", alias = "resume_in_new_node")]
     pub resume_in_new_workspace: bool,
+    /// Open a new tab/split at the workspace root instead of inheriting the
+    /// focused pane's live cwd. Off by default: a new tab/split starts where the
+    /// user is working; turn this on to always reset to the workspace root.
+    #[serde(default)]
+    pub new_pane_to_workspace_root: bool,
     /// Default action when a file is opened from the FILES tree (docs/38):
     /// `"readonly"` (the native viewer) or an editor run-command such as `"vim"`
-    /// / `"emacs -nw"`. A plain click uses this; Shift+click always reads it
-    /// read-only, and the right-click menu picks per file.
+    /// / `"emacs -nw"`. Consulted whenever a file opens in a *tab* — see
+    /// `file_click` for whether a plain click does that; Shift+click always
+    /// reads it read-only, and the right-click menu picks per file.
     #[serde(default = "default_file_open")]
     pub file_open: String,
+    /// What a plain left click on a FILES row does (docs/38): `"preview"` (the
+    /// default) reuses one native read-only preview pane in the active
+    /// workspace, VS Code style; `"tab"` opens a whole tab through
+    /// `layout.file_open`, which is what a click did before this setting
+    /// existed and the only mode that may launch an editor PTY. Deliberately
+    /// separate from `file_open`: that setting answers *which viewer*, this one
+    /// answers *where a click puts it*. Stored as a string rather than an enum
+    /// so a value written by a newer Luvus cannot fail the whole config's
+    /// deserialization — an unrecognized value reads back as the default.
+    #[serde(default = "default_file_click")]
+    pub file_click: String,
     /// Retained scrollback budget per pane. This is the user-facing memory dial:
     /// 10 MiB by default, regardless of how many panes are open. The Alacritty
     /// adapter derives a conservative row limit from it until the Ghostty engine
@@ -240,12 +286,11 @@ pub struct LayoutConfig {
     pub diff_color_mode: crate::diff::DiffColorMode,
     #[serde(default = "yes")]
     pub diff_live_refresh: bool,
-    /// Terminal width (columns) below which the touch/compact layout kicks in
-    /// (docs/18): one zoomed pane, sidebars hidden, the `≡` switcher. Configurable
-    /// because phone terminals in landscape often sit right around the default;
-    /// `0` disables compact mode entirely (the full UI always renders).
-    #[serde(default = "default_compact_width")]
-    pub compact_width: u16,
+    /// Terminal width (columns) at or below which the automatic mobile layout
+    /// kicks in (docs/100). This is resolved independently for each attached
+    /// client's viewport. `0` disables mobile presentation entirely.
+    #[serde(default = "default_mobile_width", alias = "compact_width")]
+    pub mobile_width: u16,
     /// What luvus forwards to a pane for **Shift/Alt+Enter** ("new line, don't
     /// submit"). A keyword from [`SHIFT_ENTER_CHOICES`]; default `esc-cr`
     /// (`ESC CR`, the sequence Claude Code's `/terminal-setup` installs). Exposed
@@ -256,8 +301,8 @@ pub struct LayoutConfig {
     pub shift_enter: String,
 }
 
-fn default_compact_width() -> u16 {
-    crate::app::COMPACT_WIDTH
+fn default_mobile_width() -> u16 {
+    crate::app::MOBILE_WIDTH
 }
 
 fn default_diff_context_lines() -> u16 {
@@ -288,6 +333,10 @@ pub struct SidebarsConfig {
     pub left: SideConfig,
     #[serde(default = "SideConfig::right_default")]
     pub right: SideConfig,
+    /// Last explicit FILES placement, retained while the dock is off so the
+    /// show/hide shortcut restores it to the same side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_side: Option<crate::app::Side>,
 }
 
 /// One sidebar's persisted state: shown/hidden, width, and its ordered dock ids.
@@ -299,6 +348,12 @@ pub struct SideConfig {
     pub width: u16,
     #[serde(default)]
     pub docks: Vec<String>,
+    /// Relative height share of each dock on this side, parallel to `docks`.
+    /// Empty — the default, and what every config written before dock resizing
+    /// existed contains — means an equal split, so an older config keeps the
+    /// layout it already had.
+    #[serde(default)]
+    pub dock_weights: Vec<u16>,
 }
 
 impl SideConfig {
@@ -308,6 +363,7 @@ impl SideConfig {
             visible: true,
             width: SIDEBAR_WIDTH_DEFAULT,
             docks: vec!["workspaces".into(), "agents".into()],
+            dock_weights: Vec::new(),
         }
     }
     /// The default right sidebar: off and empty.
@@ -316,6 +372,7 @@ impl SideConfig {
             visible: false,
             width: SIDEBAR_WIDTH_DEFAULT,
             docks: Vec::new(),
+            dock_weights: Vec::new(),
         }
     }
 }
@@ -326,6 +383,7 @@ impl SidebarsConfig {
         SidebarsConfig {
             left: SideConfig::left_default(),
             right: SideConfig::right_default(),
+            files_side: None,
         }
     }
     /// Migrate a pre-DOCK config: the default layout at the stored width.
@@ -336,16 +394,33 @@ impl SidebarsConfig {
     }
 }
 
-/// Sound alerts. The retro chime is optional, so both default to **off** —
-/// nothing rings until the user turns it on in Settings → General.
-#[derive(Serialize, Deserialize, Clone, Default)]
+/// Sound alerts. Both events default to **off**, while the existing Retro
+/// completion cue remains the default style for backward compatibility.
+#[derive(Serialize, Deserialize, Clone)]
 pub struct NotifyConfig {
-    /// Play the retro chime when an agent finishes a working stretch.
+    /// The synthesized cue family used by both notification events.
+    #[serde(default = "default_sound_style")]
+    pub sound_style: String,
+    /// Play the selected completion cue when an agent finishes a working stretch.
     #[serde(default)]
     pub sound_on_done: bool,
-    /// Play the same chime when an agent blocks on a permission prompt.
+    /// Play the selected attention cue when an agent blocks on a prompt.
     #[serde(default)]
     pub sound_on_blocked: bool,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            sound_style: default_sound_style(),
+            sound_on_done: false,
+            sound_on_blocked: false,
+        }
+    }
+}
+
+fn default_sound_style() -> String {
+    crate::sound::STYLE_RETRO.to_string()
 }
 
 fn default_theme() -> String {
@@ -361,6 +436,13 @@ fn default_shell_choice() -> String {
 pub const FILE_OPEN_READONLY: &str = "readonly";
 fn default_file_open() -> String {
     FILE_OPEN_READONLY.to_string()
+}
+/// `layout.file_click`: reuse one preview pane for a plain click.
+pub const FILE_CLICK_PREVIEW: &str = "preview";
+/// `layout.file_click`: a plain click opens a whole tab, honoring `file_open`.
+pub const FILE_CLICK_TAB: &str = "tab";
+fn default_file_click() -> String {
+    FILE_CLICK_PREVIEW.to_string()
 }
 fn default_sidebar_width() -> u16 {
     SIDEBAR_WIDTH_DEFAULT
@@ -391,7 +473,10 @@ impl Default for Config {
             notifications: NotifyConfig::default(),
             check_updates: true,
             resume_launch_flags: false,
+            agents_active_only: false,
+            agents_this_workspace: false,
             keybindings: std::collections::HashMap::new(),
+            direct_keybindings: std::collections::HashMap::new(),
             prefix: default_prefix(),
             mission_pricing: std::collections::HashMap::new(),
             mission_budget: None,
@@ -409,8 +494,12 @@ impl Default for LayoutConfig {
             show_titles: true,
             pane_title_path: false,
             agent_title: false,
+            workspace_paths: true,
+            agent_paths: true,
             resume_in_new_workspace: true,
+            new_pane_to_workspace_root: false,
             file_open: default_file_open(),
+            file_click: default_file_click(),
             scrollback_bytes: Some(SCROLLBACK_BYTES_DEFAULT),
             scrollback: default_scrollback(),
             files_show_hidden: true,
@@ -421,7 +510,7 @@ impl Default for LayoutConfig {
             diff_marker_style: crate::diff::DiffMarkerStyle::Symbols,
             diff_color_mode: crate::diff::DiffColorMode::Theme,
             diff_live_refresh: true,
-            compact_width: default_compact_width(),
+            mobile_width: default_mobile_width(),
             shift_enter: default_shift_enter(),
         }
     }
@@ -499,11 +588,22 @@ pub fn load() -> Config {
         .unwrap_or_default()
 }
 
-/// Hydrate an old line-count setting into the new persisted byte budget. The
-/// old default becomes today's 10 MiB default; custom values retain their rough
-/// relative size using the previous measured 5,000 lines at 120 columns ≈ 10
-/// MiB relationship.
+/// Apply versioned config migrations and clamp persisted values. The legacy
+/// scrollback line count becomes a byte budget using the previous measured
+/// 5,000 lines at 120 columns ≈ 10 MiB relationship.
 pub(crate) fn normalize_config(mut cfg: Config) -> Config {
+    // v2 assigns the former Switcher key (`m`) to Mission Control and moves
+    // Switcher to `M`. Old overrides that claim either new default would win
+    // over the defaults and leave an entry point unavailable. Keep only an
+    // override that already agrees with the v2 owner; conflicting commands
+    // return to their own defaults and can be rebound explicitly afterward.
+    if cfg.version < 2 {
+        cfg.keybindings.retain(|command, key| match key.as_str() {
+            "m" => command == "open_mission",
+            "M" => command == "switcher",
+            _ => true,
+        });
+    }
     if cfg.layout.scrollback_bytes.is_none() {
         cfg.layout.scrollback_bytes = Some(legacy_scrollback_bytes(cfg.layout.scrollback));
     }
@@ -511,6 +611,7 @@ pub(crate) fn normalize_config(mut cfg: Config) -> Config {
         .layout
         .diff_context_lines
         .min(crate::diff::MAX_CONTEXT_LINES);
+    cfg.version = cfg.version.max(CONFIG_VERSION);
     cfg
 }
 
@@ -525,20 +626,230 @@ fn legacy_scrollback_bytes(lines: usize) -> usize {
         .clamp(SCROLLBACK_BYTES_MIN, SCROLLBACK_BYTES_MAX)
 }
 
-/// Save the config atomically (best effort).
+static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Save a complete config atomically (best effort).
+///
+/// Runtime app code should use [`save_changes`] instead. A complete write is
+/// appropriate for isolated initialization and tests, but a long-running named
+/// server may hold an older copy of fields changed by another server.
+#[cfg(test)]
 pub fn save(cfg: &Config) {
-    let dir = crate::persist::ensure_config_dir();
-    if !dir.is_dir() {
-        return;
+    let path = config_path();
+    let _ = with_config_lock(&path, || write_config_atomic(cfg, &path));
+}
+
+/// Persist only fields changed between one server's last local config and its
+/// current config. The newest shared config is reloaded under a cross-process
+/// lock before applying the deep patch, so a named server cannot overwrite an
+/// unrelated setting with an older in-memory value.
+///
+/// Returns `true` after either a successful write or a no-op. Callers retain
+/// their old baseline on `false`, allowing the next change to retry everything
+/// that has not reached disk yet.
+#[cfg(test)]
+pub fn save_changes(base: &Config, desired: &Config) -> bool {
+    save_changes_with_patch(base, desired, None)
+}
+
+/// Persist local changes and also apply an explicit user/API patch. The
+/// explicit patch matters when a stale server is asked to select the value it
+/// already has in memory: there may be no local delta, but the shared file must
+/// still record the user's choice.
+pub fn save_changes_with_patch(base: &Config, desired: &Config, explicit: Option<&Value>) -> bool {
+    SaveRequest::new(base.clone(), desired.clone(), explicit.cloned()).write()
+}
+
+/// Owned save inputs with a pinned path; workers never resolve session globals.
+pub(crate) struct SaveRequest {
+    base: Config,
+    desired: Config,
+    explicit: Option<Value>,
+    path: PathBuf,
+}
+
+impl SaveRequest {
+    pub(crate) fn new(base: Config, desired: Config, explicit: Option<Value>) -> Self {
+        Self {
+            base,
+            desired,
+            explicit,
+            path: config_path(),
+        }
     }
-    let Ok(json) = serde_json::to_string_pretty(cfg) else {
+
+    pub(crate) fn write(self) -> bool {
+        save_changes_at(
+            &self.path,
+            &self.base,
+            &self.desired,
+            self.explicit.as_ref(),
+        )
+    }
+}
+
+fn save_changes_at(
+    path: &std::path::Path,
+    base: &Config,
+    desired: &Config,
+    explicit: Option<&Value>,
+) -> bool {
+    let Ok(base) = serde_json::to_value(base) else {
+        return false;
+    };
+    let Ok(desired) = serde_json::to_value(desired) else {
+        return false;
+    };
+    let delta = value_delta(&base, &desired);
+    if delta.is_none() && explicit.is_none() {
+        return true;
+    }
+
+    with_config_lock(path, || {
+        let latest: Config = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .map(normalize_config)
+            .unwrap_or_default();
+        let mut latest = serde_json::to_value(latest).map_err(io::Error::other)?;
+        if let Some(delta) = &delta {
+            apply_delta(&mut latest, delta);
+        }
+        if let Some(explicit) = explicit {
+            apply_delta(&mut latest, explicit);
+        }
+        let merged: Config = serde_json::from_value(latest).map_err(io::Error::other)?;
+        write_config_atomic(&normalize_config(merged), path)
+    })
+    .is_ok()
+}
+
+fn with_config_lock<T>(
+    path: &std::path::Path,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing configuration directory"))?;
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if Some(dir) != crate::platform::home_dir().as_deref() {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    if !dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "configuration directory is unavailable",
+        ));
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("config.lock"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    operation()
+}
+
+fn write_config_atomic(cfg: &Config, path: &std::path::Path) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(cfg).map_err(io::Error::other)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let (temporary, mut file): (PathBuf, File) = (0..16)
+        .find_map(|_| {
+            let sequence = CONFIG_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temporary = path.with_file_name(format!(
+                ".{file_name}.luvus-{}-{sequence}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => Some(Ok((temporary, file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "temporary config files"))?;
+
+    let result = (|| {
+        file.write_all(&json)?;
+        file.flush()?;
+        drop(file);
+        crate::platform::atomic_replace_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Produce a JSON Merge Patch style delta, recursing into maps so independent
+/// nested settings such as two Layout fields do not replace each other.
+fn value_delta(base: &Value, desired: &Value) -> Option<Value> {
+    match (base, desired) {
+        (Value::Object(base), Value::Object(desired)) => {
+            let mut delta = Map::new();
+            for key in base.keys() {
+                if !desired.contains_key(key) {
+                    delta.insert(key.clone(), Value::Null);
+                }
+            }
+            for (key, desired) in desired {
+                match base.get(key).and_then(|base| value_delta(base, desired)) {
+                    Some(value) => {
+                        delta.insert(key.clone(), value);
+                    }
+                    None if !base.contains_key(key) => {
+                        delta.insert(key.clone(), desired.clone());
+                    }
+                    None => {}
+                }
+            }
+            (!delta.is_empty()).then_some(Value::Object(delta))
+        }
+        _ if base == desired => None,
+        _ => Some(desired.clone()),
+    }
+}
+
+fn apply_delta(target: &mut Value, delta: &Value) {
+    let Value::Object(delta) = delta else {
+        *target = delta.clone();
         return;
     };
-    let path = config_path();
-    let tmp = path.with_extension("json.tmp");
-    if let Ok(mut f) = fs::File::create(&tmp) {
-        if f.write_all(json.as_bytes()).is_ok() && f.flush().is_ok() {
-            let _ = fs::rename(&tmp, &path);
+    if !target.is_object() {
+        *target = Value::Object(Map::new());
+    }
+    let target = target.as_object_mut().expect("object assigned above");
+    for (key, value) in delta {
+        if value.is_null() {
+            target.remove(key);
+        } else if let Some(current) = target.get_mut(key) {
+            apply_delta(current, value);
+        } else {
+            target.insert(key.clone(), value.clone());
         }
     }
 }
@@ -552,11 +863,28 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.theme, "quattro-rally");
         assert!(c.layout.show_titles);
+        assert!(c.layout.workspace_paths);
+        assert!(c.layout.agent_paths);
         assert_eq!(c.layout.col_gap, 1);
+        assert_eq!(c.layout.mobile_width, crate::app::MOBILE_WIDTH);
         // Empty object → all defaults (forward/back compat).
         let from_empty: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(from_empty.theme, "quattro-rally");
         assert_eq!(from_empty.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
+        assert!(from_empty.layout.workspace_paths);
+        assert!(from_empty.layout.agent_paths);
+        assert!(
+            from_empty.direct_keybindings.is_empty(),
+            "existing configs do not gain input-stealing direct shortcuts"
+        );
+        assert!(
+            !from_empty.agents_active_only,
+            "old configs retain the All agents default"
+        );
+        assert!(
+            !from_empty.agents_this_workspace,
+            "old configs retain the All-workspaces agents scope"
+        );
         assert_eq!(
             from_empty.bars.bottom_right,
             vec![crate::bar::CORE_RUNTIME.to_string()],
@@ -583,12 +911,35 @@ mod tests {
         // An old config written before this field still loads, at the new default.
         let old: Config = serde_json::from_str(r#"{"layout":{"col_gap":1}}"#).unwrap();
         assert_eq!(old.scrollback_bytes(), SCROLLBACK_BYTES_DEFAULT);
+        // Likewise a config written before `file_click`: an existing user gets
+        // the new preview default without their `file_open` choice moving.
+        assert_eq!(old.layout.file_click, FILE_CLICK_PREVIEW);
+        assert_eq!(c.layout.file_click, FILE_CLICK_PREVIEW);
+        let mut direct = Config::default();
+        direct
+            .direct_keybindings
+            .insert("next_tab".into(), "alt+right".into());
+        let direct_json = serde_json::to_string(&direct).unwrap();
+        let direct_roundtrip: Config = serde_json::from_str(&direct_json).unwrap();
+        assert_eq!(
+            direct_roundtrip.direct_keybindings.get("next_tab"),
+            Some(&"alt+right".to_string())
+        );
+        let picked: Config = serde_json::from_str(r#"{"layout":{"file_click":"tab"}}"#).unwrap();
+        assert_eq!(picked.layout.file_click, FILE_CLICK_TAB);
         let old_custom: Config = serde_json::from_str(r#"{"layout":{"scrollback":5000}}"#).unwrap();
         assert_eq!(old_custom.scrollback_bytes(), SCROLLBACK_BYTES_DEFAULT);
+        let legacy_mobile: Config =
+            serde_json::from_str(r#"{"layout":{"compact_width":80}}"#).unwrap();
+        assert_eq!(legacy_mobile.layout.mobile_width, 80);
+        let migrated = serde_json::to_string(&legacy_mobile).unwrap();
+        assert!(migrated.contains("\"mobile_width\":80"));
+        assert!(!migrated.contains("compact_width"));
 
         // Sounds are optional and must default to off.
         assert!(!c.notifications.sound_on_done);
         assert!(!c.notifications.sound_on_blocked);
+        assert_eq!(c.notifications.sound_style, crate::sound::STYLE_RETRO);
         let c2 = Config {
             theme: "mono".into(),
             notifications: NotifyConfig {
@@ -602,6 +953,141 @@ mod tests {
         assert_eq!(back.theme, "mono");
         assert!(back.notifications.sound_on_done);
         assert!(!back.notifications.sound_on_blocked);
+        assert_eq!(back.notifications.sound_style, crate::sound::STYLE_RETRO);
+
+        // Configs written before sound styles existed retain the original cue.
+        let old: Config = serde_json::from_str(
+            r#"{"notifications":{"sound_on_done":true,"sound_on_blocked":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.notifications.sound_style, crate::sound::STYLE_RETRO);
+    }
+
+    #[test]
+    fn agents_scope_preference_persists_both_choices() {
+        let _env = crate::persist::test_env("config-agents-scope");
+        let mut config = Config::default();
+        assert!(!config.agents_this_workspace);
+
+        config.agents_this_workspace = true;
+        save(&config);
+        assert!(load().agents_this_workspace);
+
+        config.agents_this_workspace = false;
+        save(&config);
+        assert!(!load().agents_this_workspace);
+    }
+
+    #[test]
+    fn agents_filter_preference_persists_both_choices() {
+        let _env = crate::persist::test_env("config-agents-filter");
+        let mut config = Config::default();
+        assert!(!config.agents_active_only);
+
+        config.agents_active_only = true;
+        save(&config);
+        assert!(load().agents_active_only);
+
+        config.agents_active_only = false;
+        save(&config);
+        assert!(!load().agents_active_only);
+    }
+
+    #[test]
+    fn stale_named_server_changes_preserve_newer_shared_fields() {
+        let _env = crate::persist::test_env("config-named-server-merge");
+        let mut initial = Config {
+            theme: "gruvbox-light".into(),
+            ..Config::default()
+        };
+        initial.keybindings.insert("close_pane".into(), "x".into());
+        save(&initial);
+
+        // Alpha and Beta model two named servers that loaded the same shared
+        // config before either one changed it.
+        let alpha_base = load();
+        let beta_base = load();
+
+        let mut alpha = alpha_base.clone();
+        alpha.theme = "quattro-rally".into();
+        assert!(save_changes(&alpha_base, &alpha));
+
+        // Beta still remembers the old light theme. Its unrelated change must
+        // not write that stale theme back to disk.
+        let mut beta = beta_base.clone();
+        beta.check_updates = false;
+        beta.keybindings.remove("close_pane");
+        assert!(save_changes(&beta_base, &beta));
+
+        let merged = load();
+        assert_eq!(merged.theme, "quattro-rally");
+        assert!(!merged.check_updates);
+        assert!(!merged.keybindings.contains_key("close_pane"));
+
+        // Deep patches also preserve independent fields in one nested section.
+        let alpha_base = alpha;
+        let beta_base = beta;
+        let mut alpha = alpha_base.clone();
+        alpha.layout.show_titles = false;
+        assert!(save_changes(&alpha_base, &alpha));
+        let mut beta = beta_base.clone();
+        beta.layout.files_show_hidden = true;
+        assert!(save_changes(&beta_base, &beta));
+
+        let merged = load();
+        assert!(!merged.layout.show_titles);
+        assert!(merged.layout.files_show_hidden);
+        assert_eq!(merged.theme, "quattro-rally");
+
+        // An explicit selection still wins when it matches this stale server's
+        // local value and therefore would not appear in the computed delta.
+        assert!(save_changes_with_patch(
+            &beta,
+            &beta,
+            Some(&serde_json::json!({"theme":"gruvbox-light"})),
+        ));
+        assert_eq!(load().theme, "gruvbox-light");
+    }
+
+    #[test]
+    fn v2_migrates_the_old_switcher_default_without_overriding_new_choices() {
+        let mut old = Config {
+            version: 1,
+            ..Default::default()
+        };
+        old.keybindings.insert("switcher".into(), "m".into());
+        let migrated = normalize_config(old);
+        assert_eq!(migrated.version, 2);
+        assert!(!migrated.keybindings.contains_key("switcher"));
+
+        let mut conflicting = Config {
+            version: 1,
+            ..Default::default()
+        };
+        conflicting
+            .keybindings
+            .insert("open_git".into(), "m".into());
+        conflicting
+            .keybindings
+            .insert("open_board".into(), "M".into());
+        conflicting
+            .keybindings
+            .insert("toggle_files".into(), "u".into());
+        let migrated = normalize_config(conflicting);
+        assert!(!migrated.keybindings.contains_key("open_git"));
+        assert!(!migrated.keybindings.contains_key("open_board"));
+        assert_eq!(
+            migrated.keybindings.get("toggle_files").map(String::as_str),
+            Some("u")
+        );
+
+        let mut current = Config::default();
+        current.keybindings.insert("switcher".into(), "m".into());
+        let current = normalize_config(current);
+        assert_eq!(
+            current.keybindings.get("switcher").map(String::as_str),
+            Some("m")
+        );
     }
 
     #[test]

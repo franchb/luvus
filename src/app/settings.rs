@@ -34,18 +34,6 @@ impl SettingsTab {
         SettingsTab::Language,
     ];
 
-    pub fn icon(self) -> &'static str {
-        match self {
-            SettingsTab::General => "◆",
-            SettingsTab::Theme => "◑",
-            SettingsTab::Layout => "▣",
-            SettingsTab::Keys => "⌨",
-            SettingsTab::Modules => "❏",
-            SettingsTab::Integrations => "☆",
-            SettingsTab::Language => "⊕",
-        }
-    }
-
     /// The tab label in the active UI language (docs/21).
     pub fn label(self, cat: &crate::i18n::Catalog) -> &'static str {
         match self {
@@ -92,6 +80,7 @@ pub enum LayoutRow {
     ColGap,
     RowGap,
     Scrollback,
+    MobileWidth,
     PaneTitles,
     PaneTitlePath,
     ResumeWs,
@@ -112,22 +101,29 @@ pub enum LayoutRow {
 }
 
 /// A selectable row in the General tab: the app-wide preferences that are not
-/// about looks or layout. The file-open control comes first, then a
-/// `── Notifications ──` section (same blank-gap + divider treatment as the
-/// Layout tab's Docks section).
+/// about looks or layout. The two file controls come first — which viewer, then
+/// what a click does with it — then a `── Notifications ──` section (same
+/// blank-gap + divider treatment as the Layout tab's Docks section).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GeneralRow {
     FileOpen,
+    /// What a plain click on a FILES row does: preview, or a whole tab.
+    FileClick,
     FilesShowHidden,
     ShiftEnter,
     CheckUpdates,
     /// Replay each agent's own CLI options on resume (docs/62).
     ResumeFlags,
+    /// Open a new tab/split at the workspace root instead of inheriting the
+    /// focused pane's cwd.
+    NewPaneToWorkspaceRoot,
     /// Show each agent's live session title in the AGENTS sidebar.
     AgentTitle,
+    SoundStyle,
     SoundDone,
     SoundBlocked,
-    TestSound,
+    TestDoneSound,
+    TestBlockedSound,
 }
 
 /// A selectable row in the Modules tab (docs/13 §3.6): a module, or one of the
@@ -147,22 +143,31 @@ impl App {
     pub fn general_rows(&self) -> Vec<GeneralRow> {
         vec![
             GeneralRow::FileOpen,
+            GeneralRow::FileClick,
             GeneralRow::FilesShowHidden,
             GeneralRow::ShiftEnter,
             GeneralRow::CheckUpdates,
             GeneralRow::ResumeFlags,
+            GeneralRow::NewPaneToWorkspaceRoot,
             GeneralRow::AgentTitle,
+            GeneralRow::SoundStyle,
             GeneralRow::SoundDone,
             GeneralRow::SoundBlocked,
-            GeneralRow::TestSound,
+            GeneralRow::TestDoneSound,
+            GeneralRow::TestBlockedSound,
         ]
     }
 
     /// Index of the first notification row (where the `── Notify ──` divider
-    /// goes), mirroring `dock_section_start` in the Layout tab. The five general
-    /// settings sit above it.
+    /// goes), mirroring `dock_section_start` in the Layout tab.
+    ///
+    /// This is one short: `AgentTitle` is a general setting, so the divider
+    /// renders above it and it reads as a notification option. That off-by-one
+    /// predates the `File click behavior` row — the constant went 6 → 7 only to
+    /// keep the divider where it already was. Fixing it properly means 8, which
+    /// moves a row users have already learned, so it is left for its own change.
     pub fn general_section_start(&self) -> usize {
-        5
+        7
     }
 
     /// The Layout tab's ordered selectable rows (docs/29). The first index of the
@@ -172,6 +177,7 @@ impl App {
             LayoutRow::ColGap,
             LayoutRow::RowGap,
             LayoutRow::Scrollback,
+            LayoutRow::MobileWidth,
             LayoutRow::PaneTitles,
             LayoutRow::PaneTitlePath,
             LayoutRow::ResumeWs,
@@ -272,7 +278,7 @@ impl App {
                 KEYS_HEADER_ROWS + crate::app::Cmd::ALL.len() + crate::app::key_reference_rows()
             }
             SettingsTab::Modules => self.module_rows().len(),
-            SettingsTab::Integrations => crate::integration::AGENTS.len(),
+            SettingsTab::Integrations => crate::integration::agent_count(),
             SettingsTab::Language => crate::i18n::LANGS.len(),
         }
     }
@@ -298,7 +304,7 @@ impl App {
                     return;
                 }
                 let Some(spec) = Self::prefix_spec_from_key(&key) else {
-                    self.show_toast("Use F1-F12 or a Ctrl/Alt chord");
+                    self.show_toast(self.catalog.settings.keys_invalid_prefix);
                     return;
                 };
                 if prefix_candidate.as_deref() == Some(spec.as_str()) {
@@ -314,7 +320,12 @@ impl App {
                     if let Some(ui) = self.settings.as_mut() {
                         ui.prefix_candidate = Some(spec);
                     }
-                    self.show_toast(format!("Press {label} again to confirm"));
+                    self.show_toast(
+                        self.catalog
+                            .settings
+                            .keys_confirm_prefix
+                            .replace("{key}", &label),
+                    );
                 }
                 return;
             }
@@ -429,14 +440,21 @@ impl App {
                     self.layout_rows().get(i),
                     Some(LayoutRow::SidebarWidth)
                         | Some(LayoutRow::RightWidth)
+                        | Some(LayoutRow::MobileWidth)
                         | Some(LayoutRow::DiffContext)
                         | Some(LayoutRow::Dock(_))
                         | Some(LayoutRow::Bar(_))
                 ),
-                // The file-open chooser only moves via its `‹ ›` arrows.
-                Some(SettingsTab::General) => {
-                    self.general_rows().get(i) == Some(&GeneralRow::FileOpen)
-                }
+                // The General-tab choosers only move via their `‹ ›` arrows: a
+                // click on the row body selects it. Missing one here is silent —
+                // the click falls through to `settings_activate`, which steps the
+                // value and persists it, so selecting a row would change it.
+                Some(SettingsTab::General) => matches!(
+                    self.general_rows().get(i),
+                    Some(GeneralRow::FileOpen)
+                        | Some(GeneralRow::FileClick)
+                        | Some(GeneralRow::SoundStyle)
+                ),
                 // Number/enum module settings likewise only move via `‹ ›`.
                 Some(SettingsTab::Modules) => self.module_row_is_slider(i),
                 _ => false,
@@ -541,9 +559,12 @@ impl App {
                 self.apply_language(crate::i18n::LANGS[cursor.min(crate::i18n::LANGS.len() - 1)])
             }
             SettingsTab::Layout => self.activate_layout(cursor),
-            // Enter/click: the Test row rings the chime, everything else steps.
+            // Enter/click: Test rows ring their cue, everything else steps.
             SettingsTab::General => match self.general_rows().get(cursor).copied() {
-                Some(GeneralRow::TestSound) => self.test_sound(),
+                Some(GeneralRow::TestDoneSound) => self.test_sound(crate::sound::SoundCue::Done),
+                Some(GeneralRow::TestBlockedSound) => {
+                    self.test_sound(crate::sound::SoundCue::Blocked)
+                }
                 _ => self.adjust_general(cursor, 1),
             },
             // Enter on a rebindable Keys row starts capturing the next key as its
@@ -817,7 +838,7 @@ impl App {
             )
         });
         if !removable {
-            self.show_toast(format!("Theme {id} is bundled and cannot be removed"));
+            self.show_toast(self.catalog.settings.theme_bundled.replace("{id}", id));
             return;
         }
 
@@ -837,7 +858,7 @@ impl App {
             .insert(id.to_string(), restore);
         let tx = self.app_tx.clone();
         let id = id.to_string();
-        self.show_toast(format!("Removing theme {id}…"));
+        self.show_toast(self.catalog.settings.theme_removing.replace("{id}", &id));
         std::thread::spawn(move || {
             let result = crate::theme::install::uninstall(&id)
                 .map(|_| crate::theme::ThemeRegistry::load())
@@ -859,7 +880,7 @@ impl App {
                 self.settings_theme_remove_rects
                     .retain(|(theme_id, _)| theme_id != &id);
                 self.clamp_settings_cursor();
-                self.show_toast(format!("Removed theme {id}"));
+                self.show_toast(self.catalog.settings.theme_removed.replace("{id}", &id));
             }
             Err(error) => {
                 if let Some((previous_theme, fallback_revision)) = restore {
@@ -867,7 +888,13 @@ impl App {
                         self.apply_theme(&previous_theme);
                     }
                 }
-                self.show_toast(format!("Could not remove {id}: {error}"));
+                self.show_toast(
+                    self.catalog
+                        .settings
+                        .theme_remove_failed
+                        .replace("{id}", &id)
+                        .replace("{error}", &error),
+                );
             }
         }
     }
@@ -877,17 +904,15 @@ impl App {
     }
 
     pub(crate) fn apply_theme(&mut self, name: &str) {
-        let Some(mut selected) = self.theme_registry.theme(name) else {
+        let Some(selected) = self.theme_registry.theme(name) else {
             return;
         };
         self.config.theme = theme::canonical(name).to_string();
         self.theme_selection_revision = self.theme_selection_revision.wrapping_add(1);
-        if self.downsample {
-            selected = selected.to_256();
-        }
-        self.theme = selected;
+        let theme_id = self.config.theme.clone();
+        self.set_effective_theme(&theme_id, selected);
         self.changelog_rows = None;
-        config::save(&self.config);
+        self.persist_config_patch(&serde_json::json!({"theme": theme_id}));
     }
 
     /// Swap the server's in-memory registry after an off-loop scan. A missing
@@ -895,14 +920,12 @@ impl App {
     /// restoring the file and reloading brings the selection back.
     pub(crate) fn replace_theme_registry(&mut self, registry: crate::theme::ThemeRegistry) -> bool {
         let selected_exists = registry.get(&self.config.theme).is_some();
-        if self.config.theme != "terminal" {
-            let mut selected = registry.theme_or_default(&self.config.theme);
-            if self.downsample {
-                selected = selected.to_256();
-            }
-            self.theme = selected;
-        }
         self.theme_registry = registry;
+        if self.config.theme != "terminal" {
+            let selected = self.theme_registry.theme_or_default(&self.config.theme);
+            let theme_id = self.config.theme.clone();
+            self.set_effective_theme(&theme_id, selected);
+        }
         self.clamp_settings_cursor();
         self.changelog_rows = None;
         selected_exists
@@ -912,7 +935,7 @@ impl App {
     fn apply_language(&mut self, code: &str) {
         self.config.language = code.to_string();
         self.catalog = crate::i18n::by_code(code);
-        config::save(&self.config);
+        self.persist_config_patch(&serde_json::json!({"language": code}));
     }
 
     /// Layout tab ‹ ›/click on a row's control (docs/29). Width sliders step by
@@ -951,20 +974,30 @@ impl App {
                 ) as usize;
                 self.config.layout.scrollback_bytes = Some(next);
                 self.apply_history_budget();
-                config::save(&self.config);
+                self.persist_config();
+            }
+            LayoutRow::MobileWidth => {
+                let current = self.config.layout.mobile_width;
+                self.config.layout.mobile_width = match (current, delta.cmp(&0)) {
+                    (0, std::cmp::Ordering::Greater) => 24,
+                    (0, _) => 0,
+                    (24, std::cmp::Ordering::Less) => 0,
+                    _ => (current as i32 + 4 * delta).clamp(24, 200) as u16,
+                };
+                self.persist_config();
             }
             LayoutRow::PaneTitles => {
                 self.config.layout.show_titles = !self.config.layout.show_titles;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::PaneTitlePath => {
                 self.config.layout.pane_title_path = !self.config.layout.pane_title_path;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::ResumeWs => {
                 self.config.layout.resume_in_new_workspace =
                     !self.config.layout.resume_in_new_workspace;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffLayout => {
                 self.config.layout.diff_layout = if delta < 0 {
@@ -982,23 +1015,23 @@ impl App {
                 } else {
                     self.config.layout.diff_layout.cycle()
                 };
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffWrap => {
                 self.config.layout.diff_wrap = !self.config.layout.diff_wrap;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffContext => {
                 self.config.layout.diff_context_lines =
                     (self.config.layout.diff_context_lines as i32 + delta)
                         .clamp(0, i32::from(crate::diff::MAX_CONTEXT_LINES))
                         as u16;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffLineNumbers => {
                 self.config.layout.diff_show_line_numbers =
                     !self.config.layout.diff_show_line_numbers;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffMarkers => {
                 self.config.layout.diff_marker_style = if delta < 0 {
@@ -1006,15 +1039,15 @@ impl App {
                 } else {
                     self.config.layout.diff_marker_style.cycle()
                 };
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffColors => {
                 self.config.layout.diff_color_mode = self.config.layout.diff_color_mode.cycle();
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffLiveRefresh => {
                 self.config.layout.diff_live_refresh = !self.config.layout.diff_live_refresh;
-                config::save(&self.config);
+                self.persist_config();
             }
             #[cfg(windows)]
             LayoutRow::Shell => self.cycle_shell(delta),
@@ -1047,7 +1080,7 @@ impl App {
                 };
                 self.config.bars.place(&key, region);
                 self.bar.clear_geometry();
-                config::save(&self.config);
+                self.persist_config();
                 if let Some(next) = self
                     .layout_rows()
                     .iter()
@@ -1102,7 +1135,7 @@ impl App {
                 };
                 self.config.bars.place(&key, next);
                 self.bar.clear_geometry();
-                config::save(&self.config);
+                self.persist_config();
                 if let Some(cursor) = self
                     .layout_rows()
                     .iter()
@@ -1132,7 +1165,33 @@ impl App {
             .unwrap_or(0) as i32;
         let next = (((cur + delta) % n + n) % n) as usize;
         self.config.layout.file_open = opts[next].clone();
-        config::save(&self.config);
+        self.persist_config();
+    }
+
+    /// Cycle what a plain FILES click does (docs/38): preview ⇄ open in tab.
+    /// Deliberately independent of `cycle_file_open`: this picks *where* a file
+    /// lands, that one picks *which viewer* opens it, and only "open in tab"
+    /// ever consults the viewer choice.
+    fn cycle_file_click(&mut self, delta: i32) {
+        let opts = [config::FILE_CLICK_PREVIEW, config::FILE_CLICK_TAB];
+        let n = opts.len() as i32;
+        let cur = opts
+            .iter()
+            .position(|o| *o == self.config.layout.file_click)
+            .unwrap_or(0) as i32;
+        let next = (((cur + delta) % n + n) % n) as usize;
+        self.config.layout.file_click = opts[next].to_string();
+        self.persist_config();
+    }
+
+    /// The current click-behavior choice as a display string. An unrecognized
+    /// stored value reads as the default, exactly as `file_click_target` treats it.
+    pub fn file_click_label(&self) -> String {
+        if self.config.layout.file_click.trim() == config::FILE_CLICK_TAB {
+            self.catalog.settings.click_tab.to_string()
+        } else {
+            self.catalog.settings.click_preview.to_string()
+        }
     }
 
     /// Cycle the Shift/Alt+Enter sequence through [`config::SHIFT_ENTER_CHOICES`].
@@ -1145,7 +1204,7 @@ impl App {
             .unwrap_or(0) as i32;
         let next = (((cur + delta) % n + n) % n) as usize;
         self.config.layout.shift_enter = opts[next].0.to_string();
-        config::save(&self.config);
+        self.persist_config();
     }
 
     /// The current Shift+Enter choice's display label (the raw keyword if unknown).
@@ -1153,7 +1212,11 @@ impl App {
         config::SHIFT_ENTER_CHOICES
             .iter()
             .find(|(k, _, _)| *k == self.config.layout.shift_enter)
-            .map(|(_, label, _)| label.to_string())
+            .map(|(key, label, _)| match *key {
+                "esc-cr" => format!("ESC CR ({})", self.catalog.settings.shift_default),
+                "lf" => format!("LF ({})", self.catalog.settings.shift_newline),
+                _ => label.to_string(),
+            })
             .unwrap_or_else(|| self.config.layout.shift_enter.clone())
     }
 
@@ -1162,7 +1225,7 @@ impl App {
     pub fn file_open_label(&self) -> String {
         let choice = &self.config.layout.file_open;
         if choice == config::FILE_OPEN_READONLY {
-            return "read-only".to_string();
+            return self.catalog.settings.read_only.to_string();
         }
         self.editors
             .iter()
@@ -1182,12 +1245,12 @@ impl App {
             .unwrap_or(0) as i32;
         let next = (((cur + delta) % n + n) % n) as usize;
         self.config.shell = choices[next].0.to_string();
-        config::save(&self.config);
+        self.persist_config();
     }
 
     fn apply_gaps(&mut self) {
         crate::layout::set_gaps(self.config.layout.col_gap, self.config.layout.row_gap);
-        config::save(&self.config);
+        self.persist_config();
     }
 
     /// Push the retained-history budget to every live pane. Alacritty's
@@ -1205,47 +1268,84 @@ impl App {
     fn adjust_general(&mut self, cursor: usize, delta: i32) {
         match self.general_rows().get(cursor).copied() {
             Some(GeneralRow::FileOpen) => self.cycle_file_open(delta),
+            Some(GeneralRow::FileClick) => self.cycle_file_click(delta),
             // Flips config *and* the live tree (docs/38), so it applies at once.
             Some(GeneralRow::FilesShowHidden) => self.toggle_files_hidden(),
             Some(GeneralRow::ShiftEnter) => self.cycle_shift_enter(delta),
             Some(GeneralRow::CheckUpdates) => {
                 self.config.check_updates = !self.config.check_updates;
-                config::save(&self.config);
+                self.persist_config();
             }
             Some(GeneralRow::ResumeFlags) => {
                 self.config.resume_launch_flags = !self.config.resume_launch_flags;
-                config::save(&self.config);
+                self.persist_config();
+            }
+            Some(GeneralRow::NewPaneToWorkspaceRoot) => {
+                self.config.layout.new_pane_to_workspace_root =
+                    !self.config.layout.new_pane_to_workspace_root;
+                self.persist_config();
             }
             Some(GeneralRow::AgentTitle) => {
                 self.config.layout.agent_title = !self.config.layout.agent_title;
-                config::save(&self.config);
+                self.persist_config();
             }
+            Some(GeneralRow::SoundStyle) => self.cycle_sound_style(delta),
             Some(GeneralRow::SoundDone) => {
                 self.config.notifications.sound_on_done = !self.config.notifications.sound_on_done;
-                config::save(&self.config);
+                self.persist_config();
             }
             Some(GeneralRow::SoundBlocked) => {
                 self.config.notifications.sound_on_blocked =
                     !self.config.notifications.sound_on_blocked;
-                config::save(&self.config);
+                self.persist_config();
             }
-            // The Test row fires on Enter/click only (see `settings_activate`) —
-            // arrows must not ring it, or holding ‹ › would spam the chime.
-            Some(GeneralRow::TestSound) => {}
+            // Test rows fire on Enter/click only (see `settings_activate`) —
+            // arrows must not ring them, or holding ‹ › would spam cues.
+            Some(GeneralRow::TestDoneSound | GeneralRow::TestBlockedSound) => {}
             None => {}
         }
     }
 
-    /// Play the retro chime once so the user can hear it before turning it on.
-    /// Bypasses both sound toggles — it's an explicit manual test.
-    fn test_sound(&mut self) {
-        self.pending_sound = true;
+    fn cycle_sound_style(&mut self, delta: i32) {
+        let current = crate::sound::SoundStyle::from_config(&self.config.notifications.sound_style);
+        let index = crate::sound::STYLES
+            .iter()
+            .position(|style| *style == current)
+            .unwrap_or(0) as i32;
+        let count = crate::sound::STYLES.len() as i32;
+        let next = ((index + delta) % count + count) % count;
+        self.config.notifications.sound_style = crate::sound::STYLES[next as usize].key().into();
+        self.persist_config();
+    }
+
+    pub fn sound_style_label(&self) -> &'static str {
+        crate::sound::SoundStyle::from_config(&self.config.notifications.sound_style).label()
+    }
+
+    /// Play one cue so the user can hear the selected style before enabling it.
+    /// Manual tests bypass both event toggles.
+    fn test_sound(&mut self, cue: crate::sound::SoundCue) {
+        self.queue_sound(cue);
+    }
+
+    /// Queue one sound without allowing a completion cue to hide a more urgent
+    /// blocked cue that arrived in the same event-loop interval.
+    pub(crate) fn queue_sound(&mut self, cue: crate::sound::SoundCue) {
+        if self.pending_sound.is_some_and(|signal| {
+            signal.cue == crate::sound::SoundCue::Blocked && cue == crate::sound::SoundCue::Done
+        }) {
+            return;
+        }
+        self.pending_sound = Some(crate::sound::SoundSignal {
+            cue,
+            style: crate::sound::SoundStyle::from_config(&self.config.notifications.sound_style),
+        });
     }
 
     /// Toggle an agent's integration hook: install if absent, uninstall if present.
     /// Uninstall removes only luvus's hook — never the agent itself.
     fn install_integration(&mut self, cursor: usize) {
-        if let Some(agent) = crate::integration::AGENTS.get(cursor) {
+        if let Some(agent) = crate::integration::agent_at(cursor) {
             if crate::integration::is_installed(agent) {
                 let _ = crate::integration::uninstall(agent);
             } else {
@@ -1353,6 +1453,24 @@ mod tests {
         assert_eq!(right_visible, left_visible + 1);
         assert_eq!(left_width, right_visible + 1);
         assert_eq!(right_width, left_width + 1);
+    }
+
+    #[test]
+    fn mobile_width_setting_can_disable_and_restore_automatic_layout() {
+        let _env = crate::persist::test_env("mobile-width-settings");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let row = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::MobileWidth))
+            .expect("the mobile width row is present");
+
+        app.config.layout.mobile_width = 24;
+        app.adjust_layout(row, -1);
+        assert_eq!(app.config.layout.mobile_width, 0);
+        app.adjust_layout(row, 1);
+        assert_eq!(app.config.layout.mobile_width, 24);
     }
 
     #[test]
@@ -1478,6 +1596,7 @@ mod tests {
             app.config.layout.diff_marker_style,
             crate::diff::DiffMarkerStyle::Bars
         );
+        app.flush_config_for_test(&_rx);
         assert_eq!(
             crate::config::load().layout.diff_marker_style,
             crate::diff::DiffMarkerStyle::Bars,
@@ -1520,6 +1639,7 @@ mod tests {
             app.config.layout.diff_color_mode,
             crate::diff::DiffColorMode::Standard
         );
+        app.flush_config_for_test(&_rx);
         assert_eq!(
             crate::config::load().layout.diff_color_mode,
             crate::diff::DiffColorMode::Standard,
@@ -1558,6 +1678,7 @@ mod tests {
 
         app.adjust_general(row, 1);
         assert!(app.config.resume_launch_flags, "the toggle flipped");
+        app.flush_config_for_test(&_rx);
         assert!(
             crate::config::load().resume_launch_flags,
             "and it was saved"
@@ -1572,9 +1693,57 @@ mod tests {
         assert!(!old.resume_launch_flags);
     }
 
-    // The General tab is the file-open chooser plus the Notifications section:
-    // the two sound toggles (persisted) and a Test row that rings the chime
-    // immediately, regardless of the toggles.
+    /// The "Open new pane/tab at workspace root" toggle is opt-in: off by
+    /// default (a new tab/split inherits the focused pane's cwd), and flipping
+    /// it in Settings → General persists.
+    #[test]
+    fn new_pane_to_workspace_root_toggle_persists() {
+        let _env = crate::persist::test_env("new-pane-workspace-root");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        assert!(
+            !app.config.layout.new_pane_to_workspace_root,
+            "off by default: a new tab/split inherits the focused pane's cwd"
+        );
+
+        app.open_settings();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::General;
+        }
+        let row = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::NewPaneToWorkspaceRoot)
+            .expect("the row is on the General tab");
+        // It sits with the general options, above the Notify divider.
+        assert!(row < app.general_section_start());
+
+        app.adjust_general(row, 1);
+        assert!(
+            app.config.layout.new_pane_to_workspace_root,
+            "the toggle flipped"
+        );
+        app.flush_config_for_test(&_rx);
+        assert!(
+            crate::config::load().layout.new_pane_to_workspace_root,
+            "and it was saved"
+        );
+
+        app.adjust_general(row, 1);
+        assert!(
+            !app.config.layout.new_pane_to_workspace_root,
+            "toggles back"
+        );
+
+        // A config written before this field existed loads as off: the inherit
+        // behavior stays the default for an existing user.
+        let old: crate::config::Config = serde_json::from_str("{}").unwrap();
+        assert!(!old.layout.new_pane_to_workspace_root);
+    }
+
+    // The General tab is the two file choosers plus the Notifications section:
+    // the selected sound style, two persisted event toggles, and separate test
+    // rows for the completion and attention cues.
     #[test]
     fn general_tab_toggles_sounds_and_tests_the_chime() {
         let _env = crate::persist::test_env("general-tab");
@@ -1584,10 +1753,19 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 9);
+        assert_eq!(app.settings_rows(SettingsTab::General), 13);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
+        assert_eq!(
+            rows[1],
+            GeneralRow::FileClick,
+            "click behavior sits next to the viewer it qualifies"
+        );
 
+        let style = rows
+            .iter()
+            .position(|r| *r == GeneralRow::SoundStyle)
+            .unwrap();
         let done = rows
             .iter()
             .position(|r| *r == GeneralRow::SoundDone)
@@ -1596,28 +1774,56 @@ mod tests {
             .iter()
             .position(|r| *r == GeneralRow::SoundBlocked)
             .unwrap();
-        let test = rows
+        let test_done = rows
             .iter()
-            .position(|r| *r == GeneralRow::TestSound)
+            .position(|r| *r == GeneralRow::TestDoneSound)
+            .unwrap();
+        let test_blocked = rows
+            .iter()
+            .position(|r| *r == GeneralRow::TestBlockedSound)
             .unwrap();
 
+        assert_eq!(app.sound_style_label(), "Retro");
+        app.settings_adjust(style, 1);
+        assert_eq!(app.sound_style_label(), "Soft");
         app.settings_activate(done);
         assert!(app.config.notifications.sound_on_done, "toggles done");
         app.settings_activate(blocked);
         assert!(app.config.notifications.sound_on_blocked, "toggles blocked");
 
-        assert!(!app.pending_sound);
-        // Arrows must NOT ring the chime (only Enter/click does).
-        app.settings_adjust(test, 1);
-        assert!(!app.pending_sound, "‹ › on the Test row does not ring");
-        app.settings_activate(test);
-        assert!(app.pending_sound, "the Test row rings the chime");
+        assert!(app.pending_sound.is_none());
+        // Arrows must NOT ring cues (only Enter/click does).
+        app.settings_adjust(test_done, 1);
+        assert!(
+            app.pending_sound.is_none(),
+            "‹ › on a Test row does not ring"
+        );
+        app.settings_activate(test_done);
+        assert_eq!(
+            app.pending_sound,
+            Some(crate::sound::SoundSignal {
+                cue: crate::sound::SoundCue::Done,
+                style: crate::sound::SoundStyle::Soft,
+            })
+        );
+        app.settings_activate(test_blocked);
+        assert_eq!(
+            app.pending_sound.map(|signal| signal.cue),
+            Some(crate::sound::SoundCue::Blocked),
+            "blocked test replaces a pending done cue"
+        );
+        app.settings_activate(test_done);
+        assert_eq!(
+            app.pending_sound.map(|signal| signal.cue),
+            Some(crate::sound::SoundCue::Blocked),
+            "a done cue cannot hide a pending blocked cue"
+        );
     }
 
-    /// The General tab renders the file-open chooser, then a `Notify` section
+    /// The General tab renders the two file choosers, then a `Notify` section
     /// divider, then the sound rows — the Docks-section treatment (docs/15).
     #[test]
-    fn general_tab_renders_file_open_then_a_notify_section() {
+    fn general_tab_renders_the_file_choosers_then_a_notify_section() {
         use ratatui::{backend::TestBackend, Terminal};
         let _env = crate::persist::test_env("general-render");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -1642,6 +1848,11 @@ mod tests {
         assert!(all.contains("Open files with"), "file-open row drawn");
         assert!(all.contains("read-only"), "its current value drawn");
         assert!(
+            all.contains("File click behavior"),
+            "the click-behavior row drawn beside it"
+        );
+        assert!(all.contains("Preview"), "its default value drawn");
+        assert!(
             all.contains("Remember CLI option"),
             "the resume switch drawn"
         );
@@ -1653,7 +1864,7 @@ mod tests {
             row_of("Open files with"),
             row_of("Remember CLI option"),
             row_of("Notify"),
-            row_of("Test sound"),
+            row_of("Test blocked sound"),
         );
         assert!(
             fo < res && res < div && div < snd,
@@ -1662,6 +1873,113 @@ mod tests {
         // A blank line separates the options from the section header.
         let (res, div) = (res.unwrap(), div.unwrap());
         assert!(div >= res + 2, "a blank gap sits above the section divider");
+    }
+
+    #[test]
+    fn settings_chrome_and_values_follow_the_active_catalog() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        fn screen(app: &mut crate::app::App) -> String {
+            let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, app))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        }
+
+        let _env = crate::persist::test_env("settings-complete-i18n");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(160, 40, tx).unwrap();
+        app.catalog = crate::i18n::by_code("es");
+        app.open_settings();
+
+        app.settings_set_tab(SettingsTab::Keys);
+        let keys = screen(&mut app);
+        assert!(keys.contains("Pulsa el prefijo"));
+        assert!(keys.contains("Modo de comandos"));
+        assert!(keys.contains("Preajuste"));
+        assert!(!keys.contains("Press the prefix"));
+
+        if let Some(ui) = app.settings.as_mut() {
+            ui.cursor = KEYS_HEADER_ROWS + crate::app::Cmd::ALL.len();
+        }
+        let reference = screen(&mut app);
+        assert!(reference.contains("Siempre activos"));
+        assert!(reference.contains("enfocar paneles"));
+        assert!(!reference.contains("Always on"));
+
+        if let Some(ui) = app.settings.as_mut() {
+            ui.cursor =
+                KEYS_HEADER_ROWS + crate::app::Cmd::ALL.len() + crate::app::key_reference_rows()
+                    - 1;
+        }
+        let mouse_reference = screen(&mut app);
+        assert!(mouse_reference.contains("Ratón"));
+        assert!(mouse_reference.contains("clic derecho"));
+        assert!(mouse_reference.contains("tocar panel"));
+        assert!(!mouse_reference.contains("right-click"));
+
+        if let Some(ui) = app.settings.as_mut() {
+            ui.cursor = KEYS_PREFIX_ROW;
+            ui.capturing = true;
+        }
+        app.handle_settings_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|(message, _)| message == "Usa F1-F12 o un atajo Ctrl/Alt"));
+
+        app.settings_set_tab(SettingsTab::General);
+        let general = screen(&mut app);
+        assert!(general.contains("solo lectura"));
+        assert!(general.contains("predeterminado"));
+
+        app.settings_set_tab(SettingsTab::Layout);
+        let diff_layout = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::DiffLayout))
+            .unwrap();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.cursor = diff_layout;
+        }
+        let layout = screen(&mut app);
+        assert!(layout.contains("automático"));
+
+        app.settings_set_tab(SettingsTab::Modules);
+        let modules = screen(&mut app);
+        assert!(modules.contains("No hay módulos instalados"));
+    }
+
+    #[test]
+    fn every_language_renders_every_settings_tab() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let _env = crate::persist::test_env("settings-all-languages");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(160, 40, tx).unwrap();
+        app.open_settings();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+
+        for &code in crate::i18n::LANGS {
+            app.catalog = crate::i18n::by_code(code);
+            for tab in SettingsTab::ALL {
+                app.settings_set_tab(tab);
+                let last = app.settings_rows(tab).saturating_sub(1);
+                if let Some(ui) = app.settings.as_mut() {
+                    ui.cursor = last;
+                }
+                terminal
+                    .draw(|frame| crate::ui::render(frame, &mut app))
+                    .unwrap_or_else(|error| panic!("{code} {tab:?} failed to render: {error}"));
+            }
+        }
     }
 
     /// Notifications is no longer its own tab: General leads the tab strip and
@@ -1675,20 +1993,6 @@ mod tests {
         );
         assert_eq!(SettingsTab::ALL[1], SettingsTab::Theme, "before Theme");
         assert_eq!(SettingsTab::ALL.len(), 7, "still seven tabs");
-    }
-
-    #[test]
-    fn settings_tab_icons_have_consistent_terminal_width() {
-        assert_eq!(SettingsTab::General.icon(), "◆");
-        assert_eq!(SettingsTab::Layout.icon(), "▣");
-        assert_eq!(SettingsTab::Integrations.icon(), "☆");
-        for tab in SettingsTab::ALL {
-            assert_eq!(
-                unicode_width::UnicodeWidthStr::width(tab.icon()),
-                1,
-                "{tab:?} icon must occupy one terminal column"
-            );
-        }
     }
 
     /// The General tab's "Open files with" slider cycles read-only → each detected
@@ -1723,6 +2027,144 @@ mod tests {
         assert_eq!(
             app.config.layout.file_open, "nano",
             "steps backward with wrap"
+        );
+    }
+
+    /// The General tab's "File click behavior" slider is a two-way toggle that
+    /// persists, and it is independent of "Open files with": cycling one must
+    /// never move the other.
+    #[test]
+    fn general_file_click_cycles_between_preview_and_tab() {
+        let _env = crate::persist::test_env("file-click-cycle");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.editors = vec![("vim".into(), "vim".into())];
+        app.open_settings();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::General;
+        }
+        let click = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::FileClick)
+            .expect("the General tab has a click-behavior row");
+        let open = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::FileOpen)
+            .expect("the General tab has a file-open row");
+
+        assert_eq!(
+            app.config.layout.file_click,
+            config::FILE_CLICK_PREVIEW,
+            "preview is the default"
+        );
+        assert_eq!(app.file_click_label(), "Preview");
+        app.settings_adjust(click, 1);
+        assert_eq!(app.config.layout.file_click, config::FILE_CLICK_TAB);
+        assert_eq!(app.file_click_label(), "Open in tab");
+        app.flush_config_for_test(&_rx);
+        assert_eq!(
+            crate::config::load().layout.file_click,
+            config::FILE_CLICK_TAB,
+            "and the choice was saved"
+        );
+        assert_eq!(
+            app.config.layout.file_open, "readonly",
+            "the viewer choice did not move with it"
+        );
+        // Two values, so a step in either direction wraps straight back.
+        app.settings_adjust(click, -1);
+        assert_eq!(app.config.layout.file_click, config::FILE_CLICK_PREVIEW);
+
+        // And the reverse: stepping the viewer leaves the click behavior alone.
+        app.settings_adjust(open, 1);
+        assert_eq!(app.config.layout.file_open, "vim");
+        assert_eq!(app.config.layout.file_click, config::FILE_CLICK_PREVIEW);
+    }
+
+    /// A click on a `‹ ›` slider's row *body* selects it and nothing more —
+    /// only the arrows step the value. Both General-tab file choosers are
+    /// sliders, and a row missing from `handle_settings_click`'s slider list
+    /// fails silently: the click falls through to `settings_activate`, which
+    /// cycles the setting and writes it to disk. So a user reaching to select
+    /// the row would change their setting instead.
+    #[test]
+    fn clicking_a_file_chooser_row_body_selects_it_without_changing_it() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let _env = crate::persist::test_env("settings-slider-body-click");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        app.editors = vec![("vim".into(), "vim".into())];
+        app.open_settings();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::General;
+            // Park the cursor elsewhere so "the cursor moved" is a real signal.
+            ui.cursor = 0;
+        }
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+
+        for row in [GeneralRow::FileClick, GeneralRow::FileOpen] {
+            let i = app
+                .general_rows()
+                .iter()
+                .position(|r| *r == row)
+                .unwrap_or_else(|| panic!("{row:?} is on the General tab"));
+            let rect = app
+                .settings_ctl_rects
+                .iter()
+                .find(|(index, _)| *index == i)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{row:?} has a control rect"));
+            let before = (
+                app.config.layout.file_click.clone(),
+                app.config.layout.file_open.clone(),
+            );
+
+            // The row body: two cells in from the left, far from the right-aligned
+            // `‹ ›` arrows.
+            app.handle_settings_click(rect.x + 2, rect.y);
+
+            assert_eq!(
+                app.settings.as_ref().unwrap().cursor,
+                i,
+                "{row:?} body click moves the cursor to it"
+            );
+            assert_eq!(
+                (
+                    app.config.layout.file_click.clone(),
+                    app.config.layout.file_open.clone()
+                ),
+                before,
+                "{row:?} body click must not step any chooser"
+            );
+            assert_eq!(
+                crate::config::load().layout.file_click,
+                before.0,
+                "{row:?} body click must not persist a change either"
+            );
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        }
+
+        // The arrows still work: `›` on the click-behavior row steps it.
+        let i = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::FileClick)
+            .expect("the click-behavior row");
+        let (_, _, arrow) = app
+            .settings_arrow_rects
+            .iter()
+            .find(|(index, delta, _)| *index == i && *delta == 1)
+            .copied()
+            .expect("the click-behavior row has a `›` arrow");
+        app.handle_settings_click(arrow.x, arrow.y);
+        assert_eq!(
+            app.config.layout.file_click,
+            config::FILE_CLICK_TAB,
+            "the arrow is what steps the value"
         );
     }
 

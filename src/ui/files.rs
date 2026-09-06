@@ -88,12 +88,19 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
     // `visible_rows` returns a slice borrowing `file_tree`, so it must come after
     // the scroll write.
     let n = app.file_tree.visible_rows().len();
-    let max_scroll = n.saturating_sub(cap);
-    if app.file_tree.scroll > max_scroll {
-        app.file_tree.scroll = max_scroll;
+    app.file_tree.cursor = app.file_tree.cursor.min(n.saturating_sub(1));
+    if app.files_focused && cap > 0 {
+        if app.file_tree.cursor < app.file_tree.scroll {
+            app.file_tree.scroll = app.file_tree.cursor;
+        } else if app.file_tree.cursor >= app.file_tree.scroll.saturating_add(cap) {
+            app.file_tree.scroll = app.file_tree.cursor.saturating_add(1).saturating_sub(cap);
+        }
     }
+    let max_scroll = n.saturating_sub(cap);
+    app.file_tree.scroll = app.file_tree.scroll.min(max_scroll);
     let scroll = app.file_tree.scroll;
     let hover = app.hover;
+    let keyboard_cursor = app.files_focused.then_some(app.file_tree.cursor);
 
     let rows = app.file_tree.visible_rows();
     for (i, row) in rows.iter().enumerate().skip(scroll).take(cap) {
@@ -102,6 +109,7 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
         let hovered = hover.is_some_and(|(hc, hr)| {
             hc >= rect.x && hc < rect.right() && hr >= rect.y && hr < rect.bottom()
         });
+        let selected = keyboard_cursor == Some(i);
 
         // Indentation, then a marker column: a dir gets its expand chevron, a
         // file gets a small dot in the same column. A file used to render two
@@ -137,7 +145,7 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
         if row.is_dir {
             style = style.bold();
         }
-        if hovered {
+        if hovered || selected {
             style = style.fg(t.accent);
         }
         // A folder's chevron keeps the folder's own styling; a file's dot sits
@@ -148,7 +156,7 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
         let marker_style = if row.is_dir {
             style
         } else {
-            Style::new().fg(if hovered {
+            Style::new().fg(if hovered || selected {
                 t.accent
             } else {
                 git_fg.unwrap_or(t.overlay1)
@@ -164,6 +172,9 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
                 Style::new().fg(git_fg.unwrap_or(t.overlay1)),
             ));
         }
+        if selected {
+            f.buffer_mut().set_style(rect, Style::new().bg(t.surface1));
+        }
         line_at(f, y, Line::from(spans));
         app.file_tree_rects.push((i, rect));
     }
@@ -178,6 +189,8 @@ fn draw_diff_list(
     t: &Theme,
     line_at: &impl Fn(&mut RenderTarget, u16, Line),
 ) {
+    let cx = area.x + 2;
+    let cw = area.width.saturating_sub(3);
     if !app.diff_snapshot_matches_active_workspace() {
         line_at(
             f,
@@ -210,11 +223,7 @@ fn draw_diff_list(
     }
     let max_scroll = app.diff.rows.len().saturating_sub(cap);
     app.diff.scroll = app.diff.scroll.min(max_scroll);
-    if app.diff.cursor < app.diff.scroll {
-        app.diff.scroll = app.diff.cursor;
-    } else if app.diff.cursor >= app.diff.scroll.saturating_add(cap) {
-        app.diff.scroll = app.diff.cursor.saturating_sub(cap.saturating_sub(1));
-    }
+    app.diff.viewport = cap;
     let snapshot = app.diff.snapshot.as_ref().expect("rows require snapshot");
     let rows = &app.diff.rows;
     for row_index in app.diff.scroll..rows.len().min(app.diff.scroll.saturating_add(cap)) {
@@ -258,10 +267,6 @@ fn draw_diff_list(
                 } else {
                     file.key.display_path().to_string()
                 };
-                let stats = match (file.additions, file.deletions) {
-                    (Some(add), Some(del)) => format!(" +{add} -{del}"),
-                    _ => String::new(),
-                };
                 let notes = diff_note_count(file.unresolved_notes);
                 let marker = if file.modified_since_review() {
                     "↻"
@@ -276,19 +281,52 @@ fn draw_diff_list(
                     Style::new().fg(t.subtext0)
                 };
                 let badge_style = if selected { style } else { Style::new().fg(fg) };
-                line_at(
-                    f,
+                let stats = diff_list_stats(file.additions, file.deletions, t);
+                let stats_width = stats.as_ref().map_or(0, Line::width) as u16;
+                // Keep enough room for the review marker, status badge, and a
+                // useful path fragment. Very narrow docks omit counts instead
+                // of allowing the right column to overwrite the file label.
+                let show_stats = stats_width > 0 && cw >= stats_width.saturating_add(8);
+                let label_width = if show_stats {
+                    cw.saturating_sub(stats_width).saturating_sub(1)
+                } else {
+                    cw
+                };
+                f.buffer_mut().set_line(
+                    cx,
                     y,
-                    Line::from(vec![
+                    &Line::from(vec![
                         Span::styled(format!("{marker} {} ", file.status.badge()), badge_style),
-                        Span::styled(format!("{path}{stats}{notes}"), style),
+                        Span::styled(format!("{path}{notes}"), style),
                     ]),
+                    label_width,
                 );
+                if show_stats {
+                    f.buffer_mut().set_line(
+                        cx + cw - stats_width,
+                        y,
+                        stats.as_ref().expect("visible stats require a line"),
+                        stats_width,
+                    );
+                }
                 app.diff_row_rects
                     .push((row_index, Rect::new(area.x, y, area.width, 1)));
             }
         }
     }
+}
+
+fn diff_list_stats(
+    additions: Option<u32>,
+    deletions: Option<u32>,
+    t: &Theme,
+) -> Option<Line<'static>> {
+    let (additions, deletions) = additions.zip(deletions)?;
+    Some(Line::from(vec![
+        Span::styled(format!("+{additions}"), Style::new().fg(t.mint)),
+        Span::styled(" ", Style::new().fg(t.subtext0)),
+        Span::styled(format!("-{deletions}"), Style::new().fg(t.coral)),
+    ]))
 }
 
 /// Draw a native file view (docs/38 FILE-3) into `area`, the pane's content
@@ -299,12 +337,19 @@ pub(super) fn draw_file_view(
     area: Rect,
     v: &FileView,
     sel: Option<&crate::app::Selection>,
+    mobile: bool,
     t: &Theme,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+    let show_footer = !mobile || v.search.is_some();
+    let body = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        area.height.saturating_sub(u16::from(show_footer)),
+    );
     let footer_y = area.bottom().saturating_sub(1);
 
     match &v.load {
@@ -328,16 +373,23 @@ pub(super) fn draw_file_view(
     // the selected cells, after the text so it tints whatever is under it. A
     // buffer post-pass keeps it independent of the text/search spans.
     if let Some(sel) = sel {
+        // Line numbers are presentation-only and selection_text deliberately
+        // excludes them, so do not tint the gutter as though it will be copied.
+        let text_x = body.x + crate::files::gutter_width(v.line_count()) + 1;
         let buf = f.buffer_mut();
         for y in body.y..body.bottom() {
             for x in body.x..body.right() {
-                if sel.contains(x, y) {
+                if file_selection_contains(sel, x, y, text_x) {
                     if let Some(cell) = buf.cell_mut((x, y)) {
                         cell.set_bg(t.sel_bg);
                     }
                 }
             }
         }
+    }
+
+    if !show_footer {
+        return;
     }
 
     // Footer: path · lines · encoding, or the state.
@@ -379,6 +431,10 @@ pub(super) fn draw_file_view(
             Rect::new(area.right().saturating_sub(6), footer_y, 6, 1),
         );
     }
+}
+
+fn file_selection_contains(sel: &crate::app::Selection, x: u16, y: u16, text_x: u16) -> bool {
+    x >= text_x && sel.contains(x, y)
 }
 
 fn draw_text(f: &mut RenderTarget, body: Rect, v: &FileView, lines: &[String], t: &Theme) {
@@ -644,12 +700,56 @@ pub(super) fn draw_delete_confirm(
 
 #[cfg(test)]
 mod tests {
-    use super::diff_note_count;
+    use super::{diff_list_stats, diff_note_count, file_selection_contains};
+    use crate::app::Selection;
+    use crate::ids::PaneId;
+    use crate::ui::{theme::Theme, RenderTarget};
+    use ratatui::{buffer::Buffer, layout::Rect};
 
     #[test]
     fn diff_note_count_uses_singular_and_plural_labels() {
         assert_eq!(diff_note_count(0), "");
         assert_eq!(diff_note_count(1), "  1 note");
         assert_eq!(diff_note_count(2), "  2 notes");
+    }
+
+    #[test]
+    fn diff_stats_are_colored_and_right_aligned() {
+        let theme = Theme::quattro_rally();
+        let area = Rect::new(0, 0, 24, 1);
+        let stats = diff_list_stats(Some(114), Some(25), &theme).unwrap();
+        let width = stats.width() as u16;
+        let mut buffer = Buffer::empty(area);
+        {
+            let mut target = RenderTarget::new(&mut buffer, area);
+            target
+                .buffer_mut()
+                .set_line(area.right() - width, 0, &stats, width);
+        }
+
+        let screen: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(screen.ends_with("+114 -25"));
+        assert_eq!(buffer[(area.right() - width, 0)].fg, theme.mint);
+        assert_eq!(buffer[(area.right() - 3, 0)].fg, theme.coral);
+        assert_ne!(buffer[(area.right() - width, 0)].bg, theme.accent);
+    }
+
+    #[test]
+    fn file_selection_highlight_excludes_the_line_number_gutter() {
+        let selection = Selection {
+            pane: PaneId(1),
+            content: Rect::new(2, 1, 20, 4),
+            anchor: (9, 1),
+            cursor: (12, 3),
+            retained: None,
+            scrolled: false,
+            dragging: true,
+        };
+        let text_x = 7;
+
+        assert!(!file_selection_contains(&selection, 2, 2, text_x));
+        assert!(!file_selection_contains(&selection, 6, 2, text_x));
+        assert!(file_selection_contains(&selection, 7, 2, text_x));
+        assert!(file_selection_contains(&selection, 12, 3, text_x));
     }
 }

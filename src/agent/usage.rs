@@ -8,12 +8,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 
-use super::*;
+use super::shared::{chat_store, pi_store};
+use super::{claude, codex, copilot, fx, gemini, grok, kimi, omp, pi, qwen, registry};
 use crate::mission::{context_frac, estimate_cost, AgentUsage};
 
 /// A single persisted JSONL event can contain an arbitrarily large tool result
@@ -158,19 +158,35 @@ fn modified(path: &Path) -> Option<SystemTime> {
 /// it, while agents without one return `None` rather than guessed counters.
 pub fn session_usage(agent: &str, cwd: &Path, session_id: &str) -> Option<AgentUsage> {
     match canonical(agent) {
-        "claude" => claude_usage(&claude_path(&claude_base(), cwd, session_id)),
-        "codex" => codex_usage(&codex_path(&codex_base(), session_id)?),
-        "copilot" => copilot_usage(&copilot_path(&copilot_base(), session_id)),
-        "opencode" => opencode_usage(&opencode_db_path(&opencode_base()), session_id, cwd),
-        "kimi" => kimi_usage(&kimi_dir(&kimi_base(), session_id)?),
-        "grok" => grok_usage(&grok_dir(&grok_base(), cwd, session_id)?),
-        "pi" => pi_usage(&pi_path(&pi_base(), session_id)?),
-        "gemini" => gemini_usage(&chat_path(&gemini_base(), session_id)?),
-        "qwen" => gemini_usage(&chat_path(&qwen_base(), session_id)?),
-        "fx" => fx_usage(&fx_dir(&fx_base(), session_id)),
+        "claude" => claude_usage(&claude_path(&claude::sessions::base(), cwd, session_id)),
+        "codex" => codex_usage(&codex::sessions::session_path(
+            &codex::sessions::base(),
+            session_id,
+        )?),
+        "copilot" => copilot_usage(&copilot_path(&copilot::sessions::base(), session_id)),
+        "kimi" => kimi_usage(&kimi::sessions::session_dir(
+            &kimi::sessions::base(),
+            session_id,
+        )?),
+        "grok" => grok_usage(&grok::sessions::session_dir(
+            &grok::sessions::base(),
+            cwd,
+            session_id,
+        )?),
+        "pi" => pi_usage(&pi_store::session_path(&pi::sessions::base(), session_id)?),
+        "omp" => pi_usage(&pi_store::session_path(&omp::sessions_base(), session_id)?),
+        "gemini" => gemini_usage(&chat_store::session_path(
+            &gemini::sessions::base(),
+            session_id,
+        )?),
+        "qwen" => gemini_usage(&chat_store::session_path(
+            &qwen::sessions::base(),
+            session_id,
+        )?),
+        "fx" => fx_usage(&fx_dir(&fx::sessions::base(), session_id)),
         // These agents currently expose identity/state but no stable,
         // structured, per-session usage store Luvus can read safely.
-        "aider" | "kiro" | "cursor" | "amp" | "droid" => None,
+        "aider" | "antigravity" | "kiro" | "cursor" | "amp" | "droid" | "opencode" => None,
         _ => None, // manifest-defined agents degrade honestly too.
     }
 }
@@ -179,30 +195,29 @@ pub fn session_usage(agent: &str, cwd: &Path, session_id: &str) -> Option<AgentU
 /// uses this as a cheap idle-session cache key before invoking the parser.
 pub fn session_mtime(agent: &str, cwd: &Path, session_id: &str) -> Option<SystemTime> {
     let path = match canonical(agent) {
-        "claude" => claude_path(&claude_base(), cwd, session_id),
-        "codex" => codex_path(&codex_base(), session_id)?,
-        "copilot" => copilot_path(&copilot_base(), session_id),
-        "opencode" => opencode_db_path(&opencode_base()),
-        "kimi" => kimi_dir(&kimi_base(), session_id)?.join("agents/main/wire.jsonl"),
-        "grok" => grok_dir(&grok_base(), cwd, session_id)?.join("updates.jsonl"),
-        "pi" => pi_path(&pi_base(), session_id)?,
-        "gemini" => chat_path(&gemini_base(), session_id)?,
-        "qwen" => chat_path(&qwen_base(), session_id)?,
-        "fx" => fx_dir(&fx_base(), session_id).join("usage-v2.json"),
+        "claude" => claude_path(&claude::sessions::base(), cwd, session_id),
+        "codex" => codex::sessions::session_path(&codex::sessions::base(), session_id)?,
+        "copilot" => copilot_path(&copilot::sessions::base(), session_id),
+        "kimi" => kimi::sessions::session_dir(&kimi::sessions::base(), session_id)?
+            .join("agents/main/wire.jsonl"),
+        "grok" => grok::sessions::session_dir(&grok::sessions::base(), cwd, session_id)?
+            .join("updates.jsonl"),
+        "pi" => pi_store::session_path(&pi::sessions::base(), session_id)?,
+        "omp" => pi_store::session_path(&omp::sessions_base(), session_id)?,
+        "gemini" => chat_store::session_path(&gemini::sessions::base(), session_id)?,
+        "qwen" => chat_store::session_path(&qwen::sessions::base(), session_id)?,
+        "fx" => fx_dir(&fx::sessions::base(), session_id).join("usage-v2.json"),
         _ => return None,
     };
     modified(&path)
 }
 
 fn canonical(agent: &str) -> &str {
-    match agent {
-        "cursor-agent" => "cursor",
-        other => other,
-    }
+    registry::find(agent).map_or(agent, |descriptor| descriptor.id)
 }
 
 fn claude_path(base: &Path, cwd: &Path, session_id: &str) -> PathBuf {
-    claude_project_dir(base, cwd).join(format!("{session_id}.jsonl"))
+    claude::sessions::project_dir(base, cwd).join(format!("{session_id}.jsonl"))
 }
 
 fn copilot_path(base: &Path, session_id: &str) -> PathBuf {
@@ -211,104 +226,8 @@ fn copilot_path(base: &Path, session_id: &str) -> PathBuf {
         .join("events.jsonl")
 }
 
-fn opencode_db_path(storage: &Path) -> PathBuf {
-    storage.parent().unwrap_or(storage).join("opencode.db")
-}
-
-fn kimi_dir(base: &Path, session_id: &str) -> Option<PathBuf> {
-    kimi_index(base)
-        .into_iter()
-        .find(|e| e.id == session_id)
-        .map(|e| e.session_dir)
-}
-
-fn grok_dir(base: &Path, cwd: &Path, session_id: &str) -> Option<PathBuf> {
-    grok_cwd_dirs(base)
-        .into_iter()
-        .map(|(_, p)| p)
-        .find(|p| grok_decode_cwd(p).as_deref() == Some(cwd))
-        .map(|p| p.join(session_id))
-        .filter(|p| p.is_dir())
-}
-
-fn codex_path(base: &Path, session_id: &str) -> Option<PathBuf> {
-    codex_rollout_files(base).into_iter().find_map(|(_, path)| {
-        let name_matches = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.contains(session_id));
-        if name_matches {
-            return Some(path);
-        }
-        read_codex_session(&path)
-            .is_some_and(|(id, _)| id == session_id)
-            .then_some(path)
-    })
-}
-
-fn pi_path(base: &Path, session_id: &str) -> Option<PathBuf> {
-    pi_session_files(base).into_iter().find_map(|(_, path)| {
-        read_pi_session(&path)
-            .is_some_and(|(id, _)| id == session_id)
-            .then_some(path)
-    })
-}
-
-fn gemini_base() -> PathBuf {
-    std::env::var_os("GEMINI_CLI_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".gemini"))
-}
-
-fn qwen_base() -> PathBuf {
-    std::env::var_os("QWEN_CODE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".qwen"))
-}
-
-fn fx_base() -> PathBuf {
-    std::env::var_os("FX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".fx"))
-}
-
 fn fx_dir(base: &Path, session_id: &str) -> PathBuf {
     base.join("sessions").join(session_id)
-}
-
-/// Gemini and Qwen put the first eight session-id characters in the filename,
-/// then keep the full id in the JSONL header. Filter by the filename first so a
-/// lookup does not parse every chat in a large history.
-fn chat_path(base: &Path, session_id: &str) -> Option<PathBuf> {
-    let needle = session_id.get(..session_id.len().min(8))?;
-    let tmp = base.join("tmp");
-    let projects = std::fs::read_dir(tmp).ok()?;
-    for project in projects.flatten() {
-        let chats = project.path().join("chats");
-        let Ok(files) = std::fs::read_dir(chats) else {
-            continue;
-        };
-        for entry in files.flatten() {
-            let path = entry.path();
-            let candidate = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("session-") && n.contains(needle));
-            if !candidate {
-                continue;
-            }
-            let mut found = false;
-            let _ = for_each_json_line(&path, |v| {
-                if v.get("sessionId").and_then(Value::as_str) == Some(session_id) {
-                    found = true;
-                }
-            });
-            if found {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 fn claude_usage(path: &Path) -> Option<AgentUsage> {
@@ -477,52 +396,6 @@ fn copilot_usage(path: &Path) -> Option<AgentUsage> {
         };
     }
     usage.cost = exact_estimate.filter(|_| dominant > 0);
-    finish(usage)
-}
-
-fn opencode_usage(db: &Path, session_id: &str, cwd: &Path) -> Option<AgentUsage> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | OpenFlags::SQLITE_OPEN_URI;
-    let conn = Connection::open_with_flags(db, flags).ok()?;
-    let _ = conn.busy_timeout(Duration::from_millis(25));
-    let row = conn
-        .query_row(
-            "SELECT model, cost, tokens_input, tokens_output, \
-                    tokens_cache_read, tokens_cache_write \
-             FROM session WHERE id = ?1 AND directory = ?2 LIMIT 1",
-            (session_id, cwd.to_string_lossy().as_ref()),
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, f64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            },
-        )
-        .optional()
-        .ok()??;
-
-    let as_u64 = |value: i64| u64::try_from(value).unwrap_or(0);
-    let mut usage = AgentUsage {
-        tokens_in: as_u64(row.2),
-        tokens_out: as_u64(row.3),
-        cache: as_u64(row.4).saturating_add(as_u64(row.5)),
-        ..AgentUsage::default()
-    };
-    if let Some(raw_model) = row.0 {
-        usage.model = serde_json::from_str::<Value>(&raw_model)
-            .ok()
-            .and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_string))
-            .unwrap_or(raw_model);
-    }
-    // OpenCode's custom providers commonly persist `0` when billing data is
-    // unavailable. Treat only a positive value as authoritative, then fall back
-    // to the configured estimate table.
-    usage.cost = (row.1 > 0.0 && row.1.is_finite()).then_some(row.1);
     finish(usage)
 }
 
@@ -737,8 +610,9 @@ mod tests {
     use std::fs;
 
     fn tmp(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("luvus-agent-usage-{tag}-{}", std::process::id()));
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-state/agent-usage")
+            .join(format!("{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -847,53 +721,6 @@ mod tests {
     }
 
     #[test]
-    fn opencode_reads_aggregate_session_row_without_writing() {
-        let dir = tmp("opencode");
-        let db = dir.join("opencode.db");
-        let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                directory TEXT NOT NULL,
-                model TEXT,
-                cost REAL NOT NULL,
-                tokens_input INTEGER NOT NULL,
-                tokens_output INTEGER NOT NULL,
-                tokens_reasoning INTEGER NOT NULL,
-                tokens_cache_read INTEGER NOT NULL,
-                tokens_cache_write INTEGER NOT NULL
-            );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
-                "ses-1",
-                "/work/app",
-                r#"{"id":"anthropic/claude-sonnet-4"}"#,
-                0.42,
-                300i64,
-                40i64,
-                5i64,
-                600i64,
-                10i64
-            ],
-        )
-        .unwrap();
-        drop(conn);
-
-        let usage = opencode_usage(&db, "ses-1", Path::new("/work/app")).unwrap();
-        assert_eq!(
-            (usage.tokens_in, usage.tokens_out, usage.cache),
-            (300, 40, 610)
-        );
-        assert_eq!(usage.model, "anthropic/claude-sonnet-4");
-        assert_eq!(usage.cost, Some(0.42));
-        assert!(opencode_usage(&db, "ses-1", Path::new("/work/other")).is_none());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn grok_sums_unique_turn_ledgers_and_exact_ticks() {
         let dir = tmp("grok");
         let line = |id: &str, input: u64| {
@@ -964,6 +791,41 @@ mod tests {
     }
 
     #[test]
+    fn omp_usage_uses_its_native_session_root() {
+        let _env = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("PI_CODING_AGENT_SESSION_DIR");
+        let root = tmp("omp-native-usage");
+        let project = root.join("-work-app");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("session.jsonl"),
+            concat!(
+                r#"{"type":"session","id":"omp-session","cwd":"/work/app"}"#,
+                "\n",
+                r#"{"type":"message","message":{"role":"assistant","responseId":"r1","model":"gpt-5","usage":{"input":50,"output":20,"cacheRead":100,"cacheWrite":5,"cost":{"total":0.01}}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::env::set_var("PI_CODING_AGENT_SESSION_DIR", &root);
+
+        let usage = session_usage("omp", Path::new("/work/app"), "omp-session").unwrap();
+        assert_eq!(
+            (usage.tokens_in, usage.tokens_out, usage.cache),
+            (50, 20, 105)
+        );
+        assert!(session_mtime("omp", Path::new("/work/app"), "omp-session").is_some());
+
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn gemini_and_fx_use_native_aggregate_shapes() {
         let gemini = tmp("gemini");
         let path = gemini.join("session.jsonl");
@@ -1014,6 +876,8 @@ mod tests {
     fn unsupported_agents_never_receive_guessed_usage() {
         for agent in [
             "aider",
+            "antigravity",
+            "agy",
             "kiro",
             "cursor",
             "cursor-agent",

@@ -225,6 +225,7 @@ impl App {
         if let Some(g) = self.active_git_mut() {
             g.open_pr = Some(number);
             g.detail = Load::Loading;
+            g.detail_text_cache = None;
             g.scroll = 0;
         }
         let tx = self.app_tx.clone();
@@ -255,23 +256,20 @@ impl App {
         if let Some(g) = self.active_git_mut() {
             g.open_pr = None;
             g.detail = Load::Idle;
+            g.detail_text_cache = None;
             g.scroll = 0;
         }
     }
 
-    /// A PR action (run in the workspace's terminal pane so the user sees output and
-    /// can answer any prompt — `gh pr merge` is interactive, which is the safe
-    /// "confirm before merging" path).
+    /// A deliberate PR action run in the workspace's terminal pane so the user
+    /// sees output and can handle checkout refusals or review errors.
     fn pr_action(&mut self, kind: &str) {
         let Some(n) = self.active_git().and_then(|g| g.open_pr) else {
             return;
         };
         let cmd = match kind {
             "checkout" => format!("gh pr checkout {n}"),
-            "diff" => format!("gh pr diff {n}"),
-            "merge" => format!("gh pr merge {n}"),
             "approve" => format!("gh pr review {n} --approve"),
-            "ready" => format!("gh pr ready {n}"),
             _ => return,
         };
         self.git_run_in_pane(cmd);
@@ -299,11 +297,8 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.git_scroll(-1),
             KeyCode::Char('r') => self.git_refresh_detail(),
             KeyCode::Char('o') => self.pr_detail_web(),
-            KeyCode::Char('d') => self.pr_action("diff"),
             KeyCode::Char('c') | KeyCode::Enter => self.pr_action("checkout"),
-            KeyCode::Char('M') => self.pr_action("merge"),
             KeyCode::Char('a') => self.pr_action("approve"),
-            KeyCode::Char('R') => self.pr_action("ready"),
             _ => {}
         }
     }
@@ -559,6 +554,7 @@ impl App {
         if let Some(g) = self.active_git_mut() {
             g.open_issue = Some(number);
             g.issue_detail = Load::Loading;
+            g.detail_text_cache = None;
             g.scroll = 0;
         }
         let tx = self.app_tx.clone();
@@ -582,6 +578,7 @@ impl App {
         if let Some(g) = self.active_git_mut() {
             g.open_issue = None;
             g.issue_detail = Load::Idle;
+            g.detail_text_cache = None;
             g.scroll = 0;
         }
     }
@@ -647,6 +644,7 @@ impl App {
             g.commit_detail = Load::Idle;
             g.open_issue = None;
             g.issue_detail = Load::Idle;
+            g.detail_text_cache = None;
             if g.section != section || had_detail {
                 g.section = section;
                 g.cursor = 0;
@@ -1078,15 +1076,14 @@ impl App {
         let g = self.active_git()?;
         match g.section {
             Section::Prs => {
+                if diff {
+                    return None;
+                }
                 let n = match &g.prs {
                     Load::Loaded(v) => filtered_prs(v, &g.filter).nth(g.cursor)?.number,
                     _ => return None,
                 };
-                Some(if diff {
-                    format!("gh pr diff {n}")
-                } else {
-                    format!("gh pr checkout {n}")
-                })
+                Some(format!("gh pr checkout {n}"))
             }
             Section::Issues => {
                 let n = match &g.issues {
@@ -1410,9 +1407,9 @@ mod tests {
     }
 
     /// On a phone the git tab drops its keyboard-hint footer and gives those two
-    /// rows to the list (docs/18); the desktop layout is unchanged.
+    /// rows to the list (docs/100); the desktop layout is unchanged.
     #[test]
-    fn compact_git_tab_hides_the_footer_and_reclaims_its_rows() {
+    fn mobile_git_tab_hides_the_footer_and_reclaims_its_rows() {
         use ratatui::{backend::TestBackend, Terminal};
         let _env = crate::persist::test_env("compact-git-footer");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -1438,12 +1435,12 @@ mod tests {
         assert!(app.compact);
         let compact_body = app.active_git_mut().unwrap().list_area.height;
 
-        // Two rows reclaimed here (the footer + its separator), plus the compact
-        // layout already gave the whole tab one more row (the hidden status bar).
+        // Two rows are reclaimed here (the footer + its separator). The hidden
+        // desktop status row is balanced by mobile's second header row.
         assert_eq!(
             compact_body,
-            wide_body + 3,
-            "the git list grows by the footer's rows plus the reclaimed status row"
+            wide_body + 2,
+            "the git list grows by the reclaimed footer rows"
         );
     }
 
@@ -1494,7 +1491,12 @@ mod tests {
                 body: "steps to reproduce".into(),
                 labels: vec!["bug".into()],
                 assignees: vec![],
-                comments: 2,
+                comment_count: 2,
+                comments: vec![crate::git::model::DiscussionComment {
+                    author: "reviewer".into(),
+                    body: "I can reproduce this".into(),
+                    created_at: "2026-07-23T01:00:00Z".into(),
+                }],
                 updated_at: "2026-07-23T00:00:00Z".into(),
             }))),
         );
@@ -1849,6 +1851,7 @@ mod tests {
 
     #[test]
     fn git_tab_opens_fetches_and_persists_safely() {
+        let _env = crate::persist::test_env("git-tab-opens-fetches-and-persists");
         // A temp git repo with two branches + one commit.
         let repo = std::env::temp_dir().join(format!("luvus-gittab-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
@@ -1949,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn pr_actions_produce_commands() {
+    fn pr_checkout_remains_and_removed_shortcuts_do_not_launch_commands() {
         use crate::git::model::{Checks, PullRequest};
         use crate::git::{GitView, Section};
 
@@ -1989,10 +1992,16 @@ mod tests {
             app.git_selected_command(false).as_deref(),
             Some("gh pr checkout 42")
         );
-        assert_eq!(
-            app.git_selected_command(true).as_deref(),
-            Some("gh pr diff 42")
-        );
+        assert_eq!(app.git_selected_command(true), None);
+
+        app.active_git_mut().unwrap().open_pr = Some(42);
+        for key in ['M', 'R', 'd'] {
+            app.handle_pr_detail_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            assert!(
+                app.active_is_git(),
+                "removed PR shortcut {key} must not launch a pane command"
+            );
+        }
     }
 
     #[test]

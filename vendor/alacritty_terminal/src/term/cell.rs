@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::hash::{Hash, Hasher};
 
+use arrayvec::ArrayVec;
 use bitflags::bitflags;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -8,6 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::grid::{self, GridCell};
 use crate::index::Column;
 use crate::vte::ansi::{Color, Hyperlink as VteHyperlink, NamedColor};
+
+/// Maximum number of zerowidth characters to retain per grid cell.
+///
+/// This enforces an upper bound on memory usage per cell, to ensure malicious
+/// applications cannot use this as a denial-of-service vector.
+const MAX_ZEROWIDTH_CHARS: usize = 9;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -123,9 +131,17 @@ impl ResetDiscriminant<Color> for Cell {
 #[derive(Default, Debug, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CellExtra {
-    zerowidth: Vec<char>,
+    zerowidth: ArrayVec<char, MAX_ZEROWIDTH_CHARS>,
     underline_color: Option<Color>,
     hyperlink: Option<Hyperlink>,
+}
+
+impl Hash for CellExtra {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.zerowidth.hash(state);
+        hash_color_option(self.underline_color, state);
+        self.hyperlink.hash(state);
+    }
 }
 
 /// Content and attributes of a single cell in the terminal grid.
@@ -137,6 +153,45 @@ pub struct Cell {
     pub bg: Color,
     pub flags: Flags,
     pub extra: Option<Arc<CellExtra>>,
+}
+
+impl Hash for Cell {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.c.hash(state);
+        hash_color(self.fg, state);
+        hash_color(self.bg, state);
+        self.flags.hash(state);
+        self.extra.hash(state);
+    }
+}
+
+fn hash_color<H: Hasher>(color: Color, state: &mut H) {
+    match color {
+        Color::Named(color) => {
+            0u8.hash(state);
+            (color as u16).hash(state);
+        },
+        Color::Spec(color) => {
+            1u8.hash(state);
+            color.r.hash(state);
+            color.g.hash(state);
+            color.b.hash(state);
+        },
+        Color::Indexed(color) => {
+            2u8.hash(state);
+            color.hash(state);
+        },
+    }
+}
+
+fn hash_color_option<H: Hasher>(color: Option<Color>, state: &mut H) {
+    match color {
+        Some(color) => {
+            true.hash(state);
+            hash_color(color, state);
+        },
+        None => false.hash(state),
+    }
 }
 
 impl Default for Cell {
@@ -163,7 +218,7 @@ impl Cell {
     #[inline]
     pub fn push_zerowidth(&mut self, character: char) {
         let extra = self.extra.get_or_insert(Default::default());
-        Arc::make_mut(extra).zerowidth.push(character);
+        let _ = Arc::make_mut(extra).zerowidth.try_push(character);
     }
 
     /// Remove all wide char data from a cell.
@@ -171,7 +226,7 @@ impl Cell {
     pub fn clear_wide(&mut self) {
         self.flags.remove(Flags::WIDE_CHAR);
         if let Some(extra) = self.extra.as_mut() {
-            Arc::make_mut(extra).zerowidth = Vec::new();
+            Arc::make_mut(extra).zerowidth = ArrayVec::new();
         }
         self.c = ' ';
     }
@@ -304,6 +359,20 @@ mod tests {
 
         // Ensure that cell size isn't growing by accident.
         assert!(mem::size_of::<Cell>() <= EXPECTED_CELL_SIZE);
+    }
+
+    #[test]
+    fn zerowidth_characters_are_bounded() {
+        let mut cell = Cell::default();
+        for index in 0..MAX_ZEROWIDTH_CHARS + 5 {
+            let character = char::from_u32(0x300 + index as u32).unwrap();
+            cell.push_zerowidth(character);
+        }
+
+        let zerowidth = cell.zerowidth().unwrap();
+        assert_eq!(zerowidth.len(), MAX_ZEROWIDTH_CHARS);
+        assert_eq!(zerowidth[0], '\u{300}');
+        assert_eq!(zerowidth[MAX_ZEROWIDTH_CHARS - 1], '\u{308}');
     }
 
     #[test]

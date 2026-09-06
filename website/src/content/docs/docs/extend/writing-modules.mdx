@@ -98,10 +98,7 @@ with `module log`.
 | `description` |  | One-line summary. |
 | `platforms` |  | e.g. `["macos", "linux"]`. Omit for all. `[]` is an error. |
 
-The canonical filename is `luvus-module.toml`. During the 0.11.x migration
-window, Luvus also loads `bohay-module.toml` and accepts `min_bohay_version` as
-an alias. If both files exist, `luvus-module.toml` wins and Luvus warns when
-their contents differ. New modules should use only the Luvus names.
+The manifest filename is `luvus-module.toml`.
 
 Every entry below (`build`, `startup`, `actions`, `events`, `panes`) also
 accepts its own `platforms` list, which overrides the top-level one. That's how
@@ -303,7 +300,7 @@ replacing a durable widget:
 ```
 
 See the complete [`ci-bar` example on GitHub](https://github.com/RizRiyz/luvus/tree/main/examples/modules/ci-bar)
-and the [UHP reference](/docs/reference/api/#luvus-bar).
+and the [UHP reference](/docs/uhp/methods/#luvus-bar).
 
 ### `[[events]]`: react to lifecycle events
 
@@ -322,7 +319,7 @@ Your command runs with `LUVUS_MODULE_EVENT` (the name) and
 | Tabs | `tab.created` · `tab.closed` |
 | Panes | `pane.created` · `pane.closed` · `pane.agent_status_changed` |
 | Agents | `agent.hook` |
-| Orchestration | `task.added` · `task.claimed` · `task.started` · `task.updated` · `task.ready` · `task.done` · `task.released` · `task.deleted` · `task.merged` · `task.merge_conflict` · `task.needs_compaction` · `task.gate_running` · `task.gate_passed` · `task.gate_failed` |
+| Orchestration | `task.added` · `task.claimed` · `task.started` · `task.updated` · `task.ready` · `task.done` · `task.released` · `task.deleted` · `task.merge_started` · `task.merged` · `task.merge_conflict` · `task.merge_failed` · `task.needs_compaction` · `task.gate_running` · `task.gate_passed` · `task.gate_failed` |
 | Leases | `lease.acquired` · `lease.released` |
 
 `pane.agent_status_changed` is the highest-value hook -- notify when `status`

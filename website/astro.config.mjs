@@ -7,6 +7,13 @@ import starlight from '@astrojs/starlight';
 
 export default defineConfig({
   site: 'https://luvus.dev',
+  redirects: {
+    '/docs/guides/uhp': '/docs/uhp/getting-started/',
+    '/docs/guides/uhp-access': '/docs/uhp/remote-access/',
+    '/docs/reference/uhp': '/docs/uhp/',
+    '/docs/reference/api': '/docs/uhp/methods/',
+    '/docs/reference/terminal-backend': '/docs/uhp/terminal/',
+  },
   integrations: [
     starlight({
       title: 'Luvus',
@@ -78,17 +85,30 @@ export default defineConfig({
             { label: 'Agents Talking to Agents', slug: 'docs/guides/agent-messaging' },
             { label: 'Control Luvus from Codex', slug: 'docs/guides/codex-plugin' },
             { label: 'Multi-Agent Orchestration', slug: 'docs/guides/orchestration' },
+            { label: 'Agent Automation', slug: 'docs/guides/automation' },
             { label: 'The Git Tab', slug: 'docs/guides/git' },
             { label: 'Browsing & Opening Files', slug: 'docs/guides/files' },
             { label: 'Global Fuzzy Finder', slug: 'docs/guides/search' },
             { label: 'DIFF Review', slug: 'docs/guides/diff' },
             { label: 'Worktrees', slug: 'docs/guides/worktrees' },
             { label: 'Remote Sessions', slug: 'docs/guides/remote' },
+            { label: 'Mobile Sessions', slug: 'docs/guides/mobile' },
             { label: 'Scrollback & Copy', slug: 'docs/guides/scrollback' },
             { label: 'Settings & Theming', slug: 'docs/guides/settings' },
             { label: 'Community Themes', slug: 'docs/guides/themes' },
             { label: 'Scripting luvus', slug: 'docs/guides/scripting' },
-            { label: 'Automating with UHP', slug: 'docs/guides/uhp' },
+          ],
+        },
+        {
+          label: 'UHP',
+          items: [
+            { label: 'Overview', slug: 'docs/uhp' },
+            { label: 'Getting Started', slug: 'docs/uhp/getting-started' },
+            { label: 'Practical Examples', slug: 'docs/uhp/examples' },
+            { label: 'Remote Access', slug: 'docs/uhp/remote-access' },
+            { label: 'Method Reference', slug: 'docs/uhp/methods' },
+            { label: 'Terminal Methods', slug: 'docs/uhp/terminal' },
+            { label: 'Schemas & Conformance', slug: 'docs/uhp/conformance' },
           ],
         },
         {
@@ -96,6 +116,7 @@ export default defineConfig({
           items: [
             { label: 'Using Modules', slug: 'docs/extend/using-modules' },
             { label: 'Writing a Module', slug: 'docs/extend/writing-modules' },
+            { label: 'Adding Agent Support', slug: 'docs/extend/adding-agent-support' },
             // The community index is a standalone page, not a docs entry.
             { label: 'Module Index', link: '/modules/', attrs: { target: '_self' } },
           ],
@@ -104,8 +125,6 @@ export default defineConfig({
           label: 'Reference',
           items: [
             { label: 'CLI Commands', slug: 'docs/reference/cli' },
-            { label: 'UHP Methods', slug: 'docs/reference/api' },
-            { label: 'Universal Harness Protocol', slug: 'docs/reference/uhp' },
             { label: 'Keybindings', slug: 'docs/reference/keybindings' },
             { label: 'Configuration', slug: 'docs/reference/configuration' },
             { label: 'Supported Agents', slug: 'docs/reference/agents' },

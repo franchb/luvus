@@ -9,14 +9,16 @@
 //! where a row wrapped - were found by building this and landed upstream as
 //! pg83/shitty#112 and #114.
 
-use std::sync::mpsc::Sender;
-
 use ratatui::style::{Color, Modifier};
 use shitty_vt::{Cell as VtCell, ColorSource, Rgb, Terminal};
 
-use super::{CodexComposerRegion, Cursor, HistoryMetrics, RenderCell, VtEngine};
+use super::{
+    AlignedRows, CodexComposerRegion, Cursor, DamageKind, DamageSnapshot, HistoryMetrics,
+    RenderCell, RetainedRowLayout, VtEngine, ALIGNED_WIDE_CELL,
+};
+use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::{CaptureMode, CaptureResult};
-use crate::terminal::pty::InputAction;
+use crate::terminal::pty::{InputAction, InputSender};
 
 /// Cell size assumed before the terminal exists to report its own. Corrected
 /// from [`shitty_vt::Memory::cell_size`] immediately after construction.
@@ -24,7 +26,7 @@ const ASSUMED_CELL_BYTES: usize = 16;
 
 pub struct ShittyEngine {
     term: Terminal,
-    resp_tx: Sender<InputAction>,
+    resp_tx: InputSender,
     cols: u16,
     rows: u16,
     history_budget_bytes: usize,
@@ -32,12 +34,18 @@ pub struct ShittyEngine {
 }
 
 impl ShittyEngine {
-    pub fn new(
+    /// The appearance is accepted and ignored. It exists so a pane can answer
+    /// the child's request for the host's colour scheme, which this facade
+    /// neither tracks nor reports; a pane on this engine simply never sends
+    /// that reply. Nothing else in the appearance affects the grid.
+    pub(crate) fn with_appearance(
         cols: u16,
         rows: u16,
-        resp_tx: Sender<InputAction>,
+        resp_tx: impl Into<InputSender>,
         history_budget_bytes: usize,
+        _appearance: PaneAppearance,
     ) -> Self {
+        let resp_tx = resp_tx.into();
         let cols = cols.max(1);
         let rows = rows.max(1);
         let mut term = Terminal::new(
@@ -599,6 +607,15 @@ impl VtEngine for ShittyEngine {
             allocated_cells: Some(
                 (memory.allocated_rows as usize).saturating_mul(memory.columns as usize),
             ),
+            // The packed and dense figures describe alacritty's cold-history
+            // representation. This core keeps every retained row as cells, so
+            // there is nothing to report rather than zero of something.
+            packed_blocks: None,
+            packed_bytes: None,
+            packed_rows: None,
+            dense_row_bytes: None,
+            row_descriptor_bytes: None,
+            allocation_count: None,
             // Cells only: clusters, hyperlinks and sixel patches live in a
             // store this figure does not count.
             exact_bytes: false,
@@ -609,6 +626,7 @@ impl VtEngine for ShittyEngine {
         self.term.total_rows() as usize
     }
 
+    #[cfg(test)]
     fn retained_row_text(&self, index: usize) -> Option<String> {
         let index = u32::try_from(index).ok()?;
         if index >= self.term.total_rows() {
@@ -619,6 +637,164 @@ impl VtEngine for ShittyEngine {
         let trimmed = output.trim_end().len();
         output.truncate(trimmed);
         Some(output)
+    }
+
+    fn damage_snapshot(&mut self) -> DamageSnapshot {
+        // The facade reports damage through a callback this engine does not
+        // wire up, so every snapshot is Full. The trait allows that, and the
+        // cost is a repainted frame rather than a wrong one.
+        DamageSnapshot {
+            generation: self.output_generation,
+            kind: DamageKind::Full,
+            cursor: self.cursor(),
+            composer_region: self.codex_composer_region(),
+            scroll_offset: self.scroll_offset(),
+            rows: Vec::new(),
+        }
+    }
+
+    fn acknowledge_damage(&mut self, generation: u64) -> bool {
+        // There is no partial damage to forget, but the answer still has to
+        // be honest: refusing a stale acknowledgement makes the caller repeat
+        // a frame instead of dropping output written since it was taken.
+        self.output_generation == generation
+    }
+
+    fn recycle_damage_snapshot(&mut self, _snapshot: DamageSnapshot) {
+        // A Full snapshot carries no rows, so there is no storage to pool.
+    }
+
+    fn visible_rows_aligned(&self) -> AlignedRows {
+        let rows = self.rows as usize;
+        let columns = self.cols as usize;
+        let mut aligned = AlignedRows::new(rows);
+        // The facade skips the continuation column of a wide cell and skips a
+        // row with no cells at all, while this owes the caller exactly one
+        // char per column: pad what it did not visit.
+        let mut filled = vec![0usize; rows];
+        self.term.for_each_cell(|row, column, cell| {
+            let row_index = row as usize;
+            if row_index >= rows {
+                return;
+            }
+            let column = column as usize;
+            while filled[row_index] < column && filled[row_index] < columns {
+                aligned.push_cell(row, filled[row_index] as u16, ' ', None);
+                filled[row_index] += 1;
+            }
+            if filled[row_index] >= columns {
+                return;
+            }
+            let mut points = cell.grapheme.iter().filter_map(|p| char::from_u32(*p));
+            let base = points.next().filter(|c| !c.is_control()).unwrap_or(' ');
+            let marks: Vec<char> = points.filter(|c| !c.is_control()).collect();
+            aligned.push_cell(row, column as u16, base, Some(&marks));
+            filled[row_index] += 1;
+            if cell.width == 2 && filled[row_index] < columns {
+                aligned.push_cell(row, filled[row_index] as u16, ALIGNED_WIDE_CELL, None);
+                filled[row_index] += 1;
+            }
+        });
+        for (row_index, count) in filled.iter_mut().enumerate() {
+            while *count < columns {
+                aligned.push_cell(row_index as u16, *count as u16, ' ', None);
+                *count += 1;
+            }
+        }
+        aligned
+    }
+
+    fn retained_selection_text(
+        &self,
+        ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
+    ) -> Option<String> {
+        if start_row > end_row {
+            return None;
+        }
+        let total = self.term.total_rows() as usize;
+        let start_row = if start_row < total {
+            start_row
+        } else {
+            return None;
+        };
+        let end_row = end_row.min(total.saturating_sub(1));
+        let last_column = usize::from(self.cols.saturating_sub(1));
+
+        let mut out = String::new();
+        for index in start_row..=end_row {
+            let first = if index == start_row {
+                start_col.min(last_column)
+            } else {
+                0
+            };
+            let last = if index == end_row {
+                end_col.min(last_column)
+            } else {
+                last_column
+            };
+            // A row that wrapped continues into the next one, so it keeps the
+            // blanks it owns and contributes no line break; one that ended on
+            // its own is trimmed and terminated.
+            let wrap = usize::from(self.term.row_wrap_length(index as u32));
+            let mut row = String::new();
+            self.term.row_cells(index as u32, |_, column, cell| {
+                let column = usize::from(column);
+                if column < first || column > last || (wrap != 0 && column >= wrap) {
+                    return;
+                }
+                row.push_str(&cluster_text(&cell));
+            });
+            if wrap != 0 {
+                out.push_str(&row);
+            } else {
+                out.push_str(row.trim_end());
+                if index != end_row {
+                    out.push('\n');
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn retained_row_layout(&self, index: usize) -> Option<RetainedRowLayout> {
+        let row = u32::try_from(index).ok()?;
+        if row >= self.term.total_rows() {
+            return None;
+        }
+        let columns = usize::from(self.cols);
+        let mut whitespace = vec![true; columns];
+        let mut last_content = None;
+        self.term.row_cells(row, |_, column, cell| {
+            let column = usize::from(column);
+            if column >= columns {
+                return;
+            }
+            let text = cluster_text(&cell);
+            let blank = text.chars().all(|c| c.is_whitespace() || c.is_control());
+            whitespace[column] = blank;
+            if !blank {
+                last_content = Some(column);
+            }
+            // The continuation column belongs to the same glyph, so it shares
+            // its emptiness and, when the glyph has content, extends it.
+            if cell.width == 2 && column + 1 < columns {
+                whitespace[column + 1] = blank;
+                if !blank {
+                    last_content = Some(column + 1);
+                }
+            }
+        });
+        let has_text = last_content.is_some();
+        whitespace.truncate(last_content.map_or(1, |column| column + 1));
+        Some(RetainedRowLayout::new(whitespace, has_text))
+    }
+
+    fn disambiguate_escape_codes(&self) -> bool {
+        // The facade reports no CSI-u negotiation state. Luvus encodes input
+        // above the engine, so the honest answer is that this engine does not
+        // know rather than a guess either way; false leaves legacy encoding,
+        // which is what a child gets until it is told otherwise.
+        false
     }
 
     fn for_each_retained_row(&self, f: &mut dyn FnMut(usize, &str)) {
@@ -705,7 +881,7 @@ mod tests {
         // Keep the receiver alive for the engine's lifetime: replies are sent,
         // not dropped, and a closed channel would hide a send failure.
         std::mem::forget(rx);
-        ShittyEngine::new(cols, rows, tx, 256 * 1024)
+        ShittyEngine::with_appearance(cols, rows, tx, 256 * 1024, PaneAppearance::default())
     }
 
     /// The rendered cell at `column` of the top row.

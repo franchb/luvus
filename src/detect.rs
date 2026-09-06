@@ -31,115 +31,16 @@ use serde::Deserialize;
 
 use crate::ui::theme::State;
 
-/// One agent luvus can recognise, and how far each identifying string may be
-/// trusted. Splitting the two matters because the haystack for `screen` is
-/// *whatever the pane happens to be printing*, which nobody controls.
-struct KnownAgent {
-    /// Canonical name: what the UI shows and `agent.list` returns.
-    name: &'static str,
-    /// Strings distinctive enough to believe anywhere, pane output included.
-    distinct: &'static [&'static str],
-    /// Strings that are also ordinary words. Believed only where a human or the
-    /// agent itself put them deliberately — the spawned command and the OSC
-    /// title — never from incidental output. Without this, `error: cursor is out
-    /// of bounds` names the pane cursor, and "for example" named it amp.
-    ambiguous: &'static [&'static str],
-}
-
-/// Agents we recognise. `distinct`/`ambiguous` are matched as whole words (see
-/// [`contains_agent_word`]); the canonical `name` is what gets reported.
-const KNOWN_AGENTS: &[KnownAgent] = &[
-    KnownAgent {
-        name: "claude",
-        distinct: &["claude"],
-        ambiguous: &[],
-    },
-    KnownAgent {
-        name: "codex",
-        distinct: &["codex"],
-        ambiguous: &[],
-    },
-    KnownAgent {
-        name: "gemini",
-        distinct: &["gemini"],
-        ambiguous: &[],
-    },
-    KnownAgent {
-        name: "aider",
-        distinct: &["aider"],
-        ambiguous: &[],
-    },
-    KnownAgent {
-        name: "opencode",
-        distinct: &["opencode"],
-        ambiguous: &[],
-    },
-    KnownAgent {
-        name: "copilot",
-        distinct: &["copilot"],
-        ambiguous: &[],
-    },
-    KnownAgent {
-        name: "kimi",
-        distinct: &["kimi"],
-        ambiguous: &[],
-    },
-    KnownAgent {
-        name: "qwen",
-        distinct: &["qwen"],
-        ambiguous: &[],
-    },
-    KnownAgent {
-        name: "kiro",
-        distinct: &["kiro"],
-        ambiguous: &[],
-    },
-    // The CLI binary is distinctive even though the brand name is not.
-    KnownAgent {
-        name: "cursor",
-        distinct: &["cursor-agent"],
-        ambiguous: &["cursor"],
-    },
-    KnownAgent {
-        name: "amp",
-        distinct: &[],
-        ambiguous: &["amp"],
-    },
-    KnownAgent {
-        name: "droid",
-        distinct: &[],
-        ambiguous: &["droid"],
-    },
-    KnownAgent {
-        name: "grok",
-        distinct: &[],
-        ambiguous: &["grok"],
-    },
-    // Pi (pi.dev): the npm binary is distinctive, but the bare brand name is an
-    // ordinary word (and a substring of "api"/"pip"…), so believe it only from
-    // the spawn command or OSC title — never incidental output.
-    KnownAgent {
-        name: "pi",
-        distinct: &["pi-coding-agent"],
-        ambiguous: &["pi"],
-    },
-    // `fx` is a short, common token in filenames and prose, so never infer it
-    // from arbitrary screen output. Its process name and OSC title are
-    // deliberate identity signals and therefore safe.
-    KnownAgent {
-        name: "fx",
-        distinct: &[],
-        ambiguous: &["fx"],
-    },
-];
-
-/// The runtime form of [`KnownAgent`]: owned, so `~/.luvus/manifests/*.toml` can
-/// refine a built-in agent or teach luvus one it has never heard of.
+/// The runtime identity form is owned so `~/.luvus/manifests/*.toml` can refine
+/// a built-in agent or teach Luvus one it has never heard of.
 #[derive(Clone)]
 struct AgentIdent {
     name: String,
     distinct: Vec<String>,
     ambiguous: Vec<String>,
+    binary_matcher: Option<fn(&str) -> bool>,
+    interpreter_packages: Vec<String>,
+    overlap_priority: u8,
 }
 
 impl AgentIdent {
@@ -151,12 +52,30 @@ impl AgentIdent {
 
 /// The built-in registry, in runtime form.
 fn builtin_agents() -> Vec<AgentIdent> {
-    KNOWN_AGENTS
+    crate::agent::registry::descriptors()
         .iter()
-        .map(|a| AgentIdent {
-            name: a.name.to_string(),
-            distinct: a.distinct.iter().map(|s| s.to_string()).collect(),
-            ambiguous: a.ambiguous.iter().map(|s| s.to_string()).collect(),
+        .map(|agent| AgentIdent {
+            name: agent.id.to_string(),
+            distinct: agent
+                .identity
+                .distinct
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            ambiguous: agent
+                .identity
+                .ambiguous
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            binary_matcher: agent.identity.binary_matcher,
+            interpreter_packages: agent
+                .identity
+                .interpreter_packages
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            overlap_priority: agent.identity.overlap_priority,
         })
         .collect()
 }
@@ -239,10 +158,16 @@ enum Cond {
     All(Vec<String>),
     /// The region contains none of these substrings.
     Not(Vec<String>),
+    /// The region starts with one of these values.
+    StartsWith(Vec<String>),
     /// A line in the region starts with a spinner glyph — a braille cell
     /// (U+2800..=U+28FF, what most CLIs animate) or a moon phase (U+1F311..=
     /// U+1F318, Kimi's background-agent spinner). A running spinner means work.
     Spinner,
+    /// A line starts with one of these branded prefixes and the next character
+    /// is a spinner. Some agents keep their brand before the live state glyph
+    /// in the OSC title, so the generic start-of-line spinner rule cannot see it.
+    SpinnerAfterPrefix(Vec<String>),
 }
 
 impl Cond {
@@ -251,9 +176,18 @@ impl Cond {
             Cond::Any(subs) => subs.iter().any(|s| low.contains(s)),
             Cond::All(subs) => subs.iter().all(|s| low.contains(s)),
             Cond::Not(subs) => !subs.iter().any(|s| low.contains(s)),
+            Cond::StartsWith(prefixes) => prefixes.iter().any(|prefix| low.starts_with(prefix)),
             Cond::Spinner => low
                 .lines()
                 .any(|l| l.trim_start().chars().next().is_some_and(is_spinner_glyph)),
+            Cond::SpinnerAfterPrefix(prefixes) => low.lines().any(|line| {
+                let line = line.trim_start();
+                prefixes.iter().any(|prefix| {
+                    line.strip_prefix(prefix)
+                        .and_then(|rest| rest.chars().next())
+                        .is_some_and(is_spinner_glyph)
+                })
+            }),
         }
     }
 }
@@ -339,6 +273,15 @@ impl Manifests {
         self.agents.iter().any(|a| a.name == low)
     }
 
+    fn best_agent(&self, matches: impl Fn(&AgentIdent) -> bool) -> Option<&AgentIdent> {
+        self.agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| matches(agent))
+            .max_by_key(|(index, agent)| (agent.overlap_priority, std::cmp::Reverse(*index)))
+            .map(|(_, agent)| agent)
+    }
+
     fn evaluate(&self, agent: &str, regions: &Regions) -> Option<RuleMatch> {
         let mut best: Option<RuleMatch> = None;
         for r in &self.rules {
@@ -374,6 +317,12 @@ fn any(subs: &[&str]) -> Cond {
 fn all(subs: &[&str]) -> Cond {
     Cond::All(subs.iter().map(|s| s.to_lowercase()).collect())
 }
+fn starts_with(prefixes: &[&str]) -> Cond {
+    Cond::StartsWith(prefixes.iter().map(|value| value.to_lowercase()).collect())
+}
+fn spinner_after_prefix(prefixes: &[&str]) -> Cond {
+    Cond::SpinnerAfterPrefix(prefixes.iter().map(|value| value.to_lowercase()).collect())
+}
 
 /// How much of the live terminal grid must reach the rule engine. Most agents
 /// keep state beside their bottom prompt, but fx can pin its transient activity
@@ -385,6 +334,19 @@ pub(crate) fn screen_rows(known_agent: &str, running: &[String], manifests: &Man
     } else {
         14
     }
+}
+
+/// Claude and Hermes can place a live approval panel above a tall blank footer.
+/// Keep their most recent non-empty live rows without pulling in scrollback.
+pub(crate) fn screen_uses_non_empty_rows(
+    known_agent: &str,
+    running: &[String],
+    manifests: &Manifests,
+) -> bool {
+    known_agent.eq_ignore_ascii_case("claude")
+        || manifests.process_has_agent(running, "claude")
+        || known_agent.eq_ignore_ascii_case("hermes")
+        || manifests.process_has_agent(running, "hermes")
 }
 
 /// The compiled-in default rules (generic first, then per-agent).
@@ -465,6 +427,47 @@ fn builtin_rules() -> Vec<Rule> {
             105,
             Region::Screen,
             vec![any(&["ctrl+c to stop"])],
+        ),
+        // OMP publishes its state in the OSC title as `π <state> label`.
+        // Current builds use `:` while working, `!` for attention, and `>` for
+        // the user's turn. Older builds animated a braille spinner after `π `
+        // instead of `:`; keep that form so both contracts classify.
+        //
+        // On some Windows ConPTY paths the brand glyph arrives as U+87FA
+        // (UTF-8 E8 9F BA) instead of Greek pi U+03C0. Live inventory on this
+        // host shows that consistently while ASCII state markers stay intact,
+        // so match both brand codepoints until the title encoding path is fixed.
+        // Scope the rules to OMP: the generic spinner rule requires a
+        // line-leading spinner, and weakening it would create false positives
+        // for ordinary branded titles. The explicit idle title outranks
+        // retained screen activity but not a live confirmation panel.
+        per(
+            "omp",
+            State::Blocked,
+            325,
+            Region::Title,
+            vec![starts_with(&["π !", "\u{87FA} !"])],
+        ),
+        per(
+            "omp",
+            State::Working,
+            125,
+            Region::Title,
+            vec![starts_with(&["π :", "\u{87FA} :"])],
+        ),
+        per(
+            "omp",
+            State::Working,
+            124,
+            Region::Title,
+            vec![spinner_after_prefix(&["π ", "\u{87FA} "])],
+        ),
+        per(
+            "omp",
+            State::Idle,
+            210,
+            Region::Title,
+            vec![starts_with(&["π >", "\u{87FA} >"])],
         ),
         // fx suppresses its activity row while it needs user input. Its
         // narrowest approval and question hints retain these paired controls,
@@ -589,6 +592,169 @@ fn builtin_rules() -> Vec<Rule> {
             Region::Screen,
             vec![any(&["ctrl+c:cancel"])],
         ),
+        // While a subagent is running, Grok replaces that footer entirely with
+        // "1 subagent still running - send a message to interrupt", so the rule
+        // above stops matching and the pane reads Idle for however long the
+        // subagent takes - minutes, in practice. Same reasoning as WORKING_HINTS:
+        // an invitation to interrupt only exists while there is something to
+        // interrupt.
+        per(
+            "grok",
+            State::Working,
+            105,
+            Region::Screen,
+            vec![any(&["send a message to interrupt"])],
+        ),
+        // Hermes publishes compact OSC-title state markers. The explicit idle
+        // marker outranks retained working text from the completed turn, while
+        // visible confirmation panels still outrank both title states.
+        per(
+            "hermes",
+            State::Blocked,
+            325,
+            Region::Title,
+            vec![starts_with(&["⚠"])],
+        ),
+        per(
+            "hermes",
+            State::Working,
+            125,
+            Region::Title,
+            vec![starts_with(&["⏳"])],
+        ),
+        per(
+            "hermes",
+            State::Idle,
+            210,
+            Region::Title,
+            vec![starts_with(&["✓"])],
+        ),
+        // Require both a Hermes interaction label and its controls. Matching
+        // either half alone would turn ordinary transcript prose into a false
+        // blocked state.
+        per(
+            "hermes",
+            State::Blocked,
+            315,
+            Region::Screen,
+            vec![
+                any(&["dangerous", "approval", "allow once", "1. allow"]),
+                any(&[
+                    "enter confirm",
+                    "enter to confirm",
+                    "↑/↓ to select",
+                    "show full command",
+                ]),
+            ],
+        ),
+        per(
+            "hermes",
+            State::Blocked,
+            315,
+            Region::Screen,
+            vec![
+                any(&[
+                    "hermes needs your",
+                    "type your answer",
+                    "other (type",
+                    "ask ",
+                ]),
+                any(&[
+                    "enter confirm",
+                    "enter to confirm",
+                    "enter send",
+                    "press enter",
+                    "↑/↓ select",
+                    "↑/↓ to select",
+                    "other (type",
+                ]),
+            ],
+        ),
+        per(
+            "hermes",
+            State::Blocked,
+            315,
+            Region::Screen,
+            vec![
+                any(&["approve once", "start a new session", "keep going"]),
+                any(&[
+                    "cancel",
+                    "enter to confirm",
+                    "enter confirm",
+                    "type 1/2/3",
+                    "y/n quick",
+                ]),
+            ],
+        ),
+        per(
+            "hermes",
+            State::Blocked,
+            315,
+            Region::Screen,
+            vec![
+                any(&["sudo password", "skill setup", "🔑"]),
+                any(&["password", "press enter", "enter confirm", "for "]),
+            ],
+        ),
+        per(
+            "hermes",
+            State::Working,
+            125,
+            Region::Screen,
+            vec![any(&[
+                "msg=interrupt",
+                "ctrl+c cancel",
+                "ctrl+c to interrupt",
+            ])],
+        ),
+        // Muse question, trust, and approval overlays. These paired controls
+        // outrank its generic `esc to interrupt` working hint, including the
+        // multi-select question UI that deliberately retains that phrase.
+        per(
+            "muse",
+            State::Blocked,
+            325,
+            Region::Screen,
+            vec![all(&["enter to select", "tab for an optional note"])],
+        ),
+        per(
+            "muse",
+            State::Blocked,
+            325,
+            Region::Screen,
+            vec![all(&["enter to toggle", "esc to interrupt"])],
+        ),
+        per(
+            "muse",
+            State::Blocked,
+            325,
+            Region::Screen,
+            vec![all(&["do you trust this workspace?", "trust and continue"])],
+        ),
+        per(
+            "muse",
+            State::Blocked,
+            325,
+            Region::Screen,
+            vec![all(&[
+                "allow this stage once",
+                "always allow in this workspace",
+            ])],
+        ),
+        per(
+            "muse",
+            State::Blocked,
+            325,
+            Region::Screen,
+            vec![all(&["allow once", "allow for this session"])],
+        ),
+        per(
+            "muse",
+            State::Blocked,
+            325,
+            Region::Screen,
+            vec![all(&["yes, proceed", "yes, don't ask again this session"])],
+        ),
     ]
 }
 
@@ -709,6 +875,9 @@ impl ManifestFile {
                     name: name.clone(),
                     distinct: Vec::new(),
                     ambiguous: Vec::new(),
+                    binary_matcher: None,
+                    interpreter_packages: Vec::new(),
+                    overlap_priority: 0,
                 });
                 agents.last_mut().expect("just pushed")
             }
@@ -716,6 +885,8 @@ impl ManifestFile {
         if id.replace {
             entry.distinct.clear();
             entry.ambiguous.clear();
+            entry.binary_matcher = None;
+            entry.interpreter_packages.clear();
         }
         entry.distinct.extend(lc(&id.distinct));
         entry.ambiguous.extend(lc(&id.ambiguous));
@@ -930,22 +1101,19 @@ impl Manifests {
 
     fn agent_in_process_command(&self, cmd: &str) -> Option<String> {
         let low = cmd.to_lowercase();
-        let mut tokens = low.split_whitespace();
-        let first = binary_name(tokens.next()?);
+        let tokens = Self::command_tokens(&low);
+        let tokens = unwrap_leading_env(&tokens);
+        let (first, rest) = tokens.split_first()?;
+        let first = binary_name(first);
         if let Some(a) = self.match_binary(first) {
             return Some(a);
         }
         // Several agents ship as a script run by an interpreter, so argv[0]
-        // is `node` / `python` and the real name is the script slot: the first
-        // non-flag argument. Nothing later counts -- `cargo test --example amp`
-        // must not resolve to amp.
+        // is `node` / `python` and the real name is the script slot. Nothing
+        // later counts -- `cargo test --example amp` must not resolve to amp.
         if is_interpreter(first) {
-            for t in tokens {
-                if t.starts_with('-') {
-                    continue;
-                }
-                return self.match_binary(binary_name(t));
-            }
+            let i = interpreter_script_slot(rest)?;
+            return self.match_interpreter_script(&rest[i]);
         }
         None
     }
@@ -959,7 +1127,8 @@ impl Manifests {
     /// nothing rather than guessing.
     pub fn launch_args_for(&self, running: &[String], agent: &str) -> Option<Vec<String>> {
         for cmd in running {
-            let tokens: Vec<&str> = cmd.split_whitespace().collect();
+            let tokens = Self::command_tokens(cmd);
+            let tokens = unwrap_leading_env(&tokens);
             let Some((first, rest)) = tokens.split_first() else {
                 continue;
             };
@@ -967,30 +1136,130 @@ impl Manifests {
             if self.match_binary(binary_name(&first_low)).as_deref() == Some(agent) {
                 return Some(rest.iter().map(|s| s.to_string()).collect());
             }
-            // Interpreter form: the agent token is the first non-flag argument,
-            // and nothing before it is a launch flag.
+            // Interpreter form: the agent token is the script slot, and nothing
+            // before it is a launch flag.
             if is_interpreter(binary_name(&first_low)) {
-                for (i, t) in rest.iter().enumerate() {
-                    if t.starts_with('-') {
-                        continue;
-                    }
-                    let t_low = t.to_lowercase();
-                    if self.match_binary(binary_name(&t_low)).as_deref() == Some(agent) {
+                if let Some(i) = interpreter_script_slot(rest) {
+                    let t_low = rest[i].to_lowercase();
+                    if self.match_interpreter_script(&t_low).as_deref() == Some(agent) {
                         return Some(rest[(i + 1)..].iter().map(|s| s.to_string()).collect());
                     }
-                    break; // the first non-flag arg is the script slot; nothing later counts
                 }
             }
         }
         None
     }
 
+    /// Split a process command line into argv-like tokens, retaining spaces
+    /// inside quoted paths such as `"C:\\Program Files\\nodejs\\node.exe"`.
+    /// Apply the Windows backslash-before-quote rules so escaped quotes and
+    /// trailing backslashes survive when launch arguments are replayed.
+    fn command_tokens(command: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut token = String::new();
+        let mut quoted = false;
+        let mut token_started = false;
+        let mut characters = command.chars().peekable();
+        while let Some(character) = characters.next() {
+            match character {
+                '\\' => {
+                    let mut backslashes = 1;
+                    while characters.peek().copied() == Some('\\') {
+                        characters.next();
+                        backslashes += 1;
+                    }
+                    token_started = true;
+                    if characters.peek().copied() == Some('"') {
+                        characters.next();
+                        for _ in 0..backslashes / 2 {
+                            token.push('\\');
+                        }
+                        if backslashes % 2 == 1 {
+                            token.push('"');
+                        } else {
+                            quoted = !quoted;
+                        }
+                    } else {
+                        for _ in 0..backslashes {
+                            token.push('\\');
+                        }
+                    }
+                }
+                '"' => {
+                    quoted = !quoted;
+                    token_started = true;
+                }
+                character if character.is_whitespace() && !quoted => {
+                    if token_started {
+                        tokens.push(std::mem::take(&mut token));
+                        token_started = false;
+                    }
+                }
+                character => {
+                    token.push(character);
+                    token_started = true;
+                }
+            }
+        }
+        if token_started {
+            tokens.push(token);
+        }
+        tokens
+    }
+
+    /// Match an interpreter's script slot by basename or by its npm package.
+    /// Scoped package identity is checked before the basename because OMP and
+    /// Pi intentionally ship the same `pi-coding-agent` package name under
+    /// different owners.
+    fn match_interpreter_script(&self, token: &str) -> Option<String> {
+        let normalized = token.to_lowercase().replace('\\', "/");
+        let segments: Vec<&str> = normalized.split('/').collect();
+        let script = strip_script_extension(segments.last().copied()?);
+        let package = segments
+            .iter()
+            .rposition(|segment| *segment == "node_modules")
+            .and_then(|node_modules| {
+                let first = segments.get(node_modules + 1).copied()?;
+                if first.starts_with('@') {
+                    let basename = segments.get(node_modules + 2).copied()?;
+                    Some((format!("{first}/{basename}"), basename))
+                } else {
+                    Some((first.to_string(), first))
+                }
+            });
+
+        package
+            .as_ref()
+            .and_then(|(package, _)| {
+                self.best_agent(|agent| {
+                    agent
+                        .interpreter_packages
+                        .iter()
+                        .any(|pattern| pattern == package)
+                })
+            })
+            .map(|agent| agent.name.clone())
+            .or_else(|| self.match_binary(binary_name(token)))
+            .or_else(|| {
+                self.best_agent(|agent| agent.all().any(|pattern| pattern == script))
+                    .map(|agent| agent.name.clone())
+            })
+            .or_else(|| {
+                let (_, basename) = package.as_ref()?;
+                self.best_agent(|agent| agent.distinct.iter().any(|pattern| pattern == basename))
+                    .map(|agent| agent.name.clone())
+            })
+    }
+
     /// The agent whose patterns name exactly this binary.
     fn match_binary(&self, base: &str) -> Option<String> {
-        self.agents
-            .iter()
-            .find(|a| a.all().any(|p| p == base))
-            .map(|a| a.name.clone())
+        if let Some(agent) =
+            self.best_agent(|agent| agent.binary_matcher.is_some_and(|matcher| matcher(base)))
+        {
+            return Some(agent.name.clone());
+        }
+        self.best_agent(|agent| agent.all().any(|pattern| pattern == base))
+            .map(|agent| agent.name.clone())
     }
 
     /// Name the agent running in a pane, in decreasing order of how deliberate
@@ -1008,23 +1277,22 @@ impl Manifests {
 
         // Deliberate signals: somebody typed this, or the agent published it.
         for (region, source) in [(&cmd, "launch_command"), (&title, "osc_title")] {
-            if let Some(a) = self
-                .agents
-                .iter()
-                .find(|a| a.all().any(|p| contains_agent_word(region, p)))
-            {
+            if let Some(a) = self.best_agent(|agent| {
+                agent
+                    .all()
+                    .any(|pattern| contains_agent_word(region, pattern))
+            }) {
                 return Some((a.name.clone(), source));
             }
         }
         // Incidental signal: pane output. Only names that can't be ordinary words.
-        self.agents
-            .iter()
-            .find(|a| {
-                a.distinct
-                    .iter()
-                    .any(|p| contains_agent_word(low_bottom, p))
-            })
-            .map(|a| (a.name.clone(), "screen_text"))
+        self.best_agent(|agent| {
+            agent
+                .distinct
+                .iter()
+                .any(|pattern| contains_agent_word(low_bottom, pattern))
+        })
+        .map(|agent| (agent.name.clone(), "screen_text"))
     }
 }
 
@@ -1037,6 +1305,16 @@ pub(crate) fn binary_name(token: &str) -> &str {
         .unwrap_or(token)
         .trim_start_matches('-')
         .trim_end_matches(".exe")
+}
+
+/// The basename of a script without the extension used by common interpreters.
+fn strip_script_extension(token: &str) -> &str {
+    token
+        .strip_suffix(".cjs")
+        .or_else(|| token.strip_suffix(".mjs"))
+        .or_else(|| token.strip_suffix(".js"))
+        .or_else(|| token.strip_suffix(".py"))
+        .unwrap_or(token)
 }
 
 /// Runtimes that execute an agent as a script, so the name to look for is the
@@ -1058,12 +1336,59 @@ pub(crate) fn is_interpreter(base: &str) -> bool {
             | "uvx"
             | "ruby"
             | "perl"
-            | "env"
             | "sh"
             | "bash"
             | "zsh"
             | "fish"
     )
+}
+
+/// Conservatively unwrap `env KEY=value command ...`.
+///
+/// Only that form is unwrapped: a leading `env` followed by zero or more
+/// `KEY=value` assignments, then a command. Flags after `env` are an unknown
+/// wrapper and the original argv is left untouched -- later arguments are not
+/// scanned for an agent-looking path.
+fn unwrap_leading_env(tokens: &[String]) -> &[String] {
+    let Some(first) = tokens.first() else {
+        return tokens;
+    };
+    if binary_name(&first.to_lowercase()) != "env" {
+        return tokens;
+    }
+    let mut i = 1;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        if t.starts_with('-') {
+            return tokens;
+        }
+        if !t.contains('=') {
+            return &tokens[i..];
+        }
+        i += 1;
+    }
+    &tokens[i..]
+}
+
+/// Index of the script an interpreter will run, among the arguments after
+/// argv[0]. Flags are skipped. Values consumed by `-r`, `--require`, and
+/// `--loader` are skipped with their option. The first remaining argument is
+/// the script; later arguments are not scanned.
+fn interpreter_script_slot(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg.starts_with('-') {
+            if matches!(arg, "-r" | "--require" | "--loader") {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        return Some(i);
+    }
+    None
 }
 
 /// True when `needle` appears in `hay` as a **standalone word**.
@@ -1088,6 +1413,8 @@ fn contains_agent_word(hay: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::vt::alacritty::AlacrittyEngine;
+    use crate::terminal::vt::VtEngine;
 
     fn state(bottom: &str, activity: bool, input: bool) -> State {
         classify(
@@ -1101,6 +1428,58 @@ mod tests {
             &Manifests::builtin(),
         )
         .state
+    }
+
+    const CLAUDE_COMMAND_APPROVAL_SCREEN: &str = r#"Bash command
+
+  rtk ls -la
+  List files in current directory with details
+
+This command requires approval
+
+Do you want to proceed?
+  1. Yes
+  2. Yes, and don’t ask again for: rtk ls *
+❯ 3. No"#;
+
+    const CLAUDE_PLAN_APPROVAL_SCREEN: &str = r#"Claude's plan
+
+Implement the requested change and run the focused tests.
+
+Would you like to proceed?
+  1. Yes, clear context and auto-accept edits
+  2. Yes, auto-accept edits
+❯ 3. Yes, manually approve edits
+  4. No, keep planning"#;
+
+    fn detection_from_claude_screen(screen: &str) -> Detection {
+        let manifests = Manifests::builtin();
+        let rows = screen_rows("claude", &[], &manifests);
+        let use_non_empty = screen_uses_non_empty_rows("claude", &[], &manifests);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut engine = AlacrittyEngine::new(80, 30, tx, 1024 * 1024);
+        let terminal_screen = screen.replace('\n', "\r\n");
+        engine.advance(format!("\x1b[2J\x1b[H{terminal_screen}").as_bytes());
+
+        assert!(
+            engine.detection_text(rows).trim().is_empty(),
+            "the approval card is above the ordinary bottom-row window"
+        );
+        let bottom = if use_non_empty {
+            engine.detection_text_non_empty(rows)
+        } else {
+            engine.detection_text(rows)
+        };
+        classify(
+            Some("claude"),
+            &bottom,
+            false,
+            false,
+            "claude",
+            "claude",
+            &[],
+            &manifests,
+        )
     }
 
     fn fx_state(bottom: &str, activity: bool, input: bool) -> State {
@@ -1157,6 +1536,250 @@ mod tests {
             &m,
         );
         assert_eq!(incidental.agent, "zsh", "screen prose must not name fx");
+    }
+
+    #[test]
+    fn muse_identity_accepts_native_binaries_without_trusting_prose() {
+        let m = Manifests::builtin();
+        assert_eq!(
+            m.agent_in_processes(&[
+                "/Users/me/.local/bin/muse-bin-0.2.1-R1215.1 --provider meta".into()
+            ]),
+            Some("muse".into())
+        );
+        assert_eq!(
+            m.agent_in_processes(&["/Users/me/.local/bin/muse --provider echo".into()]),
+            Some("muse".into())
+        );
+        assert_eq!(
+            m.agent_in_processes(&["/usr/local/bin/muse-bin-helper".into()]),
+            None,
+            "a similarly named helper is not Muse Code"
+        );
+
+        let incidental = classify(
+            Some("zsh"),
+            "the museum uses a muse as its example",
+            true,
+            false,
+            "zsh",
+            "",
+            &[],
+            &m,
+        );
+        assert_eq!(
+            incidental.agent, "zsh",
+            "bare muse is never trusted from pane output"
+        );
+    }
+
+    #[test]
+    fn hermes_identity_accepts_native_and_python_launchers_without_trusting_prose() {
+        let manifests = Manifests::builtin();
+        for command in [
+            "/Users/me/.local/bin/hermes --tui",
+            r"C:\Users\me\.local\bin\hermes.exe --resume 20260830_120000_a1b2c3",
+            "/usr/bin/python3 /Users/me/.local/bin/hermes --tui",
+            "/usr/bin/python3 -m hermes_cli.main --tui",
+        ] {
+            assert_eq!(
+                manifests.agent_in_processes(&[command.to_string()]),
+                Some("hermes".to_string()),
+                "failed to recognize {command}"
+            );
+        }
+
+        let incidental = classify(
+            Some("zsh"),
+            "Hermes was the messenger of the gods",
+            true,
+            false,
+            "zsh",
+            "",
+            &[],
+            &manifests,
+        );
+        assert_eq!(
+            incidental.agent, "zsh",
+            "the ordinary proper name must not identify a shell as Hermes CLI"
+        );
+    }
+
+    #[test]
+    fn hermes_state_requires_visible_interaction_evidence() {
+        let manifests = Manifests::builtin();
+        let detect = |title: &str, screen: &str| {
+            classify(
+                Some(title),
+                screen,
+                false,
+                false,
+                "zsh",
+                "hermes",
+                &["/Users/me/.local/bin/hermes --tui".to_string()],
+                &manifests,
+            )
+            .state
+        };
+
+        assert_eq!(detect("⏳ Hermes", ""), State::Working);
+        assert_eq!(detect("⚠ Hermes", ""), State::Blocked);
+        assert_eq!(
+            detect("Hermes status ✓", ""),
+            State::Idle,
+            "an incidental marker later in the title is not state authority"
+        );
+        assert_eq!(
+            detect("✓ Hermes", "Ctrl+C to interrupt"),
+            State::Idle,
+            "the current title wins over a retained interrupt hint"
+        );
+        assert_eq!(
+            detect(
+                "Hermes",
+                "Dangerous command\n1. Allow once\nEnter to confirm"
+            ),
+            State::Blocked
+        );
+        assert_eq!(
+            detect(
+                "Hermes",
+                "Hermes needs your input\nType your answer\nEnter send"
+            ),
+            State::Blocked
+        );
+        assert_eq!(
+            detect("Hermes", "running tool · msg=interrupt"),
+            State::Working
+        );
+        assert_eq!(
+            detect("Hermes", "Ask repository owner\nOther (type answer)"),
+            State::Blocked
+        );
+        assert_eq!(detect("Hermes", "🔑 API key for provider"), State::Blocked);
+        assert_eq!(detect("Hermes", "Ctrl+C to interrupt"), State::Working);
+        assert_eq!(
+            detect("Hermes", "documentation about dangerous command approval"),
+            State::Idle,
+            "labels without interactive controls are ordinary output"
+        );
+    }
+
+    #[test]
+    fn overlap_priority_keeps_omp_ahead_of_pi_independent_of_registry_order() {
+        let mut manifests = Manifests::builtin();
+        manifests.agents.reverse();
+        assert_eq!(
+            manifests
+                .detect_agent(None, "", "oh-my-pi")
+                .map(|(agent, _)| agent),
+            Some("omp".to_string())
+        );
+    }
+
+    #[test]
+    fn omp_title_states_work_without_the_optional_integration() {
+        let manifests = Manifests::builtin();
+        let omp_process = vec!["bun /Users/me/.bun/bin/omp".to_string()];
+        let detect = |title: &str, screen: &str| {
+            classify(
+                Some(title),
+                screen,
+                false,
+                false,
+                "zsh",
+                "",
+                &omp_process,
+                &manifests,
+            )
+        };
+
+        let working = detect("π : sudos", "");
+        assert_eq!(working.agent, "omp");
+        assert_eq!(working.identity_source, "process_tree");
+        assert_eq!(working.state, State::Working);
+        assert_eq!(working.state_source, "manifest_rule");
+
+        assert_eq!(detect("π ⠋ sudos", "").state, State::Working);
+        assert_eq!(detect("π ! sudos", "").state, State::Blocked);
+        assert_eq!(detect("π > sudos", "esc to interrupt").state, State::Idle);
+        // Windows ConPTY-mangled brand observed in live inventory titles.
+        assert_eq!(detect("\u{87FA} : sudos", "").state, State::Working);
+        assert_eq!(detect("\u{87FA} ! sudos", "").state, State::Blocked);
+        assert_eq!(
+            detect("\u{87FA} > sudos", "esc to interrupt").state,
+            State::Idle
+        );
+
+        let pi = classify(
+            Some("π ⠙ sudos"),
+            "",
+            false,
+            false,
+            "zsh",
+            "",
+            &["/usr/local/bin/pi".to_string()],
+            &manifests,
+        );
+        assert_eq!(pi.agent, "pi");
+        assert_eq!(
+            pi.state,
+            State::Idle,
+            "OMP's branded title contract must not change Pi state"
+        );
+    }
+
+    #[test]
+    fn muse_identity_replace_disables_the_versioned_binary_matcher() {
+        let mut m = Manifests::builtin();
+        toml::from_str::<ManifestFile>(
+            r#"
+            agent = "muse"
+            [identity]
+            distinct = ["custom-muse"]
+            replace = true
+        "#,
+        )
+        .unwrap()
+        .apply_identity(&mut m.agents);
+
+        assert_eq!(
+            m.agent_in_processes(&["muse-bin-0.2.1-R1215.1".into()]),
+            None
+        );
+        assert_eq!(
+            m.agent_in_processes(&["custom-muse".into()]),
+            Some("muse".into())
+        );
+    }
+
+    #[test]
+    fn muse_native_interactions_override_the_working_hint() {
+        let classify_muse = |bottom: &str| {
+            classify(
+                Some("Muse Code"),
+                bottom,
+                true,
+                false,
+                "zsh",
+                "muse",
+                &["muse-bin-0.2.1-R1215.1".into()],
+                &Manifests::builtin(),
+            )
+            .state
+        };
+        assert_eq!(
+            classify_muse("Which files?\nEnter to toggle · Esc to interrupt"),
+            State::Blocked
+        );
+        assert_eq!(
+            classify_muse("Do you trust this workspace?\nTrust and continue"),
+            State::Blocked
+        );
+        assert_eq!(
+            classify_muse("◆ Working (2s · esc to interrupt)"),
+            State::Working
+        );
     }
 
     #[test]
@@ -1270,6 +1893,176 @@ mod tests {
             m.launch_args_for(&["claude".into()], "claude"),
             Some(vec![])
         );
+        // Empty quoted arguments are real argv entries and must survive so a
+        // relaunch does not silently change the agent's configuration.
+        assert_eq!(
+            m.launch_args_for(&[r#"claude --model "" --yes"#.into()], "claude"),
+            Some(vec!["--model".into(), "".into(), "--yes".into()])
+        );
+        // Windows escapes a quote with an odd run of backslashes inside a
+        // quoted argument; the escaped quote must remain part of the value.
+        assert_eq!(
+            m.launch_args_for(
+                &["claude --append-system-prompt \"say \\\"hi\\\"\"".into()],
+                "claude",
+            ),
+            Some(vec!["--append-system-prompt".into(), "say \"hi\"".into()])
+        );
+        // An even run before a closing quote becomes half as many backslashes,
+        // and the quote remains the delimiter.
+        assert_eq!(
+            m.launch_args_for(&["claude --cwd \"C:\\work\\\\\"".into()], "claude"),
+            Some(vec!["--cwd".into(), r#"C:\work\"#.into()])
+        );
+        // Windows process inspection supplies the full Node command line, so
+        // Pi's npm package name in the script slot resolves to the agent.
+        assert_eq!(
+            m.agent_in_processes(&[
+                r#""C:\Program Files\nodejs\node.exe" C:\Users\me\AppData\Roaming\npm\node_modules\@earendil-works\pi-coding-agent\dist\cli.js"#.into()
+            ]),
+            Some("pi".into())
+        );
+        // An ambiguous brand name is still deliberate when it is the script
+        // basename in a running interpreter command.
+        assert_eq!(
+            m.agent_in_processes(&[r#"node C:\tools\grok.js"#.into()]),
+            Some("grok".into())
+        );
+        // A bare agent name in an unrelated project directory is not an
+        // installed package and must not identify the pane.
+        assert_eq!(
+            m.agent_in_processes(&[r#"node C:\work\claude\build.js"#.into()]),
+            None
+        );
+        // Package-directory matching remains available for npm shim paths.
+        assert_eq!(
+            m.agent_in_processes(&[r#"node C:\work\node_modules\claude\build.js"#.into()]),
+            Some("claude".into())
+        );
+        // Scoped npm packages use the package name after the `@scope` segment.
+        assert_eq!(
+            m.agent_in_processes(&[
+                r#"node C:\work\node_modules\@earendil-works\pi-coding-agent\dist\cli.js"#.into()
+            ]),
+            Some("pi".into())
+        );
+        let antigravity_unix = "/Users/me/.local/bin/agy --conversation ec33ebf9-0cba-4100-8142-c61503f6c587 --sandbox";
+        assert_eq!(
+            m.agent_in_processes(&[antigravity_unix.into()]),
+            Some("antigravity".into())
+        );
+        assert_eq!(
+            m.launch_args_for(&[antigravity_unix.into()], "antigravity"),
+            Some(vec![
+                "--conversation".into(),
+                "ec33ebf9-0cba-4100-8142-c61503f6c587".into(),
+                "--sandbox".into(),
+            ])
+        );
+        let antigravity_windows = r#"C:\Users\me\AppData\Local\agy\bin\agy.exe -p "fix the tests""#;
+        assert_eq!(
+            m.agent_in_processes(&[antigravity_windows.into()]),
+            Some("antigravity".into())
+        );
+        assert_eq!(
+            m.launch_args_for(&[antigravity_windows.into()], "antigravity"),
+            Some(vec!["-p".into(), "fix the tests".into()])
+        );
+    }
+
+    #[test]
+    fn scoped_pi_packages_distinguish_omp_from_pi() {
+        let m = Manifests::builtin();
+        let omp_bun = "/Users/me/.bun/bin/bun /Users/me/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js --model anthropic/claude";
+        assert_eq!(
+            m.agent_in_processes(&[omp_bun.into()]),
+            Some("omp".into()),
+            "OMP's scoped package must not degrade to Pi"
+        );
+        assert_eq!(
+            m.launch_args_for(&[omp_bun.into()], "omp"),
+            Some(vec!["--model".into(), "anthropic/claude".into()])
+        );
+        assert!(m.launch_args_for(&[omp_bun.into()], "pi").is_none());
+
+        let omp_windows = r#""C:\Program Files\nodejs\node.exe" C:\Users\me\AppData\Roaming\npm\node_modules\@oh-my-pi\pi-coding-agent\dist\cli.js --yes"#;
+        assert_eq!(
+            m.agent_in_processes(&[omp_windows.into()]),
+            Some("omp".into())
+        );
+
+        let pi_node = "/usr/local/bin/node /Users/me/.nvm/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js --provider openai";
+        assert_eq!(m.agent_in_processes(&[pi_node.into()]), Some("pi".into()));
+
+        let detection = classify(
+            Some("zsh"),
+            "",
+            false,
+            false,
+            "zsh",
+            "",
+            &[omp_bun.into()],
+            &m,
+        );
+        assert_eq!(detection.agent, "omp");
+        assert_eq!(detection.identity_source, "process_tree");
+
+        let omp_named_script = "/Users/me/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/bin/pi-coding-agent";
+        assert_eq!(
+            m.agent_in_processes(&[format!("node {omp_named_script}")]),
+            Some("omp".into()),
+            "the scoped package must win over Pi's shared script basename"
+        );
+        let pi_named_script =
+            "/Users/me/.nvm/lib/node_modules/@earendil-works/pi-coding-agent/bin/pi-coding-agent";
+        assert_eq!(
+            m.agent_in_processes(&[format!("node {pi_named_script}")]),
+            Some("pi".into())
+        );
+    }
+
+    #[test]
+    fn interpreter_script_slot_skips_require_value() {
+        let m = Manifests::builtin();
+        let cmd = r#"node --require C:\hooks\loader.js C:\Users\me\AppData\Roaming\npm\node_modules\@earendil-works\pi-coding-agent\dist\cli.js --yes"#;
+        assert_eq!(m.agent_in_processes(&[cmd.into()]), Some("pi".into()));
+        assert_eq!(
+            m.launch_args_for(&[cmd.into()], "pi"),
+            Some(vec!["--yes".into()])
+        );
+    }
+
+    #[test]
+    fn interpreter_script_slot_skips_loader_value() {
+        let m = Manifests::builtin();
+        let cmd = r#"node --loader C:\hooks\loader.js C:\Users\me\AppData\Roaming\npm\node_modules\@earendil-works\pi-coding-agent\dist\cli.js --yes"#;
+        assert_eq!(m.agent_in_processes(&[cmd.into()]), Some("pi".into()));
+        assert_eq!(
+            m.launch_args_for(&[cmd.into()], "pi"),
+            Some(vec!["--yes".into()])
+        );
+    }
+
+    #[test]
+    fn interpreter_script_slot_ignores_agent_looking_loader() {
+        let m = Manifests::builtin();
+        assert_eq!(
+            m.agent_in_processes(&[
+                r#"node --require C:\work\node_modules\pi-coding-agent\hooks\loader.js C:\work\build.js"#.into()
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn interpreter_script_slot_unwraps_env_key_value() {
+        let m = Manifests::builtin();
+        let cmd = r#"env FOO=bar node C:\work\node_modules\@earendil-works\pi-coding-agent\dist\cli.js --yes"#;
+        assert_eq!(m.agent_in_processes(&[cmd.into()]), Some("pi".into()));
+        assert_eq!(
+            m.launch_args_for(&[cmd.into()], "pi"),
+            Some(vec!["--yes".into()])
+        );
     }
 
     #[test]
@@ -1285,6 +2078,50 @@ mod tests {
         // though it starts with the same ✻ glyph.
         assert_eq!(state("✻ Cogitated for 18s", false, false), State::Idle);
         assert_eq!(state("✻ Worked for 47s", false, false), State::Idle);
+    }
+
+    #[test]
+    fn claude_approval_panels_use_non_empty_screen_rows() {
+        let manifests = Manifests::builtin();
+        assert!(screen_uses_non_empty_rows("claude", &[], &manifests));
+        assert!(screen_uses_non_empty_rows(
+            "",
+            &["/usr/local/bin/claude".to_string()],
+            &manifests
+        ));
+        assert!(!screen_uses_non_empty_rows(
+            "codex",
+            &["/usr/local/bin/codex".to_string()],
+            &manifests
+        ));
+    }
+
+    #[test]
+    fn claude_command_approval_screen_is_blocked() {
+        let detection = detection_from_claude_screen(CLAUDE_COMMAND_APPROVAL_SCREEN);
+        assert_eq!(detection.state, State::Blocked);
+        assert_eq!(detection.state_source, "manifest_rule");
+        assert_eq!(detection.rule_priority, Some(300));
+    }
+
+    #[test]
+    fn claude_plan_approval_screen_is_blocked() {
+        let detection = detection_from_claude_screen(CLAUDE_PLAN_APPROVAL_SCREEN);
+        assert_eq!(detection.state, State::Blocked);
+        assert_eq!(detection.state_source, "manifest_rule");
+        assert_eq!(detection.rule_priority, Some(300));
+    }
+
+    #[test]
+    fn claude_approval_prose_without_controls_is_idle() {
+        assert_eq!(
+            state(
+                "The docs say this command requires approval. Would you like to proceed later?",
+                false,
+                false,
+            ),
+            State::Idle
+        );
     }
 
     #[test]
@@ -1470,6 +2307,23 @@ mod tests {
     }
 
     #[test]
+    fn grok_running_a_subagent_is_working() {
+        // Grok swaps its `Ctrl+c:cancel` footer for a subagent line while a
+        // subagent runs; without a rule for it the pane read Idle throughout.
+        let d = classify(
+            Some("grok"),
+            "  * Run File issue to lift config live into configlist\n  * Running 1 subagent\n\n  o 1 subagent still running - send a message to interrupt",
+            true,
+            false,
+            "grok",
+            "grok",
+            &[],
+            &Manifests::builtin(),
+        );
+        assert_eq!(d.state, State::Working);
+    }
+
+    #[test]
     fn grok_permission_card_is_blocked() {
         // Grok's permission card shows Always/Never allow together; that pair
         // reads as Blocked even for an edit the generic prompt list wouldn't catch.
@@ -1640,6 +2494,26 @@ mod tests {
         assert_eq!(detection.identity_source, "command_fallback");
     }
 
+    #[test]
+    fn successful_process_scan_replaces_a_stale_identity() {
+        let detection = classify(
+            Some("claude"),
+            "claude prompt",
+            false,
+            false,
+            "cmd.exe",
+            "claude",
+            &[
+                r#"cmd.exe /d /k C:\Users\me\.grok\bin\grok.exe --prompt-file C:\Users\me\task.md"#
+                    .into(),
+                r#"C:\Users\me\.grok\bin\grok.exe --prompt-file C:\Users\me\task.md"#.into(),
+            ],
+            &Manifests::builtin(),
+        );
+        assert_eq!(detection.agent, "grok");
+        assert_eq!(detection.identity_source, "process_tree");
+    }
+
     /// A pane is named after the agent *running in it*, never after a word that
     /// happens to be on screen. `amp` is a substring of "example", "sample",
     /// "stamped" and "implementation", so a Claude pane printing ordinary prose
@@ -1704,6 +2578,33 @@ mod tests {
             named(Some("zsh"), "pi-coding-agent starting\n", "zsh"),
             "pi",
             "the npm binary is distinctive enough to trust from output"
+        );
+        // omp: the brand + npm binary are distinctive; bare "omp" is ambiguous
+        // (ordinary prose can contain it) and is trusted only from the spawn
+        // command or OSC title.
+        assert_eq!(named(Some("zsh"), "", "omp"), "omp", "command names it");
+        assert_eq!(named(Some("omp"), "", "zsh"), "omp", "title names it");
+        assert_eq!(
+            named(Some("zsh"), "oh-my-pi session restored\n", "zsh"),
+            "omp",
+            "the brand string is distinctive enough to trust from output"
+        );
+        // Registry order matters: "oh-my-pi" word-contains pi's ambiguous
+        // token, so omp must be consulted before pi or this pane reads as pi.
+        assert_eq!(
+            named(Some("zsh"), "", "oh-my-pi"),
+            "omp",
+            "an oh-my-pi command/title must not degrade to pi"
+        );
+        assert_eq!(
+            named(Some("oh-my-pi"), "", "zsh"),
+            "omp",
+            "an oh-my-pi title must not degrade to pi"
+        );
+        assert_eq!(
+            named(Some("zsh"), "compiles with omp flags\n", "zsh"),
+            "zsh",
+            "the word omp in output must not name the agent"
         );
         assert_eq!(named(Some("amp"), "", "zsh"), "amp", "title names it");
         assert_eq!(named(Some("zsh"), "", "droid"), "droid", "command names it");
@@ -1816,6 +2717,47 @@ mod tests {
             "zsh"
         );
         assert_eq!(named("gemini is a constellation\n", &proc("-zsh")), "zsh");
+        assert_eq!(
+            named("read the Antigravity documentation\n", &proc("-zsh")),
+            "zsh"
+        );
+        assert_eq!(
+            named(
+                "",
+                &proc("/Applications/Antigravity.app/Contents/MacOS/Antigravity")
+            ),
+            "zsh",
+            "the desktop editor binary is not the Antigravity CLI"
+        );
+        assert_eq!(
+            named(
+                "Requesting permission for:\nDo you want to proceed?",
+                &proc("/Users/me/.local/bin/agy")
+            ),
+            "antigravity"
+        );
+        let blocked = classify(
+            Some("agy"),
+            "Requesting permission for:\nDo you want to proceed?",
+            true,
+            false,
+            "zsh",
+            "",
+            &proc("/Users/me/.local/bin/agy"),
+            &m,
+        );
+        assert_eq!(blocked.state, State::Blocked);
+        let working = classify(
+            Some("agy"),
+            "⠹ Working on the task",
+            true,
+            false,
+            "zsh",
+            "",
+            &proc("C:\\Users\\me\\AppData\\Local\\agy\\bin\\agy.exe"),
+            &m,
+        );
+        assert_eq!(working.state, State::Working);
 
         // Flags never count as the binary, and .exe is stripped.
         assert_eq!(named("", &proc("cargo test --example amp")), "zsh");

@@ -82,6 +82,62 @@ pub enum CheckOutcome {
     Failed,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReleaseStatus {
+    pub current: String,
+    pub latest: String,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct InstallResult {
+    pub current: String,
+    pub latest: String,
+    pub channel: String,
+    pub updated: bool,
+}
+
+/// Structured update check for the on-demand UHP host profile. Unlike the
+/// periodic notifier, an explicit request reports network and manifest errors.
+pub fn release_status() -> Result<ReleaseStatus> {
+    let manifest = manifest_url();
+    release_status_at(&manifest)
+}
+
+fn release_status_at(manifest: &str) -> Result<ReleaseStatus> {
+    let body = http_get(manifest).ok_or_else(|| {
+        anyhow!("could not check {manifest}; check your connection and try again")
+    })?;
+    let latest = parse_version(&body)
+        .ok_or_else(|| anyhow!("the update manifest did not contain a valid version"))?;
+    let latest = validate_release_version(&latest)?;
+    Ok(ReleaseStatus {
+        current: CURRENT.to_string(),
+        available: is_newer(&latest, CURRENT),
+        latest,
+    })
+}
+
+/// Install the newest published release through the same verified channel as
+/// `luvus update`. This runs only in the foreground host-proxy process.
+pub fn install_latest() -> Result<InstallResult> {
+    let status = release_status()?;
+    if !status.available {
+        return Ok(InstallResult {
+            current: status.current,
+            latest: status.latest,
+            channel: "current".to_string(),
+            updated: false,
+        });
+    }
+    install_release(&status.latest, true).map(|channel| InstallResult {
+        current: status.current,
+        latest: status.latest,
+        channel,
+        updated: true,
+    })
+}
+
 /// One fetch-compare, with the answer handed back rather than swallowed.
 fn fetch_outcome(url: &str) -> CheckOutcome {
     match http_get(url).as_deref().and_then(parse_version) {
@@ -94,34 +150,59 @@ fn fetch_outcome(url: &str) -> CheckOutcome {
 /// `luvus update`: check first, then use the installation's own safe update
 /// path. This is deliberately a single command rather than an update command
 /// tree; automatic update checks stay notification-only.
-pub fn run_cli(args: &[String]) -> Result<i32> {
+pub fn run_cli(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: luvus update");
+        eprintln!(
+            "{}",
+            crate::i18n::cli::help("usage: luvus update", context.language())
+        );
         return Ok(2);
     }
 
-    println!("Checking for Luvus updates...");
+    println!("{}", context.text("Checking for Luvus updates..."));
     let manifest = manifest_url();
     let latest = match fetch_outcome(&manifest) {
         CheckOutcome::Current => {
-            println!("Luvus {CURRENT} is already up to date.");
+            println!("Luvus {CURRENT} {}", context.text("is already up to date."));
             return Ok(0);
         }
         CheckOutcome::Newer(version) => validate_release_version(&version)?,
         CheckOutcome::Failed => {
-            bail!("could not check {manifest}; check your connection and try again")
+            bail!(
+                "{} {manifest}; {}",
+                context.text("could not check"),
+                context.text("check your connection and try again")
+            )
         }
     };
 
-    println!("Luvus {latest} is available (current: {CURRENT}).");
+    println!(
+        "{}",
+        context.render(
+            "Luvus {latest} is available (current: {current}).",
+            &[("latest", &latest), ("current", CURRENT)],
+        )
+    );
+    install_release(&latest, false)?;
+
+    println!("{} {CURRENT} -> {latest}.", context.text("Updated Luvus"));
+    println!(
+        "{}",
+        context
+            .text("Run `luvus server restart` when you are ready to load the new server binary.")
+    );
+    Ok(0)
+}
+
+fn install_release(latest: &str, quiet: bool) -> Result<String> {
     let executable = std::env::current_exe().context("find the running Luvus binary")?;
     let executable = executable.canonicalize().unwrap_or(executable);
     let channel = classify_install(&executable, crate::platform::home_dir().as_deref());
 
     match channel {
         InstallChannel::Homebrew => {
-            run_package_update("brew", &["upgrade", "luvus"], "Homebrew")?;
-            verify_path_version(&homebrew_binary_path()?, &latest)?;
+            run_package_update("brew", &["upgrade", "luvus"], "Homebrew", quiet)?;
+            verify_path_version(&homebrew_binary_path()?, latest)?;
         }
         InstallChannel::Cargo => {
             #[cfg(windows)]
@@ -132,10 +213,11 @@ pub fn run_cli(args: &[String]) -> Result<i32> {
             {
                 run_package_update(
                     "cargo",
-                    &["install", "luvus", "--locked", "--version", &latest],
+                    &["install", "luvus", "--locked", "--version", latest],
                     "Cargo",
+                    quiet,
                 )?;
-                verify_path_version(&executable, &latest)?;
+                verify_path_version(&executable, latest)?;
             }
         }
         InstallChannel::Direct => {
@@ -144,7 +226,7 @@ pub fn run_cli(args: &[String]) -> Result<i32> {
                 "Windows cannot replace the executable while it is running; close Luvus and run `irm https://luvus.dev/install.ps1 | iex`"
             );
             #[cfg(not(windows))]
-            install_direct_release(&latest, &executable)?;
+            install_direct_release(latest, &executable)?;
         }
         InstallChannel::Development => bail!(
             "refusing to overwrite a development binary at {}; rebuild it with `cargo build --release`",
@@ -163,9 +245,7 @@ pub fn run_cli(args: &[String]) -> Result<i32> {
         ),
     }
 
-    println!("Updated Luvus {CURRENT} -> {latest}.");
-    println!("Run `luvus server restart` when you are ready to load the new server binary.");
-    Ok(0)
+    Ok(channel.label().to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +257,20 @@ enum InstallChannel {
     Nix,
     SystemPackage,
     Unknown,
+}
+
+impl InstallChannel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Homebrew => "homebrew",
+            Self::Cargo => "cargo",
+            Self::Direct => "direct",
+            Self::Nix => "nix",
+            Self::SystemPackage => "system-package",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 fn classify_install(executable: &Path, home: Option<&Path>) -> InstallChannel {
@@ -238,9 +332,15 @@ fn validate_release_version(version: &str) -> Result<String> {
         .map_err(|_| anyhow!("the update manifest returned an invalid version: {version:?}"))
 }
 
-fn run_package_update(program: &str, args: &[&str], label: &str) -> Result<()> {
-    let status = Command::new(program)
-        .args(args)
+fn run_package_update(program: &str, args: &[&str], label: &str, quiet: bool) -> Result<()> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if quiet {
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
+    let status = crate::platform::no_window(&mut command)
         .status()
         .with_context(|| format!("start {label} updater `{program}`"))?;
     if !status.success() {
@@ -511,8 +611,24 @@ pub fn check_now_reporting(tx: Sender<AppEvent>) {
 /// One fetch-compare-report, silent unless there is news. Takes the URL so tests
 /// can point it at a file without mutating process-wide environment.
 fn check_once(tx: &Sender<AppEvent>, url: &str) {
-    if let CheckOutcome::Newer(latest) = fetch_outcome(url) {
-        let _ = tx.send(AppEvent::UpdateAvailable(latest));
+    match fetch_outcome(url) {
+        CheckOutcome::Newer(latest) => {
+            crate::logging::event(
+                crate::logging::EventKind::UpdateCheck,
+                &[crate::logging::Field::Outcome(crate::logging::Outcome::Ok)],
+            );
+            let _ = tx.send(AppEvent::UpdateAvailable(latest));
+        }
+        CheckOutcome::Current => crate::logging::event(
+            crate::logging::EventKind::UpdateCheck,
+            &[crate::logging::Field::Outcome(crate::logging::Outcome::Ok)],
+        ),
+        CheckOutcome::Failed => crate::logging::event(
+            crate::logging::EventKind::UpdateCheck,
+            &[crate::logging::Field::Outcome(
+                crate::logging::Outcome::Error,
+            )],
+        ),
     }
 }
 
@@ -523,26 +639,11 @@ fn parse_version(body: &str) -> Option<String> {
     Some(s.trim_start_matches('v').to_string())
 }
 
-/// True when `latest` is a strictly higher semver than `current`. Both accept an
-/// optional leading `v`; any pre-release/build suffix on a component is ignored.
+/// True when `latest` is a strictly higher semantic version than `current`.
+/// Both accept an optional leading `v`; prerelease ordering follows semver.
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    semver(latest) > semver(current)
-}
-
-fn semver(s: &str) -> (u32, u32, u32) {
-    let s = s.trim().trim_start_matches('v');
-    let mut it = s.split('.').map(|part| {
-        part.split(|c: char| !c.is_ascii_digit())
-            .next()
-            .unwrap_or("")
-            .parse::<u32>()
-            .unwrap_or(0)
-    });
-    (
-        it.next().unwrap_or(0),
-        it.next().unwrap_or(0),
-        it.next().unwrap_or(0),
-    )
+    let parse = |version: &str| semver::Version::parse(version.trim().trim_start_matches('v')).ok();
+    matches!((parse(latest), parse(current)), (Some(latest), Some(current)) if latest > current)
 }
 
 /// Fetch a URL with `curl`, then `wget` — whichever is installed. `None` on any
@@ -583,8 +684,12 @@ mod tests {
         assert!(is_newer("1.0.0", "0.9.9"));
         assert!(!is_newer("0.9.2", "0.9.2"), "same version is not newer");
         assert!(!is_newer("0.9.1", "0.9.2"), "older is not newer");
-        // A pre-release suffix on a component doesn't break the compare.
+        // Prereleases preserve full semantic-version ordering.
         assert!(is_newer("0.9.3-rc1", "0.9.2"));
+        assert!(!is_newer("1.0.0-rc.1", "1.0.0"));
+        assert!(is_newer("1.0.0", "1.0.0-rc.1"));
+        assert!(is_newer("1.0.0-rc.2", "1.0.0-rc.1"));
+        assert!(!is_newer("invalid", "1.0.0"));
     }
 
     /// The whole chain, off the network: fetch, parse, compare, report. A file
@@ -643,6 +748,31 @@ mod tests {
         // Garbage / missing field → None (no false "update available").
         assert_eq!(parse_version("not json"), None);
         assert_eq!(parse_version(r#"{"other":1}"#), None);
+    }
+
+    #[test]
+    fn structured_release_status_validates_a_local_manifest() {
+        let dir = std::env::temp_dir().join(format!("luvus-release-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("latest.json");
+        std::fs::write(&path, r#"{"version":"99.0.0"}"#).unwrap();
+
+        let status = release_status_at(&format!("file://{}", path.display())).unwrap();
+        assert_eq!(status.current, CURRENT);
+        assert_eq!(status.latest, "99.0.0");
+        assert!(status.available);
+
+        std::fs::write(&path, format!(r#"{{"version":"{CURRENT}-rc.1"}}"#)).unwrap();
+        assert!(
+            !release_status_at(&format!("file://{}", path.display()))
+                .unwrap()
+                .available,
+            "a prerelease of the current stable version is not an update"
+        );
+
+        std::fs::write(&path, r#"{"version":"../../bad"}"#).unwrap();
+        assert!(release_status_at(&format!("file://{}", path.display())).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

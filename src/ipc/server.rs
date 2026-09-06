@@ -26,13 +26,7 @@ use crate::ui;
 const DEFAULT_SIZE: (u16, u16) = (120, 32);
 /// Minimum time between rendered frames — the fps cap during activity (60fps).
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-/// A genuinely quiet server only needs a bounded maintenance/signalling audit.
-/// This is still short enough for clean signal shutdown while cutting idle
-/// timeout wakes by more than 80% compared with the former 33 ms poll.
-const IDLE_INTERVAL: Duration = Duration::from_millis(250);
-/// Detection hysteresis and parked API workflows retain their established
-/// 100 ms cadence while they have time-sensitive work.
-const FAST_IDLE_INTERVAL: Duration = Duration::from_millis(100);
+const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 fn frame_wait(elapsed_since_attempt: Duration) -> Duration {
     FRAME_INTERVAL
@@ -54,12 +48,19 @@ static CHANGED_PROJECTIONS: AtomicU64 = AtomicU64::new(0);
 static UNCHANGED_PROJECTIONS: AtomicU64 = AtomicU64::new(0);
 static FRAMES_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static FRAMES_BACKPRESSURED: AtomicU64 = AtomicU64::new(0);
+static FULL_TERMINAL_PROJECTIONS: AtomicU64 = AtomicU64::new(0);
+static PARTIAL_TERMINAL_PROJECTIONS: AtomicU64 = AtomicU64::new(0);
+static RETAINED_RENDER_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_DAMAGE_ROWS: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_DAMAGE_CELLS: AtomicU64 = AtomicU64::new(0);
 static LOOP_EVENT_WAKES: AtomicU64 = AtomicU64::new(0);
 static LOOP_DEADLINE_WAKES: AtomicU64 = AtomicU64::new(0);
 static CAUSE_VISIBLE_PTY: AtomicU64 = AtomicU64::new(0);
 static CAUSE_BACKGROUND_PTY: AtomicU64 = AtomicU64::new(0);
 static CAUSE_DETECTION: AtomicU64 = AtomicU64::new(0);
 static CAUSE_METADATA: AtomicU64 = AtomicU64::new(0);
+// Retained in diagnostics for consumers that compare snapshots across releases.
+// Working-state indicators are static, so this counter remains zero.
 static CAUSE_ANIMATION: AtomicU64 = AtomicU64::new(0);
 static CAUSE_UI: AtomicU64 = AtomicU64::new(0);
 static CAUSE_API_MAINTENANCE: AtomicU64 = AtomicU64::new(0);
@@ -80,6 +81,13 @@ pub fn performance_snapshot() -> serde_json::Value {
         "unchanged_projections": UNCHANGED_PROJECTIONS.load(Ordering::Relaxed),
         "frames_enqueued": FRAMES_ENQUEUED.load(Ordering::Relaxed),
         "frames_backpressured": FRAMES_BACKPRESSURED.load(Ordering::Relaxed),
+        "terminal_projection": {
+            "full": FULL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed),
+            "partial": PARTIAL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed),
+            "fallbacks": RETAINED_RENDER_FALLBACKS.load(Ordering::Relaxed),
+            "damage_rows": TERMINAL_DAMAGE_ROWS.load(Ordering::Relaxed),
+            "damage_cells": TERMINAL_DAMAGE_CELLS.load(Ordering::Relaxed),
+        },
         "render_causes": {
             "visible_pty": CAUSE_VISIBLE_PTY.load(Ordering::Relaxed),
             "background_pty": CAUSE_BACKGROUND_PTY.load(Ordering::Relaxed),
@@ -105,7 +113,6 @@ enum RenderCause {
     VisiblePty,
     Detection,
     Metadata,
-    Animation,
     UserInterface,
     ApiOrMaintenance,
     ForcedRepair,
@@ -123,7 +130,6 @@ impl RenderCause {
             Self::VisiblePty => &CAUSE_VISIBLE_PTY,
             Self::Detection => &CAUSE_DETECTION,
             Self::Metadata => &CAUSE_METADATA,
-            Self::Animation => &CAUSE_ANIMATION,
             Self::UserInterface => &CAUSE_UI,
             Self::ApiOrMaintenance => &CAUSE_API_MAINTENANCE,
             Self::ForcedRepair => &CAUSE_FORCED,
@@ -162,6 +168,10 @@ impl RenderRequest {
 
     fn needs_render(self) -> bool {
         self.causes != 0
+    }
+
+    fn is_visible_pty_only(self) -> bool {
+        self.causes == RenderCause::VisiblePty.bit()
     }
 
     fn clear(&mut self) {
@@ -212,8 +222,17 @@ struct ClientState {
     last_frame: Option<protocol::FrameData>,
     behind: bool,
     force_full: bool,
+    retained_pane_content: Vec<(crate::ids::PaneId, Rect)>,
+    retained_ready: bool,
     last_activity: u64,
-    animation_mask: ui::AnimationMask,
+}
+
+#[derive(Default)]
+struct RenderScratch {
+    damage: HashMap<crate::ids::PaneId, crate::terminal::vt::DamageSnapshot>,
+    generations: HashMap<crate::ids::PaneId, u64>,
+    order: Vec<u64>,
+    dead: Vec<u64>,
 }
 
 impl ClientState {
@@ -233,8 +252,9 @@ impl ClientState {
             last_frame: None,
             behind: false,
             force_full: true,
+            retained_pane_content: Vec::new(),
+            retained_ready: false,
             last_activity,
-            animation_mask: ui::AnimationMask::default(),
         }
     }
 
@@ -257,16 +277,62 @@ pub fn run() -> Result<()> {
     let client_sock = persist::client_socket_path();
     // A responsive listener means another server owns this state directory.
     // Do not reclaim either socket or start a competing process.
-    if transport::connect(&sock).is_ok() || transport::connect(&client_sock).is_ok() {
+    if transport::endpoint_exists(&sock, Duration::from_millis(50))
+        || transport::endpoint_exists(&client_sock, Duration::from_millis(50))
+    {
         return Ok(());
     }
+    let _logging = crate::logging::init(crate::logging::Role::Server);
+    crate::logging::event(
+        crate::logging::EventKind::ServerStart,
+        &[crate::logging::Field::Role(crate::logging::Role::Server)],
+    );
     api::set_socket_path(sock.clone());
 
     let events = api::new_bus();
-    let api_listener = api::bind_server(&sock, &startup_lock)?;
+    let api_listener = match api::bind_server(&sock, &startup_lock) {
+        Ok(listener) => {
+            crate::logging::event(
+                crate::logging::EventKind::ListenerBind,
+                &[crate::logging::Field::Listener(
+                    crate::logging::Listener::Uhp,
+                )],
+            );
+            listener
+        }
+        Err(error) => {
+            crate::logging::event(
+                crate::logging::EventKind::ListenerBindFailed,
+                &[
+                    crate::logging::Field::Listener(crate::logging::Listener::Uhp),
+                    crate::logging::Field::ErrorCode(
+                        crate::logging::SafeId::new("io").expect("static id is valid"),
+                    ),
+                ],
+            );
+            return Err(error.into());
+        }
+    };
     let client_listener = match bind_client_listener(&client_sock, &startup_lock) {
-        Ok(listener) => listener,
+        Ok(listener) => {
+            crate::logging::event(
+                crate::logging::EventKind::ListenerBind,
+                &[crate::logging::Field::Listener(
+                    crate::logging::Listener::Client,
+                )],
+            );
+            listener
+        }
         Err(err) => {
+            crate::logging::event(
+                crate::logging::EventKind::ListenerBindFailed,
+                &[
+                    crate::logging::Field::Listener(crate::logging::Listener::Client),
+                    crate::logging::Field::ErrorCode(
+                        crate::logging::SafeId::new("io").expect("static id is valid"),
+                    ),
+                ],
+            );
             drop(api_listener);
             let _ = remove_unbound_socket(&sock);
             return Err(err.into());
@@ -276,6 +342,12 @@ pub fn run() -> Result<()> {
     let mut app = match App::restore_or_new(DEFAULT_SIZE.0, DEFAULT_SIZE.1, tx.clone()) {
         Ok(app) => app,
         Err(err) => {
+            crate::logging::event(
+                crate::logging::EventKind::PersistRestore,
+                &[crate::logging::Field::Outcome(
+                    crate::logging::Outcome::Error,
+                )],
+            );
             drop(client_listener);
             drop(api_listener);
             let _ = remove_unbound_socket(&client_sock);
@@ -285,13 +357,41 @@ pub fn run() -> Result<()> {
     };
     app.events = events.clone();
     app.server_mode = true;
-    shutdown::install();
+    app.reconcile_automations();
+    shutdown::install(tx.clone());
 
     let mut terminal_theme_enabled = app.config.theme == "terminal";
     let terminal_theme = Arc::new(AtomicBool::new(terminal_theme_enabled));
     api::start_server(api_listener, tx.clone(), events);
     start_client_listener(client_listener, tx.clone(), terminal_theme.clone());
     drop(startup_lock);
+    let restored_workspaces = app.workspaces.len() as u64;
+    let restored_tabs = app
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.tabs.len() as u64)
+        .sum();
+    let restored_panes = app.panes.len() as u64;
+    crate::logging::event(
+        crate::logging::EventKind::PersistRestore,
+        &[
+            crate::logging::Field::Outcome(crate::logging::Outcome::Ok),
+            crate::logging::Field::RestoreWorkspaces(restored_workspaces),
+            crate::logging::Field::RestoreTabs(restored_tabs),
+            crate::logging::Field::RestorePanes(restored_panes),
+            crate::logging::Field::RestoreSkipped(0),
+        ],
+    );
+    crate::logging::event(
+        crate::logging::EventKind::ServerReady,
+        &[
+            crate::logging::Field::RestoreWorkspaces(restored_workspaces),
+            crate::logging::Field::RestoreTabs(restored_tabs),
+            crate::logging::Field::RestorePanes(restored_panes),
+            crate::logging::Field::RestoreSkipped(0),
+        ],
+    );
+    let _pid_file = persist::ServerPidFile::claim();
     // The session is restored and the API socket is listening, so a module's
     // `[[startup]]` hooks can now call back in — this is where a module
     // repaints the docks it owns (docs/13 §3.7).
@@ -304,19 +404,17 @@ pub fn run() -> Result<()> {
 
     let mut clients: Clients = HashMap::new();
     let mut foreground: Option<u64> = None;
+    let mut render_scratch = RenderScratch::default();
     // Geometry last committed to the shared PTYs and interactive hit-test state.
     // Secondary-client projections never change it.
     let mut interactive_size = DEFAULT_SIZE;
     let mut next_activity = 1u64;
     let mut last_render_attempt = Instant::now();
     let mut last_save = Instant::now();
+    let mut immediate_save_attempted = false;
     // Un-rendered activity waiting for the frame cap to expire — drives a trailing
     // render so a change that lands mid-interval isn't stuck until the next event.
     let mut render_request = RenderRequest::default();
-    // Advances only a spinner that the renderer reported visible. Its deadline
-    // participates in the wait calculation, so quiet servers pay no timer cost.
-    let mut last_spin = Instant::now();
-    const SPIN_INTERVAL: Duration = Duration::from_millis(100);
     // Fallback re-arm cadence for PTY wake coalescing when frames aren't being
     // rendered (no client attached / nothing dirty): readers may announce new
     // output ~10x/s. While rendering, the render path re-arms at the frame rate.
@@ -324,45 +422,76 @@ pub fn run() -> Result<()> {
     const REARM_INTERVAL: Duration = Duration::from_millis(100);
 
     loop {
-        // Pending + clients attached → wait only until the cap frees up (flush
-        // promptly); otherwise tick at the coarser idle cadence.
-        let wait = if render_request.needs_render() && !clients.is_empty() {
-            frame_wait(last_render_attempt.elapsed())
+        // Pending + clients attached → wait only until the cap frees up.
+        // Otherwise sleep until the next real deadline, or block on the
+        // channel when nothing is due (PTY/API/client/signal wake the loop).
+        let now = Instant::now();
+        let rearm_interval = if app.has_history_maintenance() {
+            Duration::from_millis(1)
         } else {
-            let mut idle = if app.needs_fast_runtime_tick(Instant::now()) {
-                FAST_IDLE_INTERVAL
-            } else {
-                IDLE_INTERVAL
-            };
-            if clients
-                .values()
-                .any(|client| client.animation_mask.has_working_spinner())
-            {
-                idle = idle.min(SPIN_INTERVAL.saturating_sub(last_spin.elapsed()));
+            REARM_INTERVAL
+        };
+        let persist_due = !app.session_save_inflight
+            && ((app.persist_session_now && !immediate_save_attempted)
+                || (app.session_dirty && last_save.elapsed() >= SESSION_SAVE_DEBOUNCE));
+        let rearm_due = app.has_pending_pty_output() && last_rearm.elapsed() >= rearm_interval;
+        let received = if persist_due || rearm_due {
+            // Already-due persist/re-arm must not `recv_timeout(0)`: that busy-loops
+            // until the 100ms re-arm cadence elapses.
+            None
+        } else if render_request.needs_render() && !clients.is_empty() {
+            match rx.recv_timeout(frame_wait(last_render_attempt.elapsed())) {
+                Ok(ev) => Some(ev),
+                Err(RecvTimeoutError::Timeout) => {
+                    LOOP_DEADLINE_WAKES.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            let mut deadline = app.next_runtime_deadline(now, !clients.is_empty());
+            if app.session_dirty && !app.session_save_inflight {
+                App::sooner_deadline(&mut deadline, last_save + SESSION_SAVE_DEBOUNCE);
             }
             if app.has_pending_pty_output() {
-                idle = idle.min(REARM_INTERVAL.saturating_sub(last_rearm.elapsed()));
+                App::sooner_deadline(&mut deadline, last_rearm + rearm_interval);
             }
-            idle.max(Duration::from_millis(1))
+            match deadline.map(|at| at.saturating_duration_since(now)) {
+                Some(timeout) if !timeout.is_zero() => match rx.recv_timeout(timeout) {
+                    Ok(ev) => Some(ev),
+                    Err(RecvTimeoutError::Timeout) => {
+                        LOOP_DEADLINE_WAKES.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                },
+                Some(_) => None,
+                None if shutdown::wake_available() => match rx.recv() {
+                    Ok(ev) => Some(ev),
+                    Err(_) => break,
+                },
+                None => match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(ev) => Some(ev),
+                    Err(RecvTimeoutError::Timeout) => {
+                        LOOP_DEADLINE_WAKES.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                },
+            }
         };
-        match rx.recv_timeout(wait) {
-            Ok(ev) => {
-                LOOP_EVENT_WAKES.fetch_add(1, Ordering::Relaxed);
-                let source = event_render_source(&app, &ev);
-                let changed = apply(
-                    ev,
-                    &mut app,
-                    &mut clients,
-                    &mut foreground,
-                    &mut interactive_size,
-                    &mut next_activity,
-                );
-                record_event_render_request(source, changed, &mut render_request);
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                LOOP_DEADLINE_WAKES.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
+        if let Some(ev) = received {
+            LOOP_EVENT_WAKES.fetch_add(1, Ordering::Relaxed);
+            let source = event_render_source(&app, &ev);
+            let changed = apply(
+                ev,
+                &mut app,
+                &mut clients,
+                &mut foreground,
+                &mut interactive_size,
+                &mut next_activity,
+            );
+            record_event_render_request(source, changed, &mut render_request);
         }
         while let Ok(ev) = rx.try_recv() {
             let source = event_render_source(&app, &ev);
@@ -403,25 +532,16 @@ pub fn run() -> Result<()> {
             );
             break;
         }
-        // The last node closed (docs/43 §3.3): the *session* is over, so every
-        // window goes away — not just the foreground one, which would leave other
-        // clients staring at a session with nothing in it. The server stays up
-        // with no nodes; `server stop` is still what ends it.
-        if app.end_session {
-            app.end_session = false;
-            // Detach is a reliable control message. It does not compete with the
-            // one-frame backpressure slot, so a busy or remote client cannot
-            // lose it and cannot block this loop.
-            for (_, client) in clients.drain() {
-                let _ = client.send_control(ServerMessage::Detach);
-            }
-            foreground = None;
-            // Persist immediately rather than waiting out the 2s debounce: the
-            // snapshot is now empty, which *removes* `session.json`, and a kill
-            // inside that window would otherwise leave the closed nodes on disk
-            // to be restored on the next start.
-            persist::save(&app);
-            app.session_dirty = false;
+        if !app.persist_session_now {
+            immediate_save_attempted = false;
+        }
+        // Closing the final project bypasses the debounce once. Failed writes
+        // retain both flags and retry at the normal cadence instead of hot-looping.
+        let immediate_save_due = app.persist_session_now && !immediate_save_attempted;
+        let debounced_save_due = app.session_dirty && last_save.elapsed() >= SESSION_SAVE_DEBOUNCE;
+        if !app.session_save_inflight && (immediate_save_due || debounced_save_due) {
+            immediate_save_attempted = app.persist_session_now;
+            app.schedule_session_save();
             last_save = Instant::now();
         }
         if app.detach_requested {
@@ -448,16 +568,10 @@ pub fn run() -> Result<()> {
             }
         }
 
-        if app.session_dirty && last_save.elapsed() > Duration::from_secs(2) {
-            persist::save(&app);
-            app.session_dirty = false;
-            last_save = Instant::now();
-        }
-
         // A state transition here (e.g. a silent agent reaching Done) has no PtyData
         // to ride on, so repaint when detection reports a visible change.
         let now = Instant::now();
-        if app.detect_tick(now) {
+        if app.detect_tick_with(now, !clients.is_empty()) {
             render_request.record(RenderCause::Detection);
         }
         // Parked `wait.output` deadlines lapse on the tick (docs/81); a no-op
@@ -466,12 +580,14 @@ pub fn run() -> Result<()> {
         app.tick_agent_waits(now);
         app.tick_agent_workflows(now);
         app.tick_backend_revision_waits(now);
+        if app.tick_automations(crate::automation::unix_now()) {
+            render_request.record(RenderCause::Detection);
+        }
         for msg in app.pending_notify.drain(..) {
             broadcast(&mut clients, ServerMessage::Notify(msg));
         }
-        if app.pending_sound {
-            app.pending_sound = false;
-            broadcast(&mut clients, ServerMessage::Sound);
+        if let Some(signal) = app.pending_sound.take() {
+            broadcast(&mut clients, ServerMessage::Sound(signal));
         }
         // A finished mouse selection copies to the client's clipboard (OSC 52).
         if let Some(url) = app.pending_open_url.take() {
@@ -484,6 +600,9 @@ pub fn run() -> Result<()> {
         if app.tick_toast(Instant::now()) {
             render_request.record(RenderCause::Metadata);
         }
+        if app.tick_copy_highlight(Instant::now()) {
+            render_request.record(RenderCause::Metadata);
+        }
         // Likewise for an expired search-jump flash (docs/63).
         if app.tick_search_flash(Instant::now()) {
             render_request.record(RenderCause::Metadata);
@@ -491,22 +610,14 @@ pub fn run() -> Result<()> {
         if app.tick_bar_notifications(now) {
             render_request.record(RenderCause::Metadata);
         }
-        // Animate the sidebar spinner while any agent is working: advance the
-        // frame and mark dirty so the diff sends only the changed dot cell.
-        if last_spin.elapsed() >= SPIN_INTERVAL
-            && clients
-                .values()
-                .any(|client| client.animation_mask.has_working_spinner())
-        {
-            app.spinner = app.spinner.wrapping_add(1);
-            last_spin = Instant::now();
-            render_request.record(RenderCause::Animation);
-        }
         // Fallback re-arm (the render path below re-arms at the frame rate): a
         // flag still set here means un-rendered output → schedule a frame.
-        if last_rearm.elapsed() >= REARM_INTERVAL {
+        if last_rearm.elapsed() >= rearm_interval {
             last_rearm = Instant::now();
-            let (visible, background) = app.rearm_pty_notify_by_visibility();
+            let (visible, background, title_changed) = app.rearm_pty_notify_by_visibility();
+            if title_changed {
+                render_request.record(RenderCause::Metadata);
+            }
             if visible {
                 render_request.record_visible_pty();
             }
@@ -538,12 +649,17 @@ pub fn run() -> Result<()> {
                 &mut foreground,
                 &mut interactive_size,
                 forced,
+                render_request.is_visible_pty_only(),
+                &mut render_scratch,
             );
             render_request.clear();
             // Re-arm the PTY readers now that their output is on screen. A flag
             // set during this frame = more output already waiting → stay dirty
             // so the burst keeps rendering at the frame cap, tail included.
-            let (visible, background) = app.rearm_pty_notify_by_visibility();
+            let (visible, background, title_changed) = app.rearm_pty_notify_by_visibility();
+            if title_changed {
+                render_request.record(RenderCause::Metadata);
+            }
             if visible {
                 render_request.record_visible_pty();
             }
@@ -553,7 +669,7 @@ pub fn run() -> Result<()> {
         }
     }
 
-    persist::save(&app);
+    app.finish_session_persistence();
     Ok(())
 }
 
@@ -575,6 +691,15 @@ fn apply(
             rows,
             terminal_colors,
         } => {
+            crate::logging::event(
+                crate::logging::EventKind::ServerClientAttach,
+                &[
+                    crate::logging::Field::ClientId(id),
+                    crate::logging::Field::Cols(u64::from(cols)),
+                    crate::logging::Field::Rows(u64::from(rows)),
+                    crate::logging::Field::ProtocolVersion(u64::from(protocol::PROTOCOL_VERSION)),
+                ],
+            );
             let activity = *next_activity;
             *next_activity = next_activity.saturating_add(1);
             clients.insert(
@@ -592,9 +717,17 @@ fn apply(
             );
             *foreground = Some(id);
             apply_foreground_theme(app, clients, *foreground);
+            app.mark_runtime_scans_dirty();
             true
         }
         AppEvent::ClientDetach { id } => {
+            crate::logging::event(
+                crate::logging::EventKind::ServerClientDetach,
+                &[
+                    crate::logging::Field::ClientId(id),
+                    crate::logging::Field::Reason(crate::logging::Reason::Eof),
+                ],
+            );
             let was_foreground = *foreground == Some(id);
             clients.remove(&id);
             if was_foreground {
@@ -611,6 +744,14 @@ fn apply(
             *next_activity = next_activity.saturating_add(1);
 
             if let ClientInput::Resize(cols, rows) = input {
+                crate::logging::event(
+                    crate::logging::EventKind::ServerClientResize,
+                    &[
+                        crate::logging::Field::ClientId(id),
+                        crate::logging::Field::Cols(u64::from(cols)),
+                        crate::logging::Field::Rows(u64::from(rows)),
+                    ],
+                );
                 client.size = (cols.max(1), rows.max(1));
                 // Resize/focus repair is local to this terminal. Its next frame
                 // must be complete, but other clients keep their diff baselines.
@@ -628,9 +769,10 @@ fn apply(
             }
             let target_size = clients.get(&id).map(|client| client.size);
             if promoted || target_size.is_some_and(|size| size != *interactive_size) {
-                let disconnected = clients
-                    .get_mut(&id)
-                    .is_some_and(|client| render_client(app, client, true, false).disconnected);
+                let no_damage = HashMap::new();
+                let disconnected = clients.get_mut(&id).is_some_and(|client| {
+                    render_client(app, client, true, false, false, &no_damage).disconnected
+                });
                 if disconnected {
                     clients.remove(&id);
                     *foreground = latest_client(clients);
@@ -689,6 +831,9 @@ enum EventRenderSource {
 fn event_render_source(app: &App, event: &AppEvent) -> EventRenderSource {
     match event {
         AppEvent::PtyData(id) if app.pane_is_visible(*id) => EventRenderSource::VisiblePty,
+        AppEvent::PtyData(id) if app.hidden_title_changed(*id) => {
+            EventRenderSource::Cause(RenderCause::Metadata)
+        }
         AppEvent::PtyData(_) => EventRenderSource::HiddenPty,
         AppEvent::ClientConnected { .. }
         | AppEvent::ClientInput {
@@ -735,37 +880,166 @@ fn render_clients(
     foreground: &mut Option<u64>,
     interactive_size: &mut (u16, u16),
     force_all: bool,
+    visible_pty_only: bool,
+    scratch: &mut RenderScratch,
 ) -> bool {
     RENDER_PASSES.fetch_add(1, Ordering::Relaxed);
+    if clients.is_empty() {
+        return false;
+    }
     if foreground.is_none_or(|id| !clients.contains_key(&id)) {
         *foreground = latest_client(clients);
         apply_foreground_theme(app, clients, *foreground);
     }
 
-    let mut order: Vec<u64> = clients.keys().copied().collect();
-    order.sort_unstable_by_key(|id| (*foreground != Some(*id), *id));
-    let mut dead = Vec::new();
+    let retained_client_ready = foreground
+        .and_then(|id| clients.get(&id))
+        .is_some_and(|client| {
+            client.retained_ready
+                && !client.force_full
+                && !client.behind
+                && client.last_frame.is_some()
+        });
+    let partial_candidate =
+        visible_pty_only && !force_all && retained_client_ready && ui::retained_pty_eligible(app);
+    if partial_candidate {
+        capture_visible_terminal_damage(app, &mut scratch.damage);
+    } else {
+        capture_visible_terminal_generations(app, &mut scratch.generations);
+    }
+    let partial_pass = partial_candidate
+        && !scratch.damage.is_empty()
+        && scratch
+            .damage
+            .values()
+            .all(|snapshot| snapshot.kind == crate::terminal::vt::DamageKind::Partial);
+
+    scratch.order.clear();
+    scratch.order.extend(clients.keys().copied());
+    scratch
+        .order
+        .sort_unstable_by_key(|id| (*foreground != Some(*id), *id));
+    scratch.dead.clear();
     let mut presented = false;
-    for id in order {
+    for id in scratch.order.iter().copied() {
         let interactive = *foreground == Some(id);
         if let Some(client) = clients.get_mut(&id) {
-            let outcome = render_client(app, client, interactive, force_all);
+            let outcome = render_client(
+                app,
+                client,
+                interactive,
+                force_all,
+                partial_pass,
+                &scratch.damage,
+            );
             presented |= outcome.enqueued;
             if outcome.disconnected {
-                dead.push(id);
+                scratch.dead.push(id);
             } else if interactive {
                 *interactive_size = client.size;
             }
         }
     }
-    for id in dead {
+    for id in scratch.dead.drain(..) {
         clients.remove(&id);
     }
     if foreground.is_some_and(|id| !clients.contains_key(&id)) {
         *foreground = latest_client(clients);
         apply_foreground_theme(app, clients, *foreground);
     }
+    if partial_candidate {
+        acknowledge_visible_terminal_damage(app, &mut scratch.damage);
+    } else {
+        acknowledge_visible_terminal_generations(app, &mut scratch.generations);
+    }
     presented
+}
+
+fn capture_visible_terminal_generations(
+    app: &App,
+    generations: &mut HashMap<crate::ids::PaneId, u64>,
+) {
+    generations.clear();
+    if app.workspaces.is_empty()
+        || app.active_is_git()
+        || app.active_is_orch()
+        || app.active_is_mission()
+    {
+        return;
+    }
+    let pane_ids = app.layout().leaves();
+    generations.reserve(pane_ids.len());
+    for id in pane_ids {
+        let Some(pane) = app.panes.get(&id) else {
+            continue;
+        };
+        if let Ok(engine) = pane.engine.lock() {
+            generations.insert(id, engine.output_generation());
+        }
+    }
+}
+
+fn capture_visible_terminal_damage(
+    app: &App,
+    snapshots: &mut HashMap<crate::ids::PaneId, crate::terminal::vt::DamageSnapshot>,
+) {
+    snapshots.clear();
+    if app.workspaces.is_empty()
+        || app.active_is_git()
+        || app.active_is_orch()
+        || app.active_is_mission()
+    {
+        return;
+    }
+    let pane_ids = app.layout().leaves();
+    snapshots.reserve(pane_ids.len());
+    for id in pane_ids {
+        let Some(pane) = app.panes.get(&id) else {
+            continue;
+        };
+        if let Ok(mut engine) = pane.engine.lock() {
+            let snapshot = engine.damage_snapshot();
+            TERMINAL_DAMAGE_ROWS.fetch_add(snapshot.rows.len() as u64, Ordering::Relaxed);
+            TERMINAL_DAMAGE_CELLS.fetch_add(
+                snapshot
+                    .rows
+                    .iter()
+                    .map(|row| row.cells.len() as u64)
+                    .sum::<u64>(),
+                Ordering::Relaxed,
+            );
+            snapshots.insert(id, snapshot);
+        }
+    }
+}
+
+fn acknowledge_visible_terminal_damage(
+    app: &App,
+    snapshots: &mut HashMap<crate::ids::PaneId, crate::terminal::vt::DamageSnapshot>,
+) {
+    for (id, snapshot) in snapshots.drain() {
+        let Some(pane) = app.panes.get(&id) else {
+            continue;
+        };
+        if let Ok(mut engine) = pane.engine.lock() {
+            let _ = engine.acknowledge_damage(snapshot.generation);
+            engine.recycle_damage_snapshot(snapshot);
+        }
+    }
+}
+
+fn acknowledge_visible_terminal_generations(
+    app: &App,
+    generations: &mut HashMap<crate::ids::PaneId, u64>,
+) {
+    for (id, generation) in generations.drain() {
+        let Some(pane) = app.panes.get(&id) else {
+            continue;
+        };
+        if let Ok(mut engine) = pane.engine.lock() {
+            let _ = engine.acknowledge_damage(generation);
+        }
+    }
 }
 
 /// Render and enqueue one client's next frame. Returns true when its writer is
@@ -775,6 +1049,8 @@ fn render_client(
     client: &mut ClientState,
     interactive: bool,
     force_all: bool,
+    partial_pass: bool,
+    damage: &HashMap<crate::ids::PaneId, crate::terminal::vt::DamageSnapshot>,
 ) -> RenderClientOutcome {
     CLIENT_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
     let area = Rect::new(0, 0, client.size.0, client.size.1);
@@ -782,20 +1058,45 @@ fn render_client(
         client.render_buf = Buffer::empty(area);
         client.last_frame = None;
         client.force_full = true;
-    } else {
-        client.render_buf.reset();
+        client.retained_ready = false;
     }
 
-    let (cursor, animation_mask) = {
+    let may_patch = partial_pass
+        && client.retained_ready
+        && !client.force_full
+        && !client.behind
+        && client.last_frame.is_some();
+    let patched = if may_patch {
+        let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
+        ui::patch_terminal_damage(&mut target, app, &client.retained_pane_content, damage)
+            .map(|()| (target.cursor(), target.cursor_visible()))
+            .ok()
+    } else {
+        None
+    };
+
+    let (cursor, cursor_visible) = if let Some(cursor) = patched {
+        PARTIAL_TERMINAL_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
+        cursor
+    } else {
+        if partial_pass {
+            RETAINED_RENDER_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        }
+        FULL_TERMINAL_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
+        client.render_buf.reset();
         let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
         if interactive {
             ui::render_into(&mut target, app);
+            client
+                .retained_pane_content
+                .clone_from(&app.pane_content_rects);
+            client.retained_ready = true;
         } else {
-            ui::render_projection(&mut target, app);
+            client.retained_pane_content = ui::render_projection(&mut target, app);
+            client.retained_ready = true;
         }
-        (target.cursor(), target.animation_mask())
+        (target.cursor(), target.cursor_visible())
     };
-    client.animation_mask = animation_mask;
 
     let full = force_all
         || client.force_full
@@ -805,15 +1106,20 @@ fn render_client(
                 || previous.height != client.render_buf.area.height
         });
     let message = if full {
-        client.last_frame = Some(protocol::frame_from_buffer(&client.render_buf, cursor));
+        client.last_frame = Some(protocol::frame_from_buffer(
+            &client.render_buf,
+            cursor,
+            cursor_visible,
+        ));
         Some(ServerMessage::Frame(
             client.last_frame.as_ref().expect("frame stored").clone(),
         ))
     } else {
         let previous = client.last_frame.as_mut().expect("frame baseline exists");
-        let cursor_moved = previous.cursor != cursor;
+        let cursor_moved = previous.cursor != cursor || previous.cursor_visible != cursor_visible;
         let runs = protocol::diff_buffer(previous, &client.render_buf);
         previous.cursor = cursor;
+        previous.cursor_visible = cursor_visible;
         if runs.is_empty() && !cursor_moved {
             None
         } else {
@@ -822,6 +1128,7 @@ fn render_client(
                 height: previous.height,
                 runs,
                 cursor,
+                cursor_visible,
             }))
         }
     };
@@ -844,6 +1151,7 @@ fn render_client(
         Err(FrameSendError::Full) => {
             FRAMES_BACKPRESSURED.fetch_add(1, Ordering::Relaxed);
             client.behind = true;
+            client.retained_ready = false;
             RenderClientOutcome::default()
         }
         Err(FrameSendError::Disconnected) => RenderClientOutcome {
@@ -910,6 +1218,13 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             rows,
         }) => {
             if version != protocol::PROTOCOL_VERSION {
+                crate::logging::event(
+                    crate::logging::EventKind::ServerClientHandshakeRejected,
+                    &[
+                        crate::logging::Field::Reason(crate::logging::Reason::VersionMismatch),
+                        crate::logging::Field::ProtocolVersion(u64::from(version)),
+                    ],
+                );
                 let _ = protocol::write_message(
                     &mut writer,
                     &ServerMessage::Welcome {
@@ -1057,23 +1372,84 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
 }
 
 /// Graceful shutdown on a termination signal. The handler only flips an atomic
-/// flag (the only async-signal-safe thing to do); the event loop polls it every
-/// idle tick (≤250ms) and exits through the normal path — clients notified, the
-/// session saved — instead of dying mid-state on SIGTERM (logout, `kill`,
-/// system shutdown).
+/// and writes a self-pipe (async-signal-safe); a waiter thread then posts
+/// `AppEvent::Shutdown` so a sleeping event loop still exits through the normal
+/// path — clients notified, the session saved — instead of dying mid-state on
+/// SIGTERM (logout, `kill`, system shutdown).
 #[cfg(unix)]
 mod shutdown {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::io;
+    use std::os::fd::RawFd;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::mpsc::Sender;
+    use std::thread;
+
+    use crate::event::AppEvent;
 
     static FLAG: AtomicBool = AtomicBool::new(false);
+    static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+    static WAKE_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
     pub fn requested() -> bool {
         FLAG.load(Ordering::Relaxed)
     }
 
-    pub fn install() {
+    pub fn wake_available() -> bool {
+        WAKE_AVAILABLE.load(Ordering::Relaxed)
+    }
+
+    pub fn install(tx: Sender<AppEvent>) {
+        let mut fds = [-1, -1];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            install_handler();
+            return;
+        }
+        if set_cloexec(fds[0]).is_err() || set_nonblocking_cloexec(fds[1]).is_err() {
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            install_handler();
+            return;
+        }
+        WRITE_FD.store(fds[1], Ordering::Relaxed);
+        let read_fd = fds[0];
+        install_handler();
+        if thread::Builder::new()
+            .name("luvus-signal".into())
+            .spawn(move || wait_for_signal(read_fd, tx))
+            .is_ok()
+        {
+            WAKE_AVAILABLE.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn wait_for_signal(read_fd: RawFd, tx: Sender<AppEvent>) {
+        let mut buf = [0u8; 8];
+        loop {
+            let count = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if count > 0 {
+                FLAG.store(true, Ordering::Relaxed);
+                let _ = tx.send(AppEvent::Shutdown);
+                continue;
+            }
+            if count < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+
+    fn install_handler() {
         extern "C" fn on_signal(_sig: libc::c_int) {
             FLAG.store(true, Ordering::Relaxed);
+            let fd = WRITE_FD.load(Ordering::Relaxed);
+            if fd >= 0 {
+                write_wake_preserving_errno(fd);
+            }
         }
         unsafe {
             let h = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -1082,16 +1458,110 @@ mod shutdown {
             libc::signal(libc::SIGINT, h);
         }
     }
+
+    fn write_wake_preserving_errno(fd: RawFd) {
+        let byte = 1u8;
+        unsafe {
+            let errno = errno_location();
+            let saved_errno = errno.as_ref().copied();
+            let _ = libc::write(fd, (&byte as *const u8).cast(), 1);
+            if let Some(saved_errno) = saved_errno {
+                *errno = saved_errno;
+            }
+        }
+    }
+
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    unsafe fn errno_location() -> *mut libc::c_int {
+        libc::__error()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "hurd", target_os = "redox"))]
+    unsafe fn errno_location() -> *mut libc::c_int {
+        libc::__errno_location()
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "nuttx"
+    ))]
+    unsafe fn errno_location() -> *mut libc::c_int {
+        libc::__errno()
+    }
+
+    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+    unsafe fn errno_location() -> *mut libc::c_int {
+        libc::___errno()
+    }
+
+    #[cfg(target_os = "aix")]
+    unsafe fn errno_location() -> *mut libc::c_int {
+        libc::_Errno()
+    }
+
+    // libc exposes no common errno accessor across every possible `unix`
+    // target. Unknown targets retain an async-signal-safe handler; null
+    // precisely disables save/restore instead of guessing an ABI symbol.
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+        target_os = "hurd",
+        target_os = "redox",
+        target_os = "android",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "nuttx",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "aix"
+    )))]
+    unsafe fn errno_location() -> *mut libc::c_int {
+        std::ptr::null_mut()
+    }
+
+    fn set_cloexec(fd: RawFd) -> io::Result<()> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn set_nonblocking_cloexec(fd: RawFd) -> io::Result<()> {
+        set_cloexec(fd)?;
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 /// Windows: no POSIX signals; the detached server is stopped via `server stop`.
 #[cfg(not(unix))]
 mod shutdown {
+    use std::sync::mpsc::Sender;
+
+    use crate::event::AppEvent;
+
     pub fn requested() -> bool {
         false
     }
 
-    pub fn install() {}
+    pub fn wake_available() -> bool {
+        // Stop arrives as an API event, not a POSIX signal.
+        true
+    }
+
+    pub fn install(_tx: Sender<AppEvent>) {}
 }
 
 #[cfg(test)]
@@ -1100,14 +1570,16 @@ mod tests {
     use super::{
         apply, broadcast, frame_cadence_ready, frame_wait, record_event_render_request,
         render_clients, ClientSender, ClientState, EventRenderSource, FrameSendError, RenderCause,
-        RenderRequest, FRAME_INTERVAL,
+        RenderRequest, RenderScratch, FRAME_INTERVAL,
     };
     use crate::app::App;
     use crate::event::{AppEvent, ClientInput};
     use crate::ipc::protocol::FrameDiff;
+    use crate::terminal::appearance::PaneAppearance;
+    use crate::terminal::vt::{create_engine, VtEngineKind};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1139,6 +1611,236 @@ mod tests {
             ServerMessage::FrameDiff(frame) => (frame.width, frame.height),
             _ => panic!("expected rendered frame"),
         }
+    }
+
+    #[test]
+    fn hidden_agent_titles_present_once_including_coalesced_output() {
+        let _env = crate::persist::test_env("hidden-agent-title");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let hidden = app.layout().focus;
+        app.status.get_mut(&hidden).unwrap().agent = "claude".into();
+        let (tx, _rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            100,
+            30,
+            tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+        );
+        app.panes.get_mut(&hidden).unwrap().engine = engine.clone();
+        app.dispatch("tab.new", &serde_json::json!({})).unwrap();
+        assert!(!app.pane_is_visible(hidden));
+        app.config.layout.agent_title = true;
+
+        engine.lock().unwrap().advance(b"\x1b]2;reviewing\x07");
+        let source = super::event_render_source(&app, &AppEvent::PtyData(hidden));
+        let mut request = RenderRequest::default();
+        record_event_render_request(source, true, &mut request);
+        assert!(request.needs_render());
+        assert!(matches!(
+            source,
+            EventRenderSource::Cause(RenderCause::Metadata)
+        ));
+        engine
+            .lock()
+            .unwrap()
+            .advance(b"ordinary output\x1b]2;reviewing\x07");
+        assert!(matches!(
+            super::event_render_source(&app, &AppEvent::PtyData(hidden)),
+            EventRenderSource::HiddenPty
+        ));
+
+        // Output may arrive while the reader's notification is already set.
+        engine.lock().unwrap().advance(b"\x1b]2;finished\x07");
+        app.panes[&hidden].mark_data_pending_for_test();
+        assert!(app.rearm_pty_notify_by_visibility().2);
+        app.panes[&hidden].mark_data_pending_for_test();
+        assert!(!app.rearm_pty_notify_by_visibility().2);
+    }
+
+    #[test]
+    fn passive_retained_frames_match_full_projection_at_each_client_size() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let _env = crate::persist::test_env("passive-retained-frames");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.server_mode = true;
+        let pane = app.layout().focus;
+        let (tx, _rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            100,
+            30,
+            tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+        );
+        app.panes.get_mut(&pane).unwrap().engine = engine.clone();
+        let mut clients = HashMap::new();
+        let mut receivers = Vec::new();
+        for (id, cols, rows) in [(1, 100, 30), (2, 100, 30), (3, 60, 20)] {
+            let (client, rx) = display_client(cols, rows, id);
+            clients.insert(id, client);
+            receivers.push(rx);
+        }
+        let mut foreground = Some(1);
+        let mut size = (100, 30);
+        let mut scratch = RenderScratch::default();
+        render_clients(
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut size,
+            false,
+            false,
+            &mut scratch,
+        );
+        for rx in &receivers {
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        let geometry = app.pane_content_rects.clone();
+        let pty_size = app.panes[&pane].size();
+
+        for bytes in [
+            "界e\u{301} text",
+            "\rshort\x1b[K",
+            "\x1b]2;new title\x07!",
+            "\rnext",
+        ] {
+            for client in clients.values() {
+                client.sender.frame_pending.store(false, Ordering::Release);
+            }
+            engine.lock().unwrap().advance(bytes.as_bytes());
+            let partial_before = super::PARTIAL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed);
+            render_clients(
+                &mut app,
+                &mut clients,
+                &mut foreground,
+                &mut size,
+                false,
+                true,
+                &mut scratch,
+            );
+            for rx in &receivers {
+                rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            if !bytes.contains("\x1b]2;") {
+                assert!(
+                    super::PARTIAL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed)
+                        >= partial_before + 3,
+                    "all three clients must patch their own retained geometry"
+                );
+            }
+            for client in clients.values() {
+                let area = Rect::new(0, 0, client.size.0, client.size.1);
+                let mut expected = Buffer::empty(area);
+                let mut target = crate::ui::RenderTarget::new(&mut expected, area);
+                crate::ui::render_projection(&mut target, &mut app);
+                let cursor = (target.cursor(), target.cursor_visible());
+                assert_eq!(client.render_buf, expected, "client size {:?}", client.size);
+                let frame = client.last_frame.as_ref().unwrap();
+                assert_eq!((frame.cursor, frame.cursor_visible), cursor);
+                assert!(client.retained_ready);
+            }
+            assert_eq!(app.pane_content_rects, geometry);
+            assert_eq!(app.panes[&pane].size(), pty_size);
+            assert_eq!(app.layout().focus, pane);
+        }
+    }
+
+    #[test]
+    fn visible_pty_only_frame_uses_retained_rows_after_full_baseline() {
+        let _env = crate::persist::test_env("server-retained-terminal-rows");
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(100, 30, app_tx).expect("app starts");
+        app.server_mode = true;
+        app.config.layout.agent_title = true;
+        let focus = app.layout().focus;
+        let (response_tx, _response_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            100,
+            30,
+            response_tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+        );
+        app.panes.get_mut(&focus).expect("focused pane").engine = engine.clone();
+
+        let (client, rx) = display_client(100, 30, 1);
+        let mut clients = HashMap::from([(1, client)]);
+        let mut foreground = Some(1);
+        let mut interactive_size = (100, 30);
+        let mut scratch = RenderScratch::default();
+        assert!(render_clients(
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut interactive_size,
+            false,
+            false,
+            &mut scratch,
+        ));
+        assert!(matches!(rx.recv().unwrap(), ServerMessage::Frame(_)));
+        clients[&1]
+            .sender
+            .frame_pending
+            .store(false, Ordering::Release);
+
+        engine
+            .lock()
+            .expect("engine lock")
+            .advance(b"one changed row");
+        let before = super::PARTIAL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed);
+        assert!(render_clients(
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut interactive_size,
+            false,
+            true,
+            &mut scratch,
+        ));
+        assert!(matches!(rx.recv().unwrap(), ServerMessage::FrameDiff(_)));
+        assert!(
+            super::PARTIAL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed) > before,
+            "PTY-only render patched the retained client buffer"
+        );
+        assert!(!clients[&1].behind);
+
+        // A slow client may reject the next partial frame. Its retained buffer
+        // is then deliberately abandoned and the next accepted render is a
+        // complete resynchronization, so acknowledging shared VT damage cannot
+        // leave that client permanently behind.
+        engine.lock().expect("engine lock").advance(b" more");
+        assert!(!render_clients(
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut interactive_size,
+            false,
+            true,
+            &mut scratch,
+        ));
+        assert!(clients[&1].behind);
+        assert!(!clients[&1].retained_ready);
+        clients[&1]
+            .sender
+            .frame_pending
+            .store(false, Ordering::Release);
+        assert!(render_clients(
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut interactive_size,
+            false,
+            false,
+            &mut scratch,
+        ));
+        assert!(matches!(rx.recv().unwrap(), ServerMessage::Frame(_)));
+        assert!(!clients[&1].behind);
     }
 
     #[test]
@@ -1206,6 +1908,7 @@ mod tests {
                 height: 32,
                 runs: Vec::new(),
                 cursor: None,
+                cursor_visible: false,
             })
         };
 
@@ -1239,11 +1942,10 @@ mod tests {
         );
     }
 
-    /// Session detach is carried by the same reliable control path. Preserve the
-    /// earlier guarantee that closing the last node cannot strand a client just
-    /// because its writer already has a frame waiting.
+    /// Explicit client detach is carried by the same reliable control path and
+    /// cannot be lost behind a queued frame.
     #[test]
-    fn ending_a_session_delivers_detach_behind_a_queued_frame() {
+    fn explicit_detach_is_delivered_behind_a_queued_frame() {
         let (messages, rx) = mpsc::channel();
         let client = ClientSender {
             messages,
@@ -1255,6 +1957,7 @@ mod tests {
                 height: 1,
                 runs: Vec::new(),
                 cursor: None,
+                cursor_visible: false,
             }))
             .is_ok());
         assert!(client.send_control(ServerMessage::Detach).is_ok());
@@ -1275,6 +1978,7 @@ mod tests {
         let mut clients = HashMap::from([(1, large), (2, small)]);
         let mut foreground = Some(1);
         let mut interactive_size = (120, 40);
+        let mut scratch = RenderScratch::default();
 
         render_clients(
             &mut app,
@@ -1282,6 +1986,8 @@ mod tests {
             &mut foreground,
             &mut interactive_size,
             false,
+            false,
+            &mut scratch,
         );
 
         assert_eq!(received_frame_size(&large_rx), (120, 40));
@@ -1301,45 +2007,6 @@ mod tests {
             app.panes[&focus].size(),
             (content.width, content.height),
             "secondary projection must not resize the shared PTY"
-        );
-    }
-
-    #[test]
-    fn animation_mask_tracks_a_spinner_that_is_actually_rendered() {
-        let _env = crate::persist::test_env("rendered-animation-mask");
-        let (app_tx, _app_rx) = mpsc::channel();
-        let mut app = App::new(120, 40, app_tx).expect("app starts");
-        app.server_mode = true;
-        let focus = app.layout().focus;
-        let status = app.status.get_mut(&focus).expect("focused pane status");
-        status.agent = "claude".into();
-        status.state = crate::ui::theme::State::Working;
-
-        let (client, _rx) = display_client(120, 40, 1);
-        let mut clients = HashMap::from([(1, client)]);
-        let mut foreground = Some(1);
-        let mut interactive_size = (120, 40);
-        render_clients(
-            &mut app,
-            &mut clients,
-            &mut foreground,
-            &mut interactive_size,
-            false,
-        );
-        assert!(clients[&1].animation_mask.has_working_spinner());
-
-        app.sidebars.left.visible = false;
-        app.sidebars.right.visible = false;
-        render_clients(
-            &mut app,
-            &mut clients,
-            &mut foreground,
-            &mut interactive_size,
-            false,
-        );
-        assert!(
-            !clients[&1].animation_mask.has_working_spinner(),
-            "a hidden AGENTS dock must not keep scheduling animation frames"
         );
     }
 

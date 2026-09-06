@@ -9,7 +9,7 @@
 [![crates.io](https://img.shields.io/crates/v/luvus.svg)](https://crates.io/crates/luvus)
 [![ci](https://github.com/RizRiyz/luvus/actions/workflows/ci.yml/badge.svg)](https://github.com/RizRiyz/luvus/actions/workflows/ci.yml)
 [![docs](https://img.shields.io/badge/docs-luvus.dev-c6ff1a.svg)](https://luvus.dev/docs/)
-![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
+![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20·%20Linux%20·%20Windows-lightgrey.svg)
 
 **[Website](https://luvus.dev)** · **[Documentation](https://luvus.dev/docs/)** · **[Releases](https://github.com/RizRiyz/luvus/releases)**
@@ -30,13 +30,15 @@
   working, done, or idle state with session titles, tokens, cost, context use,
   and optional sound alerts.
 - **Agent workflows:** Start, name, message, inspect, wait for, resume, and send
-  keys to agents. Fork Claude, Grok, Codex, and Pi sessions with their context intact.
+  keys to agents. Fork Claude, Grok, Codex, Pi, and OMP sessions with their
+  context intact.
 - **Files and code:** Browse a Git-aware file tree, inspect files and changes,
   reveal paths, and open files in a pane, tab, preview, or external editor.
 - **Git and GitHub:** View status, branches, commits, contributors, pull
   requests, issues, and repository activity without leaving Luvus.
 - **Worktrees and orchestration:** Create worktrees, coordinate dependent tasks,
-  reserve file paths, assign agents, run quality gates, and merge completed work.
+  reserve file paths, assign agents, schedule timezone-aware recurring work,
+  run quality gates, and merge completed work.
 - **Remote and multi-client use:** Attach over SSH, connect several clients with
   independent viewport sizes, and use the compact switcher on narrow screens.
 - **Terminal tools:** Configure per-pane Scrollback Memory, search across pane
@@ -89,11 +91,15 @@ Keyboard → Keyboard Shortcuts → Input Sources** to free `Ctrl+Space`.
 | Claude Code | ✓ | ✓ | ✓ |
 | GitHub Copilot CLI | ✓ | ✓ | ✓ |
 | Codex | ✓ | ✓ | ✓ |
+| Antigravity CLI | ✓ | ✓ | session only |
 | opencode | ✓ | ✓ | ✓ |
 | Kimi | ✓ | ✓ | ✓ |
 | Grok | ✓ | ✓ | ✓ |
+| Hermes CLI | ✓ | ✓ with integration | session only |
 | Pi | ✓ | ✓ | No |
-| Fx | ✓ | No | No |
+| Oh My Pi (omp) | ✓ | ✓ | ✓ |
+| Muse Code | ✓ | ✓ | No |
+| Fx | ✓ | ✓ | No |
 | Cursor | ✓ | resume command | No |
 | Gemini · Aider · Amp · Droid · Qwen · Kiro | ✓ | No | No |
 
@@ -104,8 +110,10 @@ the complete CLI and API reference.
 ## Development
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests, and pull request
-requirements. Report vulnerabilities through [SECURITY.md](SECURITY.md).
+requirements. Native agent contributors should also read
+[Adding Agent Support](https://luvus.dev/docs/extend/adding-agent-support/).
+Report vulnerabilities through [SECURITY.md](SECURITY.md).
 
 ## License
 
-[GNU AGPL v3 or later](LICENSE).
+[Apache License 2.0](LICENSE).

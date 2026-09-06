@@ -1,9 +1,15 @@
-//! Agent integrations (M6): install a hook into an agent's config so it reports
-//! its native session id back to luvus over the socket, enabling resume.
-//! See docs/10 §integrations.
+//! Optional agent integrations: install a reviewed hook, plugin, or extension
+//! so an agent can report exact session identity and lifecycle state to Luvus.
+//!
+//! This module owns the shared safe-editing mechanics and stable facade.
+//! Agent-specific paths, event formats, assets, and operations are assembled by
+//! the owning `src/agent/<agent>/` descriptor. Integrations augment native
+//! process/screen detection; they are never required for sidebar recognition.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -13,7 +19,7 @@ use serde_json::{json, Value};
 /// socket using the pane's injected `LUVUS_*` env). Shared by Claude and Copilot —
 /// their hook formats are compatible (docs/23). The id key varies, so we try the
 /// common ones.
-fn agent_hook_script(agent: &str) -> String {
+pub(crate) fn agent_hook_script(agent: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 # luvus {agent} integration — reports the session id for native resume, and
@@ -51,181 +57,131 @@ exit 0
     )
 }
 
-/// The opencode plugin (docs/23): opencode uses JS/TS **plugins**, not shell hooks,
-/// so we ship a tiny dependency-free plugin that reports the session id on
-/// `session.created`/`session.updated`.
-const OPENCODE_PLUGIN: &str = r#"// luvus opencode integration (docs/23) — reports the session id for native resume.
-// Auto-installed at <config>/opencode/plugin/luvus.js by `luvus integration install opencode`.
-import { spawn } from "node:child_process"
-
-export const luvus = async () => {
-  let last = ""
-  const luvusBin = process.env.LUVUS_BIN_PATH || "luvus"
-  const report = (id) => {
-    if (!id || id === last || !process.env.LUVUS_SOCKET_PATH) return
-    last = id
-    try {
-      spawn(luvusBin, ["pane", "report", "--agent", "opencode", "--session", String(id)], {
-        stdio: "ignore",
-        detached: true,
-      }).unref()
-    } catch {}
-  }
-  return {
-    event: async ({ event }) => {
-      if (event?.type === "session.created" || event?.type === "session.updated") {
-        const p = event.properties || {}
-        report(p.info?.id ?? p.sessionID ?? p.id ?? p.session?.id)
-      }
-    },
-  }
-}
-"#;
-
-pub fn run(args: &[String]) -> Result<i32> {
+pub fn run(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     match (
         args.get(2).map(String::as_str),
         args.get(3).map(String::as_str),
     ) {
-        (Some("install"), Some(agent)) if AGENTS.contains(&agent) => {
+        (Some("hook"), Some(agent)) => hook_operation(agent)
+            .map(|hook| hook())
+            .ok_or_else(|| anyhow!("unsupported integration hook")),
+        (Some("install"), Some(agent)) if operation(agent).is_some() => {
             install(agent)?;
-            println!("installed luvus {agent} integration");
+            println!(
+                "{}",
+                context.render(
+                    "Installed Luvus integration for {agent}.",
+                    &[("agent", agent)]
+                )
+            );
             Ok(0)
         }
-        (Some("uninstall"), Some(agent)) if AGENTS.contains(&agent) => {
+        (Some("uninstall"), Some(agent)) if operation(agent).is_some() => {
             uninstall(agent)?;
-            println!("removed luvus {agent} integration (the {agent} agent itself is untouched)");
+            println!(
+                "{}",
+                context.render(
+                    "Removed Luvus integration for {agent}. The agent itself was not changed.",
+                    &[("agent", agent)],
+                )
+            );
             Ok(0)
         }
-        (Some("install" | "uninstall"), Some(other)) => Err(anyhow!(
-            "unsupported agent: {other} (supported: {})",
-            AGENTS.join(", ")
-        )),
+        (Some("install" | "uninstall"), Some(other)) => {
+            let supported = agent_ids().collect::<Vec<_>>().join(", ");
+            Err(anyhow!(context.render(
+                "Unsupported agent: {agent} (supported: {supported})",
+                &[("agent", other), ("supported", &supported)],
+            )))
+        }
         _ => Err(anyhow!(
             "usage: luvus integration <install|uninstall> <{}>",
-            AGENTS.join("|")
+            agent_ids().collect::<Vec<_>>().join("|")
         )),
     }
 }
 
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     crate::platform::home_dir().unwrap_or_default()
 }
 
-fn claude_config_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return PathBuf::from(d);
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Serialize JSON into a same-directory temporary file, sync it, and atomically
+/// replace `path`. A failed write or replacement leaves the previous file
+/// untouched and removes the incomplete temporary file.
+pub(crate) fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
+    let output = serde_json::to_vec_pretty(value)?;
+    write_bytes_atomic(path, &output)
+}
+
+/// Atomically replace one integration-owned text or config asset without
+/// exposing a partially written file to the agent process.
+pub(crate) fn write_bytes_atomic(path: &Path, output: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("configuration path has no parent"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("configuration filename is not valid Unicode"))?;
+    let (temporary, mut file) = (0..16)
+        .find_map(|_| {
+            let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temporary = parent.join(format!(
+                ".{file_name}.luvus-{}-{sequence}.tmp",
+                std::process::id()
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => Some(Ok((temporary, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow!("could not reserve a temporary configuration file"))?;
+
+    let result = (|| -> Result<()> {
+        file.write_all(output)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        crate::platform::atomic_replace_file(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    home().join(".claude")
-}
-
-fn copilot_config_dir() -> PathBuf {
-    // Copilot CLI reads `~/.copilot`; `LUVUS_COPILOT_DIR` overrides it (tests).
-    if let Some(d) = crate::compat::inherited("LUVUS_COPILOT_DIR", "BOHAY_COPILOT_DIR") {
-        return PathBuf::from(d);
-    }
-    home().join(".copilot")
-}
-
-fn codex_config_dir() -> PathBuf {
-    // Codex CLI reads `~/.codex`; `CODEX_HOME` overrides it (a real Codex env var).
-    if let Some(d) = std::env::var_os("CODEX_HOME") {
-        return PathBuf::from(d);
-    }
-    home().join(".codex")
-}
-
-/// Kimi Code CLI's data dir: `~/.kimi-code`, overridable with `KIMI_CODE_HOME`
-/// (a real Kimi env var). Its `config.toml` holds the user's API keys, so we
-/// edit it format-preserving (docs/23), never a lossy round-trip.
-fn kimi_config_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("KIMI_CODE_HOME") {
-        return PathBuf::from(d);
-    }
-    home().join(".kimi-code")
-}
-
-fn kimi_config_path() -> PathBuf {
-    kimi_config_dir().join("config.toml")
-}
-
-/// Grok Build's home: `$GROK_HOME`, else `~/.grok` (docs/35). Unlike Kimi, grok
-/// reads hooks from a **directory of `*.json` files** at `<home>/hooks/`, not
-/// from the auth-bearing `config.toml`, so luvus drops a standalone `luvus.json`
-/// there — nothing of the user's is edited.
-fn grok_hooks_dir() -> PathBuf {
-    let home = std::env::var_os("GROK_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".grok"));
-    home.join("hooks")
-}
-
-fn grok_hook_json_path() -> PathBuf {
-    grok_hooks_dir().join("luvus.json")
-}
-
-/// opencode's global plugin dir: `$XDG_CONFIG_HOME/opencode/plugin`, else
-/// `~/.config/opencode/plugin` (docs/23). opencode auto-loads `*.js`/`*.ts` here.
-fn opencode_plugin_dir() -> PathBuf {
-    let cfg = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"));
-    cfg.join("opencode").join("plugin")
-}
-
-fn opencode_plugin_path() -> PathBuf {
-    opencode_plugin_dir().join("luvus.js")
+    result
 }
 
 /// Where + how an agent's shell hook is configured (docs/23). `file` is the JSON
 /// config file inside `dir`; `event` is the hook key; `matcher` is an optional
 /// group matcher (Codex reports `startup` and `resume` SessionStart sources).
-struct HookSpec {
-    dir: PathBuf,
-    file: &'static str,
-    event: &'static str,
-    matcher: Option<&'static str>,
+pub(crate) struct HookSpec {
+    pub(crate) dir: PathBuf,
+    pub(crate) file: &'static str,
+    pub(crate) event: &'static str,
+    pub(crate) matcher: Option<&'static str>,
 }
 
-fn hook_spec(agent: &str) -> Option<HookSpec> {
-    Some(match agent {
-        "claude" => HookSpec {
-            dir: claude_config_dir(),
-            file: "settings.json",
-            event: "SessionStart",
-            matcher: None,
-        },
-        "copilot" => HookSpec {
-            dir: copilot_config_dir(),
-            file: "settings.json",
-            event: "sessionStart",
-            matcher: None,
-        },
-        "codex" => HookSpec {
-            dir: codex_config_dir(),
-            file: "hooks.json",
-            event: "SessionStart",
-            matcher: Some("startup|resume"),
-        },
-        _ => return None,
-    })
-}
+pub(crate) type ShellHookSpec = HookSpec;
 
-/// Write the shared `SessionStart` hook script into `agent`'s config dir and
-/// register it under the agent's event key. Idempotent (replaces any prior luvus
-/// entry). Used for Claude / Copilot / Codex (compatible hook formats, docs/23).
-fn install_shell_hook(agent: &str) -> Result<PathBuf> {
-    let spec = hook_spec(agent).ok_or_else(|| anyhow!("no shell hook for {agent}"))?;
+pub(crate) fn install_shell_hook_with_spec(agent: &str, spec: ShellHookSpec) -> Result<PathBuf> {
     fs::create_dir_all(&spec.dir)?;
     let script = spec.dir.join("luvus-agent-hook.sh");
-    fs::write(&script, agent_hook_script(agent))?;
-    set_executable(&script)?;
-
     let cfg_path = spec.dir.join(spec.file);
     let mut cfg: Value = match fs::read_to_string(&cfg_path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| json!({})),
-        Err(_) => json!({}),
+        Ok(contents) => serde_json::from_str(&contents)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.into()),
     };
+    fs::write(&script, agent_hook_script(agent))?;
+    set_executable(&script)?;
     register_hook(
         &mut cfg,
         spec.event,
@@ -238,232 +194,34 @@ fn install_shell_hook(agent: &str) -> Result<PathBuf> {
     Ok(spec.dir)
 }
 
-pub fn install_claude() -> Result<PathBuf> {
-    let dir = install_shell_hook("claude")?;
-    // Also register the same branching script under lifecycle events so modules
-    // and API clients get precise permission/turn-end signals.
-    let cfg_path = dir.join("settings.json");
-    let script = dir.join("luvus-agent-hook.sh");
-    let mut cfg: Value = fs::read_to_string(&cfg_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    for evt in ["Notification", "Stop"] {
-        register_hook(&mut cfg, evt, None, &script.to_string_lossy(), None);
-    }
-    fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
-    Ok(dir)
-}
-
-pub fn install_copilot() -> Result<PathBuf> {
-    install_shell_hook("copilot")
-}
-
-pub fn install_codex() -> Result<PathBuf> {
-    let dir = install_shell_hook("codex")?;
-    let cfg_path = dir.join("hooks.json");
-    let script = dir.join("luvus-agent-hook.sh");
-    let mut cfg: Value = fs::read_to_string(&cfg_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    // Codex provides the session id to both hooks. SessionStart is the earliest
-    // report, while UserPromptSubmit covers Code mode lifecycles where startup
-    // hooks are delayed or skipped.
-    register_hook(
-        &mut cfg,
-        "UserPromptSubmit",
-        None,
-        &script.to_string_lossy(),
-        Some(5),
-    );
-    fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
-    Ok(dir)
-}
-
-/// Install the opencode plugin (NI-4). No shell hook — write the JS plugin.
-pub fn install_opencode() -> Result<PathBuf> {
-    let dir = opencode_plugin_dir();
-    fs::create_dir_all(&dir)?;
-    fs::write(opencode_plugin_path(), OPENCODE_PLUGIN)?;
-    let _ = fs::remove_file(dir.join("bohay.js"));
-    Ok(dir)
-}
-
-/// The Kimi hook events we register (docs/23): `SessionStart` (matcher
-/// `startup|resume`) reports the session id for resume; `Notification` + `Stop`
-/// feed modules and API clients precise lifecycle signals. Kimi's `[[hooks]]` table
-/// accepts only `event`/`matcher`/`command`/`timeout`, so we write nothing else.
-const KIMI_HOOK_EVENTS: &[(&str, Option<&str>)] = &[
-    ("SessionStart", Some("startup|resume")),
-    ("Notification", None),
-    ("Stop", None),
-];
-
-/// True if a `[[hooks]]` entry's `command` points at luvus's hook script.
-fn kimi_entry_is_luvus(t: &toml_edit::Table) -> bool {
-    t.get("command")
-        .and_then(|v| v.as_str())
-        .map(|c| c.contains("luvus-agent-hook") || c.contains("bohay-agent-hook"))
-        .unwrap_or(false)
-}
-
-/// Drop every luvus `[[hooks]]` entry in place (idempotent reinstall/uninstall),
-/// leaving the user's own hooks and the rest of the file untouched.
-fn kimi_strip_luvus(arr: &mut toml_edit::ArrayOfTables) {
-    let doomed: Vec<usize> = arr
+pub fn agent_ids() -> impl ExactSizeIterator<Item = &'static str> + DoubleEndedIterator + Clone {
+    crate::agent::registry::integrations()
         .iter()
-        .enumerate()
-        .filter(|(_, t)| kimi_entry_is_luvus(t))
-        .map(|(i, _)| i)
-        .collect();
-    for i in doomed.into_iter().rev() {
-        arr.remove(i);
-    }
+        .map(|descriptor| descriptor.id)
 }
 
-/// Install the Kimi Code hook. Writes the shared `luvus-agent-hook.sh` and adds
-/// our `[[hooks]]` entries to `config.toml` **format-preserving** (toml_edit),
-/// so the user's API keys, comments, and layout survive. Idempotent.
-pub fn install_kimi() -> Result<PathBuf> {
-    use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
-    let dir = kimi_config_dir();
-    fs::create_dir_all(&dir)?;
-    let script = dir.join("luvus-agent-hook.sh");
-    fs::write(&script, agent_hook_script("kimi"))?;
-    set_executable(&script)?;
-    let cmd = script.to_string_lossy().into_owned();
-
-    let cfg_path = kimi_config_path();
-    let mut doc: DocumentMut = fs::read_to_string(&cfg_path)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_default();
-    // Get (or create) the `hooks` array-of-tables, coercing a wrong-typed value.
-    let hooks = doc
-        .as_table_mut()
-        .entry("hooks")
-        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
-    if !hooks.is_array_of_tables() {
-        *hooks = Item::ArrayOfTables(ArrayOfTables::new());
-    }
-    let arr = hooks.as_array_of_tables_mut().unwrap();
-    kimi_strip_luvus(arr);
-    for (event, matcher) in KIMI_HOOK_EVENTS {
-        let mut t = Table::new();
-        t["event"] = value(*event);
-        if let Some(m) = matcher {
-            t["matcher"] = value(*m);
-        }
-        t["command"] = value(cmd.clone());
-        arr.push(t);
-    }
-    fs::write(&cfg_path, doc.to_string())?;
-    let _ = fs::remove_file(dir.join("bohay-agent-hook.sh"));
-    Ok(dir)
+pub fn agent_count() -> usize {
+    crate::agent::registry::integrations().len()
 }
 
-/// Install the Grok Build hook (docs/35). grok discovers hooks from
-/// `<home>/hooks/*.json` in the Claude-compatible `{"hooks":{Event:[…]}}` shape,
-/// so luvus writes its own `luvus.json` there plus the shared `luvus-agent-hook.sh`.
-/// Because it is luvus's *own* file (not a shared config), install/uninstall is
-/// just write/remove — no merge, and the user's auth `config.toml` is never touched.
-/// grok's payload uses snake_case `session_id` + an `event` field, both of which
-/// the shared script already reads. Idempotent.
-pub fn install_grok() -> Result<PathBuf> {
-    let dir = grok_hooks_dir();
-    fs::create_dir_all(&dir)?;
-    let script = dir.join("luvus-agent-hook.sh");
-    fs::write(&script, agent_hook_script("grok"))?;
-    set_executable(&script)?;
-    let cmd = script.to_string_lossy();
-
-    // SessionStart resumes; Notification/Stop/SubagentStop feed event
-    // subscribers, matching what install_claude registers.
-    let group = |c: &str| json!({ "hooks": [ { "type": "command", "command": c } ] });
-    let doc = json!({
-        "hooks": {
-            "SessionStart": [group(&cmd)],
-            "Notification": [group(&cmd)],
-            "Stop": [group(&cmd)],
-            "SubagentStop": [group(&cmd)],
-        }
-    });
-    fs::write(grok_hook_json_path(), serde_json::to_string_pretty(&doc)?)?;
-    let _ = fs::remove_file(grok_hooks_dir().join("bohay.json"));
-    let _ = fs::remove_file(grok_hooks_dir().join("bohay-agent-hook.sh"));
-    Ok(dir)
+pub fn agent_at(index: usize) -> Option<&'static str> {
+    crate::agent::registry::integrations()
+        .get(index)
+        .map(|descriptor| descriptor.id)
 }
 
-/// Upgrade only integrations previously managed by Bohay. This is a release
-/// migration, never a debug/custom-home side effect, and never installs an
-/// integration the user did not already have.
-pub fn migrate_legacy_integrations() {
-    if cfg!(debug_assertions)
-        || std::env::var_os("LUVUS_HOME").is_some()
-        || std::env::var_os("BOHAY_HOME").is_some()
-    {
-        return;
-    }
-    for agent in AGENTS {
-        if legacy_is_installed(agent) {
-            let _ = install(agent);
-        }
-    }
+fn operation(agent: &str) -> Option<crate::agent::types::IntegrationOperations> {
+    crate::agent::registry::find(agent)?.integration
 }
 
-fn legacy_is_installed(agent: &str) -> bool {
-    if agent == "opencode" {
-        return opencode_plugin_dir().join("bohay.js").is_file();
-    }
-    if agent == "grok" {
-        return grok_hooks_dir().join("bohay.json").is_file();
-    }
-    if agent == "kimi" {
-        return fs::read_to_string(kimi_config_path())
-            .ok()
-            .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
-            .and_then(|doc| {
-                doc.get("hooks")
-                    .and_then(|h| h.as_array_of_tables())
-                    .map(|arr| arr.iter().any(kimi_entry_is_luvus))
-            })
-            .unwrap_or(false)
-            && kimi_config_dir().join("bohay-agent-hook.sh").is_file();
-    }
-    let Some(spec) = hook_spec(agent) else {
-        return false;
-    };
-    let Ok(s) = fs::read_to_string(spec.dir.join(spec.file)) else {
-        return false;
-    };
-    serde_json::from_str::<Value>(&s)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("hooks")
-                .and_then(|hooks| hooks.get(spec.event))
-                .and_then(Value::as_array)
-                .map(|groups| groups.iter().any(group_mentions_luvus))
-        })
-        .unwrap_or(false)
-        && spec.dir.join("bohay-agent-hook.sh").is_file()
+fn hook_operation(agent: &str) -> Option<fn() -> i32> {
+    operation(agent)?.hook
 }
-
-/// Agents the integration hook supports (for the Settings UI + CLI).
-pub const AGENTS: &[&str] = &["claude", "copilot", "codex", "opencode", "kimi", "grok"];
 
 /// Install the integration for `agent` (used by the Settings tab + CLI).
 pub fn install(agent: &str) -> Result<()> {
-    match agent {
-        "claude" => install_claude().map(|_| ()),
-        "copilot" => install_copilot().map(|_| ()),
-        "codex" => install_codex().map(|_| ()),
-        "opencode" => install_opencode().map(|_| ()),
-        "kimi" => install_kimi().map(|_| ()),
-        "grok" => install_grok().map(|_| ()),
-        other => Err(anyhow!("no integration for {other}")),
-    }
+    let operations = operation(agent).ok_or_else(|| anyhow!("no integration for {agent}"))?;
+    (operations.install)()
 }
 
 /// Remove luvus's integration for `agent`. Deletes **only what `install` added** —
@@ -471,128 +229,62 @@ pub fn install(agent: &str) -> Result<()> {
 /// the config file itself are left intact), or the opencode plugin file. **Never
 /// touches the agent binary, its config, or its sessions.** Idempotent.
 pub fn uninstall(agent: &str) -> Result<()> {
-    if agent == "opencode" {
-        let _ = fs::remove_file(opencode_plugin_path());
-        let _ = fs::remove_file(opencode_plugin_dir().join("bohay.js"));
-        return Ok(());
-    }
-    if agent == "grok" {
-        // Both are luvus's own files; removing them leaves grok's config and
-        // any user hooks in `<home>/hooks/` untouched.
-        let _ = fs::remove_file(grok_hook_json_path());
-        let _ = fs::remove_file(grok_hooks_dir().join("bohay.json"));
-        let _ = fs::remove_file(grok_hooks_dir().join("luvus-agent-hook.sh"));
-        let _ = fs::remove_file(grok_hooks_dir().join("bohay-agent-hook.sh"));
-        return Ok(());
-    }
-    if agent == "kimi" {
-        let _ = fs::remove_file(kimi_config_dir().join("luvus-agent-hook.sh"));
-        let _ = fs::remove_file(kimi_config_dir().join("bohay-agent-hook.sh"));
-        // Strip only luvus's `[[hooks]]` entries, format-preserving; the user's
-        // API keys, comments, and own hooks stay exactly as they were.
-        let cfg_path = kimi_config_path();
-        if let Ok(s) = fs::read_to_string(&cfg_path) {
-            if let Ok(mut doc) = s.parse::<toml_edit::DocumentMut>() {
-                if let Some(arr) = doc
-                    .as_table_mut()
-                    .get_mut("hooks")
-                    .and_then(|h| h.as_array_of_tables_mut())
-                {
-                    kimi_strip_luvus(arr);
-                }
-                let _ = fs::write(&cfg_path, doc.to_string());
-            }
-        }
-        return Ok(());
-    }
-    let spec = hook_spec(agent).ok_or_else(|| anyhow!("no integration for {agent}"))?;
+    let operations = operation(agent).ok_or_else(|| anyhow!("no integration for {agent}"))?;
+    (operations.uninstall)()
+}
+
+/// Whether the integration is currently installed for `agent`.
+pub fn is_installed(agent: &str) -> bool {
+    operation(agent)
+        .map(|operations| (operations.is_installed)())
+        .unwrap_or(false)
+}
+
+pub(crate) fn uninstall_shell_hook(spec: ShellHookSpec, extra_events: &[&str]) -> Result<()> {
     let _ = fs::remove_file(spec.dir.join("luvus-agent-hook.sh"));
     let _ = fs::remove_file(spec.dir.join("bohay-agent-hook.sh"));
-    // Strip luvus's entry from the hook array, keeping everything else in the file.
     let cfg_path = spec.dir.join(spec.file);
-    if let Ok(s) = fs::read_to_string(&cfg_path) {
-        if let Ok(mut v) = serde_json::from_str::<Value>(&s) {
-            // Strip luvus's entry from the primary event and the extra events
-            // installed alongside session detection.
-            let mut events = vec![spec.event];
-            if agent == "claude" {
-                events.extend(["Notification", "Stop"]);
-            } else if agent == "codex" {
-                events.push("UserPromptSubmit");
-            }
-            for evt in events {
-                if let Some(arr) = v
+    if let Ok(contents) = fs::read_to_string(&cfg_path) {
+        if let Ok(mut value) = serde_json::from_str::<Value>(&contents) {
+            for event in std::iter::once(spec.event).chain(extra_events.iter().copied()) {
+                if let Some(groups) = value
                     .get_mut("hooks")
-                    .and_then(|h| h.get_mut(evt))
-                    .and_then(|a| a.as_array_mut())
+                    .and_then(|hooks| hooks.get_mut(event))
+                    .and_then(Value::as_array_mut)
                 {
-                    arr.retain(|group| !group_mentions_luvus(group));
+                    groups.retain(|group| !group_mentions_luvus(group));
                 }
             }
-            if let Ok(out) = serde_json::to_string_pretty(&v) {
-                let _ = fs::write(&cfg_path, out);
+            if let Ok(output) = serde_json::to_string_pretty(&value) {
+                let _ = fs::write(&cfg_path, output);
             }
         }
     }
     Ok(())
 }
 
-/// Whether the integration is currently installed for `agent`.
-pub fn is_installed(agent: &str) -> bool {
-    if agent == "opencode" {
-        return opencode_plugin_path().exists();
-    }
-    if agent == "grok" {
-        return grok_hook_json_path().exists();
-    }
-    if agent == "kimi" {
-        let Ok(s) = fs::read_to_string(kimi_config_path()) else {
-            return false;
-        };
-        let Ok(doc) = s.parse::<toml_edit::DocumentMut>() else {
-            return false;
-        };
-        return doc
-            .get("hooks")
-            .and_then(|h| h.as_array_of_tables())
-            .map(|arr| arr.iter().any(kimi_entry_is_luvus))
-            .unwrap_or(false);
-    }
-    let Some(spec) = hook_spec(agent) else {
+pub(crate) fn shell_hook_installed(spec: ShellHookSpec, required_events: &[&str]) -> bool {
+    let Ok(contents) = fs::read_to_string(spec.dir.join(spec.file)) else {
         return false;
     };
-    let Ok(s) = fs::read_to_string(spec.dir.join(spec.file)) else {
+    let Ok(value) = serde_json::from_str::<Value>(&contents) else {
         return false;
     };
-    let Ok(v) = serde_json::from_str::<Value>(&s) else {
-        return false;
-    };
-    let installed = v
-        .get("hooks")
-        .and_then(|h| h.get(spec.event))
-        .and_then(|a| a.as_array())
-        .map(|arr| arr.iter().any(group_mentions_luvus))
-        .unwrap_or(false);
-    if !installed {
-        return false;
-    }
-    // A previously installed Codex integration can predate the prompt hook.
-    // Treat that as incomplete so Settings offers an in-place refresh instead
-    // of an uninstall.
-    if agent == "codex" {
-        return v
-            .get("hooks")
-            .and_then(|h| h.get("UserPromptSubmit"))
-            .and_then(|a| a.as_array())
-            .map(|arr| arr.iter().any(group_mentions_luvus))
-            .unwrap_or(false);
-    }
-    true
+    std::iter::once(spec.event)
+        .chain(required_events.iter().copied())
+        .all(|event| {
+            value
+                .get("hooks")
+                .and_then(|hooks| hooks.get(event))
+                .and_then(Value::as_array)
+                .map(|groups| groups.iter().any(group_mentions_luvus))
+                .unwrap_or(false)
+        })
 }
 
 /// Insert a command hook under `hooks.<event>` pointing at `script` (with an
 /// optional group `matcher`), removing any prior luvus entry first.
-fn register_hook(
+pub(crate) fn register_hook(
     settings: &mut Value,
     event: &str,
     matcher: Option<&str>,
@@ -632,7 +324,7 @@ fn register_hook(
     arr.push(group);
 }
 
-fn group_mentions_luvus(group: &Value) -> bool {
+pub(crate) fn group_mentions_luvus(group: &Value) -> bool {
     group
         .get("hooks")
         .and_then(|h| h.as_array())
@@ -648,7 +340,7 @@ fn group_mentions_luvus(group: &Value) -> bool {
 }
 
 #[cfg(unix)]
-fn set_executable(path: &Path) -> Result<()> {
+pub(crate) fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(0o755);
@@ -657,13 +349,94 @@ fn set_executable(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<()> {
+pub(crate) fn set_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kimi_entry_is_luvus(table: &toml_edit::Table) -> bool {
+        table
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(|command| {
+                command.contains("luvus-agent-hook") || command.contains("bohay-agent-hook")
+            })
+            .unwrap_or(false)
+    }
+
+    fn omp_extension() -> &'static str {
+        crate::agent::omp::extension_source()
+    }
+
+    #[test]
+    fn internal_hook_dispatch_is_owned_by_the_agent_descriptor() {
+        assert!(operation("antigravity")
+            .and_then(|operations| operations.hook)
+            .is_some());
+        assert!(operation("agy")
+            .and_then(|operations| operations.hook)
+            .is_some());
+        assert!(operation("claude")
+            .and_then(|operations| operations.hook)
+            .is_none());
+    }
+
+    #[test]
+    fn atomic_json_write_replaces_complete_files_and_cleans_failed_temps() {
+        let root = std::env::temp_dir().join(format!(
+            "luvus-atomic-json-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let config = root.join("hooks.json");
+        fs::write(&config, r#"{"existing":{"token":"keep"}}"#).unwrap();
+        write_json_atomic(
+            &config,
+            &json!({"existing": {"token": "keep"}, "luvus": {"enabled": true}}),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        assert_eq!(value["existing"]["token"], "keep");
+        assert_eq!(value["luvus"]["enabled"], true);
+
+        let blocked = root.join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        assert!(write_json_atomic(&blocked, &json!({"never": "replace"})).is_err());
+        assert!(blocked.is_dir());
+        assert!(fs::read_dir(&root).unwrap().flatten().all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".blocked.json.luvus-")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsupported_agent_message_is_a_complete_localized_sentence() {
+        let args = [
+            "luvus".into(),
+            "integration".into(),
+            "install".into(),
+            "mystery".into(),
+        ];
+        let context = crate::i18n::cli::Context::for_language(crate::i18n::cli::Language::Ja);
+        let error = run(&args, context).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "未対応のエージェント：mystery（対応：{}）",
+                agent_ids().collect::<Vec<_>>().join(", ")
+            )
+        );
+    }
 
     #[test]
     fn install_writes_hook_and_settings() {
@@ -674,8 +447,8 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         std::env::set_var("CLAUDE_CONFIG_DIR", &tmp);
 
-        install_claude().unwrap();
-        install_claude().unwrap(); // idempotent
+        install("claude").unwrap();
+        install("claude").unwrap(); // idempotent
 
         let script = tmp.join("luvus-agent-hook.sh");
         assert!(script.exists());
@@ -687,8 +460,59 @@ mod tests {
         assert_eq!(count, 1);
         assert!(is_installed("claude"));
 
+        let mut incomplete = settings;
+        incomplete["hooks"].as_object_mut().unwrap().remove("Stop");
+        fs::write(
+            tmp.join("settings.json"),
+            serde_json::to_string_pretty(&incomplete).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !is_installed("claude"),
+            "every required Claude hook must be present"
+        );
+
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn install_preserves_malformed_user_configs() {
+        let _env = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "luvus-malformed-hooks-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let claude = root.join("claude");
+        let kimi = root.join("kimi");
+        fs::create_dir_all(&claude).unwrap();
+        fs::create_dir_all(&kimi).unwrap();
+        let invalid_json = "{ user config";
+        let invalid_toml = "[user\nsecret = 'keep-me'";
+        fs::write(claude.join("settings.json"), invalid_json).unwrap();
+        fs::write(kimi.join("config.toml"), invalid_toml).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude);
+        std::env::set_var("KIMI_CODE_HOME", &kimi);
+
+        assert!(install("claude").is_err());
+        assert!(install("kimi").is_err());
+        assert_eq!(
+            fs::read_to_string(claude.join("settings.json")).unwrap(),
+            invalid_json
+        );
+        assert_eq!(
+            fs::read_to_string(kimi.join("config.toml")).unwrap(),
+            invalid_toml
+        );
+        assert!(!claude.join("luvus-agent-hook.sh").exists());
+        assert!(!kimi.join("luvus-agent-hook.sh").exists());
+
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::remove_var("KIMI_CODE_HOME");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -700,8 +524,8 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         std::env::set_var("LUVUS_COPILOT_DIR", &tmp);
 
-        install_copilot().unwrap();
-        install_copilot().unwrap(); // idempotent
+        install("copilot").unwrap();
+        install("copilot").unwrap(); // idempotent
 
         let script = fs::read_to_string(tmp.join("luvus-agent-hook.sh")).unwrap();
         assert!(script.contains("--agent copilot"), "reports as copilot");
@@ -735,7 +559,7 @@ mod tests {
         )
         .unwrap();
 
-        install_copilot().unwrap();
+        install("copilot").unwrap();
 
         assert!(!tmp.join("bohay-agent-hook.sh").exists());
         assert!(tmp.join("luvus-agent-hook.sh").exists());
@@ -774,7 +598,7 @@ mod tests {
         )
         .unwrap();
 
-        install_claude().unwrap();
+        install("claude").unwrap();
         assert!(is_installed("claude"));
         assert!(tmp.join("luvus-agent-hook.sh").exists());
 
@@ -804,15 +628,27 @@ mod tests {
         let _env = crate::persist::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!("luvus-uninst-oc-{}", std::process::id()));
+        let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-state/integration")
+            .join(format!("luvus-uninst-oc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        let old_tui = std::env::var_os("OPENCODE_TUI_CONFIG");
         std::env::set_var("XDG_CONFIG_HOME", &tmp);
-        install_opencode().unwrap();
+        std::env::remove_var("OPENCODE_TUI_CONFIG");
+        install("opencode").unwrap();
         assert!(is_installed("opencode"));
         uninstall("opencode").unwrap();
         assert!(!is_installed("opencode"), "plugin removed");
         uninstall("opencode").unwrap(); // idempotent
-        std::env::remove_var("XDG_CONFIG_HOME");
+        match old {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_tui {
+            Some(value) => std::env::set_var("OPENCODE_TUI_CONFIG", value),
+            None => std::env::remove_var("OPENCODE_TUI_CONFIG"),
+        }
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -825,8 +661,8 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         std::env::set_var("CODEX_HOME", &tmp);
 
-        install_codex().unwrap();
-        install_codex().unwrap(); // idempotent
+        install("codex").unwrap();
+        install("codex").unwrap(); // idempotent
 
         let script = fs::read_to_string(tmp.join("luvus-agent-hook.sh")).unwrap();
         assert!(script.contains("--agent codex"), "reports as codex");
@@ -893,8 +729,8 @@ mod tests {
         )
         .unwrap();
 
-        install_kimi().unwrap();
-        install_kimi().unwrap(); // idempotent
+        install("kimi").unwrap();
+        install("kimi").unwrap(); // idempotent
         assert!(is_installed("kimi"));
         assert!(tmp.join("luvus-agent-hook.sh").exists());
 
@@ -945,8 +781,8 @@ mod tests {
         // And the auth config must never be touched.
         fs::write(tmp.join("config.toml"), "[auth]\nkey = \"secret\"\n").unwrap();
 
-        install_grok().unwrap();
-        install_grok().unwrap(); // idempotent — it's our own file, just overwritten
+        install("grok").unwrap();
+        install("grok").unwrap(); // idempotent — it's our own file, just overwritten
         assert!(is_installed("grok"));
         assert!(hooks.join("luvus-agent-hook.sh").exists());
 
@@ -976,27 +812,368 @@ mod tests {
     }
 
     #[test]
-    fn opencode_installs_a_plugin_file() {
+    fn opencode_installs_a_tui_plugin_without_process_spawns() {
         let _env = crate::persist::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!("luvus-opencode-{}", std::process::id()));
+        let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-state/integration")
+            .join(format!("luvus-opencode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        let old_tui = std::env::var_os("OPENCODE_TUI_CONFIG");
         std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        std::env::remove_var("OPENCODE_TUI_CONFIG");
 
-        install_opencode().unwrap();
-        let plugin = tmp.join("opencode").join("plugin").join("luvus.js");
+        install("opencode").unwrap();
+        let plugin = tmp.join("opencode").join("luvus-tui.mjs");
         let js = fs::read_to_string(&plugin).unwrap();
         assert!(js.contains("session.created"), "hooks the session event");
-        assert!(js.contains("--agent"), "reports the session");
+        assert!(js.contains("pane.report_session"), "reports the session");
         assert!(
-            js.contains("process.env.LUVUS_BIN_PATH"),
-            "uses the exact server-selected binary before PATH fallback"
+            js.contains("net.createConnection"),
+            "uses direct bounded local transport"
         );
+        assert!(!js.contains("child_process"));
         assert!(js.contains("opencode"));
         assert!(is_installed("opencode"));
 
-        std::env::remove_var("XDG_CONFIG_HOME");
+        match old {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_tui {
+            Some(value) => std::env::set_var("OPENCODE_TUI_CONFIG", value),
+            None => std::env::remove_var("OPENCODE_TUI_CONFIG"),
+        }
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn omp_install_writes_extension_and_is_idempotent() {
+        let _env = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("luvus-omp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let saved_home = std::env::var_os("HOME");
+        let saved_userprofile = std::env::var_os("USERPROFILE");
+        let omp_vars = [
+            "OMP_PROFILE",
+            "PI_PROFILE",
+            "PI_CONFIG_DIR",
+            "PI_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
+            "XDG_DATA_HOME",
+        ];
+        let saved_omp_vars: Vec<_> = omp_vars
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("USERPROFILE", &tmp);
+        for key in omp_vars {
+            std::env::remove_var(key);
+        }
+
+        crate::agent::omp::install_extension().unwrap();
+        crate::agent::omp::install_extension().unwrap(); // idempotent
+
+        let ext = tmp
+            .join(".omp")
+            .join("agent")
+            .join("extensions")
+            .join("luvus.ts");
+        assert!(ext.exists(), "luvus.ts dropped in the omp extensions dir");
+        // A user-installed factory in the same directory must survive.
+        let sibling = tmp
+            .join(".omp")
+            .join("agent")
+            .join("extensions")
+            .join("mine.ts");
+        fs::write(&sibling, "export default () => {}").unwrap();
+
+        crate::agent::omp::install_extension().unwrap();
+        assert!(sibling.exists(), "unrelated omp extension preserved");
+        assert!(is_installed("omp"));
+
+        uninstall("omp").unwrap();
+        assert!(!is_installed("omp"), "luvus.ts removed");
+        assert!(sibling.exists(), "unrelated omp extension still preserved");
+        uninstall("omp").unwrap(); // idempotent
+
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        for (key, value) in saved_omp_vars {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn omp_install_accepts_pi_spelling_only_as_separate_agent() {
+        // omp and pi are different agents. `install("pi")` must NOT install the
+        // OMP extension — pi has no hook integration, so the request errors.
+        assert!(install("pi").is_err(), "pi is not omp; no alias");
+        assert!(!agent_ids().any(|agent| agent == "pi"));
+    }
+
+    #[test]
+    fn omp_extension_source_is_syntactically_valid_typescript() {
+        // Rust CI embeds the extension as text and never type-checks it, so
+        // validate the generated file with Node's parser (available on every
+        // GitHub runner). `node --check` parses the source without executing
+        // it; a missing identifier or syntax error fails the build.
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(if cfg!(windows) { "node.exe" } else { "node" }))
+                .find(|candidate| candidate.is_file())
+        });
+        let Some(node) = node else {
+            return; // node not installed locally — CI runners always have it
+        };
+        let dir = std::env::temp_dir().join(format!("luvus-omp-parse-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("luvus.mts"); // .mts: parsed as an ES module
+        fs::write(&path, omp_extension()).unwrap();
+        let output = std::process::Command::new(node)
+            .args(["--check", "--experimental-strip-types"])
+            .arg(&path)
+            .output()
+            .expect("node --check should spawn");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            output.status.success(),
+            "generated omp extension failed to parse: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn omp_extension_reports_authoritative_root_state_transitions() {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(if cfg!(windows) { "node.exe" } else { "node" }))
+                .find(|candidate| candidate.is_file())
+        });
+        let Some(node) = node else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("luvus-omp-events-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let extension = dir.join("luvus.mts");
+        let harness = dir.join("harness.mjs");
+        fs::write(&extension, omp_extension()).unwrap();
+        fs::write(
+            &harness,
+            r#"
+import { pathToFileURL } from "node:url";
+
+process.env.LUVUS_ENV = "1";
+process.env.LUVUS_PANE_ID = "7";
+process.env.LUVUS_SOCKET_PATH = "/isolated/luvus.sock";
+process.env.LUVUS_BIN_PATH = "/opt/luvus";
+
+const handlers = new Map();
+const calls = [];
+const pi = {
+  on(name, handler) { handlers.set(name, handler); },
+  async exec(bin, args) {
+    calls.push({ bin, args });
+    return { stdout: "", stderr: "", code: 0, killed: false };
+  },
+};
+const extension = await import(pathToFileURL(process.argv[2]).href);
+extension.default(pi);
+const root = { hasUI: true, sessionManager: { getSessionId: () => "session-1" } };
+const child = { hasUI: false, sessionManager: { getSessionId: () => "child" } };
+const emit = async (name, event, ctx = root) => {
+  const result = handlers.get(name)?.(event, ctx);
+  if (result && typeof result.then === "function") await result;
+};
+
+await emit("session_start", {});
+await emit("agent_start", {});
+await emit("tool_approval_requested", { toolCallId: "a", toolName: "bash", reason: "approve" });
+await emit("tool_approval_resolved", { toolCallId: "a", toolName: "bash", approved: true });
+await emit("tool_execution_start", { toolCallId: "q", toolName: "ask", args: { questions: [{ question: "choose" }] } });
+await emit("tool_execution_end", { toolCallId: "q", toolName: "ask", result: {}, isError: false });
+await emit("tool_approval_requested", { toolCallId: "child", toolName: "bash" }, child);
+await emit("session_stop", {});
+await emit("session_shutdown", {});
+console.log(JSON.stringify(calls));
+"#,
+        )
+        .unwrap();
+        let output = std::process::Command::new(node)
+            .arg("--experimental-strip-types")
+            .arg(&harness)
+            .arg(&extension)
+            .output()
+            .expect("OMP extension harness should spawn");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            output.status.success(),
+            "OMP extension harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(calls.len(), 11, "child-session events must be ignored");
+        assert!(calls.iter().all(|call| call["bin"] == "/opt/luvus"));
+
+        let reports: Vec<_> = calls
+            .iter()
+            .filter_map(|call| {
+                let args = call["args"].as_array()?;
+                (args.first()? == "agent" && args.get(1)? == "report").then_some(args)
+            })
+            .collect();
+        let statuses: Vec<_> = reports
+            .iter()
+            .map(|args| {
+                let at = args.iter().position(|arg| arg == "--status").unwrap();
+                args[at + 1].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            ["idle", "working", "blocked", "working", "blocked", "working", "done"]
+        );
+        for args in reports {
+            assert_eq!(args[2], "7");
+            assert!(args.iter().any(|arg| arg == "--sequence"));
+            assert!(args.iter().any(|arg| arg == "--ttl"));
+            let session = args.iter().position(|arg| arg == "--session").unwrap();
+            assert_eq!(args[session + 1], "session-1");
+        }
+        let last = calls.last().unwrap()["args"].as_array().unwrap();
+        assert_eq!(last[0], "agent");
+        assert_eq!(last[1], "release");
+        assert_eq!(last[2], "7");
+    }
+
+    #[test]
+    fn omp_extension_registers_only_documented_events_and_reports_via_cli() {
+        // Every pi.on(...) registration must name an event from omp's public
+        // ExtensionAPI catalog (docs/extension-authoring), and all reports go
+        // through the luvus CLI so routing follows LUVUS_SOCKET_PATH exactly.
+        const DOCUMENTED_EVENTS: &[&str] = &[
+            "resources_discover",
+            "session_start",
+            "session_before_switch",
+            "session_switch",
+            "session_before_branch",
+            "session_branch",
+            "session_before_compact",
+            "session.compacting",
+            "session_compact",
+            "session_before_tree",
+            "session_tree",
+            "session_shutdown",
+            "input",
+            "before_agent_start",
+            "before_provider_request",
+            "after_provider_response",
+            "context",
+            "agent_start",
+            "agent_end",
+            "session_stop",
+            "turn_start",
+            "turn_end",
+            "message_start",
+            "message_update",
+            "message_end",
+            "tool_call",
+            "tool_result",
+            "tool_execution_start",
+            "tool_execution_update",
+            "tool_execution_end",
+            "tool_approval_requested",
+            "tool_approval_resolved",
+            "user_bash",
+            "user_python",
+            "mcp_notification",
+            "auto_compaction_start",
+            "auto_compaction_end",
+            "auto_retry_start",
+            "auto_retry_end",
+            "retry_fallback_applied",
+            "retry_fallback_succeeded",
+            "ttsr_triggered",
+            "todo_reminder",
+            "goal_updated",
+            "credential_disabled",
+        ];
+        let extension = omp_extension();
+        for capture in extension.match_indices("pi.on(\"") {
+            let start = capture.0 + "pi.on(\"".len();
+            let rest = &extension[start..];
+            let end = rest.find('"').expect("unterminated event name");
+            let event = &rest[..end];
+            assert!(
+                DOCUMENTED_EVENTS.contains(&event),
+                "`{event}` is not in omp's documented ExtensionAPI event list"
+            );
+        }
+        // Root completion comes only from session_stop — never agent_end or
+        // turn_end, which child subagent sessions also emit.
+        assert!(extension.contains("pi.on(\"session_stop\""));
+        assert!(
+            !extension.contains("pi.on(\"agent_end\"") && !extension.contains("pi.on(\"turn_end\""),
+            "child sessions forward agent_end/turn_end; reporting Stop from \
+             them would mark the root pane done when a subagent finishes"
+        );
+        // The omp loader accepts a module-as-function or module.default; a
+        // named-only export is skipped at load. This is the real load
+        // contract — node --check cannot catch it.
+        assert!(
+            extension.contains("export default createLuvusExtension"),
+            "the extension must keep its default export or omp never loads it"
+        );
+        // A file path is not a session id: the session-file fallback must
+        // stay gone (safe_id() rejects `\\` on Windows, so a path would
+        // silently break resume there).
+        assert!(
+            !extension.contains("getSessionFile"),
+            "sessionRef must not fall back to a file path"
+        );
+        // OMP uses Luvus's authoritative state channel, including ordering and
+        // TTL, while keeping exact native session ids for resume.
+        assert!(
+            extension.contains("\"agent\",") && extension.contains("\"report\","),
+            "state must use the validated agent report API"
+        );
+        assert!(
+            extension.contains("--sequence")
+                && extension.contains("--ttl")
+                && extension.contains("--session"),
+            "reports must be ordered, expiring, and resume-aware"
+        );
+        for status in ["idle", "working", "blocked", "done"] {
+            assert!(extension.contains(status), "missing `{status}` state");
+        }
+        assert!(extension.contains("pi.on(\"tool_approval_resolved\""));
+        assert!(extension.contains("pi.on(\"tool_execution_end\""));
+        assert!(extension.contains("\"release\""));
+        // Reports route through the exact-session CLI, not pipe discovery.
+        assert!(extension.contains("LUVUS_BIN_PATH"));
+        assert!(
+            !extension.contains("readdirSync")
+                && !extension.contains("node:net")
+                && !extension.contains("createConnection")
+                && !extension.contains("\\\\.\\pipe\\"),
+            "no named-pipe enumeration: reports must target the inherited \
+             session socket via the luvus CLI"
+        );
     }
 }

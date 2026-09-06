@@ -10,9 +10,10 @@ use ratatui::style::{Color, Modifier};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::sound::SoundSignal;
 use crate::terminal::theme_probe::TerminalColors;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -47,8 +48,8 @@ pub enum ServerMessage {
     FrameDiff(FrameDiff),
     /// Ring the bell + raise a desktop notification on the client's terminal.
     Notify(String),
-    /// Play the retro "done" jingle on the client (an agent finished).
-    Sound,
+    /// Play the selected notification cue on the client.
+    Sound(SoundSignal),
     /// Set the client's system clipboard (OSC 52) to this text — sent when a
     /// mouse selection finishes, so drag-to-select auto-copies.
     Clipboard(String),
@@ -82,6 +83,10 @@ pub struct FrameData {
     /// Row-major, `width * height` cells.
     pub cells: Vec<CellData>,
     pub cursor: Option<(u16, u16)>,
+    /// When `cursor` is Some, whether the host caret should be shown. Hidden
+    /// in-view PTY still parks IME (Pi `?25l` after CUP to its input marker).
+    #[serde(default)]
+    pub cursor_visible: bool,
 }
 
 /// A sparse update sent instead of a full `FrameData` when the dimensions are
@@ -95,6 +100,8 @@ pub struct FrameDiff {
     pub height: u16,
     pub runs: Vec<DiffRun>,
     pub cursor: Option<(u16, u16)>,
+    #[serde(default)]
+    pub cursor_visible: bool,
 }
 
 /// A maximal run of adjacent changed cells that share `fg`/`bg`/`mods`. `symbols`
@@ -159,6 +166,7 @@ pub fn apply_diff(frame: &mut FrameData, diff: &FrameDiff) {
     frame.width = diff.width;
     frame.height = diff.height;
     frame.cursor = diff.cursor;
+    frame.cursor_visible = diff.cursor_visible;
     for run in &diff.runs {
         for (k, sym) in run.symbols.iter().enumerate() {
             if let Some(slot) = frame.cells.get_mut(run.start as usize + k) {
@@ -233,7 +241,11 @@ fn wire_symbol(raw: &str, prev_wide: bool) -> &str {
     }
 }
 
-pub fn frame_from_buffer(buf: &Buffer, cursor: Option<(u16, u16)>) -> FrameData {
+pub fn frame_from_buffer(
+    buf: &Buffer,
+    cursor: Option<(u16, u16)>,
+    cursor_visible: bool,
+) -> FrameData {
     let area = buf.area;
     let mut cells = Vec::with_capacity(area.width as usize * area.height as usize);
     for y in 0..area.height {
@@ -255,6 +267,7 @@ pub fn frame_from_buffer(buf: &Buffer, cursor: Option<(u16, u16)>) -> FrameData 
         height: area.height,
         cells,
         cursor,
+        cursor_visible: cursor.is_some() && cursor_visible,
     }
 }
 
@@ -433,6 +446,7 @@ mod tests {
                 },
             ],
             cursor: Some((1, 0)),
+            cursor_visible: true,
         });
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -447,6 +461,20 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn sound_signal_roundtrip_preserves_style_and_cue() {
+        let signal = crate::sound::SoundSignal {
+            cue: crate::sound::SoundCue::Blocked,
+            style: crate::sound::SoundStyle::Pulse,
+        };
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &ServerMessage::Sound(signal)).unwrap();
+        assert!(matches!(
+            read_message::<_, ServerMessage>(&mut &bytes[..]).unwrap(),
+            ServerMessage::Sound(decoded) if decoded == signal
+        ));
     }
 
     #[test]
@@ -483,7 +511,7 @@ mod tests {
         );
 
         // Full-frame serialization blanks it.
-        let frame = frame_from_buffer(&buf, None);
+        let frame = frame_from_buffer(&buf, None, false);
         assert_eq!(frame.cells[0].symbol, "🔴", "emoji at col 0");
         assert_eq!(
             frame.cells[1].symbol, "",
@@ -493,7 +521,7 @@ mod tests {
 
         // The per-frame diff path blanks it too, so a modal that repaints via
         // `diff_buffer` (the hot path) is fixed as well.
-        let mut prev = frame_from_buffer(&Buffer::empty(Rect::new(0, 0, 6, 1)), None);
+        let mut prev = frame_from_buffer(&Buffer::empty(Rect::new(0, 0, 6, 1)), None, false);
         let runs = diff_buffer(&mut prev, &buf);
         let changed: Vec<&str> = runs
             .iter()
@@ -511,7 +539,7 @@ mod tests {
         use ratatui::layout::Rect;
         let area = Rect::new(0, 0, 4, 2);
         // `prev` starts as the blank buffer.
-        let mut prev = frame_from_buffer(&Buffer::empty(area), None);
+        let mut prev = frame_from_buffer(&Buffer::empty(area), None, false);
         // A buffer with two adjacent changed cells on row 0.
         let mut buf = Buffer::empty(area);
         buf[(1, 0)].set_symbol("a");
@@ -522,7 +550,7 @@ mod tests {
         assert_eq!(runs[0].start, 1);
         assert_eq!(runs[0].symbols, vec!["a".to_string(), "b".to_string()]);
         // `prev` was updated in place to equal the buffer.
-        assert_eq!(prev.cells, frame_from_buffer(&buf, None).cells);
+        assert_eq!(prev.cells, frame_from_buffer(&buf, None, false).cells);
         // Diffing the same buffer again yields nothing (no spurious frames).
         assert!(diff_buffer(&mut prev, &buf).is_empty());
     }
@@ -540,6 +568,7 @@ mod tests {
             height: 1,
             cells: vec![cell("a"), cell("b"), cell("c")],
             cursor: Some((0, 0)),
+            cursor_visible: true,
         };
         let mut new = old.clone();
         new.cells[1] = cell("X"); // one cell changed
@@ -559,6 +588,7 @@ mod tests {
                 height: new.height,
                 runs,
                 cursor: new.cursor,
+                cursor_visible: new.cursor_visible,
             },
         );
         assert!(rebuilt == new, "diff reconstructs the new frame");
@@ -577,6 +607,7 @@ mod tests {
             height: 1,
             cells: vec![c(" ", 0), c(" ", 0), c(" ", 0), c(" ", 0), c(" ", 0)],
             cursor: None,
+            cursor_visible: false,
         };
         let mut new = old.clone();
         // "hi" same color at 1..3, then a different-color "X" at 3.
@@ -609,6 +640,7 @@ mod tests {
             height: 2,
             cells: vec![cell("a", 1), cell("b", 2), cell("c", 3), cell("d", 4)],
             cursor: Some((0, 0)),
+            cursor_visible: true,
         };
         let mut f2 = f1.clone();
         f2.cells[3] = cell("Z", 9);
@@ -621,6 +653,7 @@ mod tests {
             height: f2.height,
             runs: diff_runs(&f1, &f2),
             cursor: f2.cursor,
+            cursor_visible: f2.cursor_visible,
         });
         let mut wire = Vec::new();
         write_message(&mut wire, &frame_msg).unwrap();
@@ -680,6 +713,7 @@ mod size_probe {
             height: h,
             cells,
             cursor: Some((0, 0)),
+            cursor_visible: true,
         }
     }
     fn ser(m: &ServerMessage) -> usize {
@@ -702,6 +736,7 @@ mod size_probe {
             height: 32,
             runs: diff_runs(&f0, &f1),
             cursor: f1.cursor,
+            cursor_visible: f1.cursor_visible,
         }));
         // simulate a line of output: 40 chars, same color
         let mut f2 = f0.clone();
@@ -713,6 +748,7 @@ mod size_probe {
             height: 32,
             runs: diff_runs(&f0, &f2),
             cursor: Some((40, 1)),
+            cursor_visible: true,
         }));
         // a full-screen redraw of same-colored text (worst streaming case)
         let mut f3 = f0.clone();
@@ -724,6 +760,7 @@ mod size_probe {
             height: 32,
             runs: diff_runs(&f0, &f3),
             cursor: Some((0, 0)),
+            cursor_visible: true,
         }));
         println!("FULL frame (120x32)      : {full} bytes");
         println!(

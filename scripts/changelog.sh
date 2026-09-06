@@ -2,9 +2,9 @@
 #
 # changelog.sh — release notes for a tag.
 #
-# `changelog/<tag>.md` in the repo is the **source of truth**. It is what the
-# GitHub Release publishes and what luvus.dev/changelog renders, so the notes are
-# version-controlled, reviewable in a PR, and identical everywhere.
+# `changelog/<tag>.md` in the repo is the **source of truth**. GitHub Releases
+# and luvus.dev/changelog may enrich its contributor links with avatars, while
+# the notes themselves stay version-controlled and reviewable in one place.
 #
 #   scripts/changelog.sh v0.8.1            # print the notes (curated file if it
 #                                          # exists, else generated from commits)
@@ -40,9 +40,33 @@ strip_front_matter() {
     | awk 'NF {p=1} p'
 }
 
-# Print an existing curated file verbatim — never regenerate over hand-written notes.
+# GitHub Releases can render profile pictures even though the source Markdown
+# stays portable for the terminal app. Add an avatar row above curated linked
+# contributor and issue-reporter lists, then retain each text list as the
+# accessible fallback.
+render_release_notes() {
+  strip_front_matter | perl -0pe '
+    s{(^## (?:Contributors|Issue reporters)[ \t]*\r?\n(?:\r?\n)?)((?:^[ \t]*-[^\r\n]*(?:\r?\n|$))+)}{
+      my ($heading, $list) = ($1, $2);
+      my @avatars;
+      while ($list =~ m{^[ \t]*- \[([^\]]+)\]\(https://github\.com/([A-Za-z0-9-]+)/?\)[ \t]*$}gm) {
+        my ($label, $login) = ($1, $2);
+        $label =~ s/&/&amp;/g;
+        $label =~ s/"/&quot;/g;
+        $label =~ s/</&lt;/g;
+        $label =~ s/>/&gt;/g;
+        push @avatars, qq{<a href="https://github.com/$login" title="$label"><img src="https://github.com/$login.png?size=80" alt="$label" width="40" height="40"></a>};
+      }
+      @avatars
+        ? $heading . "<p>\n" . join("\n", @avatars) . "\n</p>\n\n" . $list
+        : $heading . $list;
+    }egm;
+  '
+}
+
+# Print an existing curated file without regenerating over hand-written notes.
 if [ "$WRITE" = 0 ] && [ -f "$FILE" ]; then
-  strip_front_matter < "$FILE"
+  render_release_notes < "$FILE"
   exit 0
 fi
 if [ "$WRITE" = 1 ] && [ -f "$FILE" ] && [ "$FORCE" = 0 ]; then
@@ -160,6 +184,7 @@ if [ "$WRITE" = 1 ]; then
   notes > "$FILE"
   printf 'wrote changelog/%s.md — edit it before releasing.\n' "$NEW" >&2
 else
-  # Same strip as the curated path, so both produce an identical release body.
-  notes | strip_front_matter
+  # Same rendering as the curated path, including profile avatars when the
+  # generated notes eventually contain linked GitHub credit sections.
+  notes | render_release_notes
 fi

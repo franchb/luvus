@@ -1,0 +1,166 @@
+---
+title: Getting started with UHP
+description: Connect a script or coding harness to Luvus through Universal Harness Protocol 1.0.
+---
+
+Universal Harness Protocol, or UHP, is Luvus's single public automation
+contract. It covers host sessions, workspaces, tabs, panes, agents, terminal
+streams, files, Git, DIFF, Mission Control, worktrees, modules, bars,
+configuration, and events.
+
+Normal commands such as `luvus pane list` are friendly wrappers over the same
+UHP methods. Unix sockets on macOS and Linux and named pipes on Windows are
+local transports, not separate APIs.
+
+## Before you connect
+
+Confirm that you are targeting the intended server and named session:
+
+```sh
+luvus server status
+luvus --session review uhp capabilities
+```
+
+Inside a Luvus pane, preserve its inherited endpoint and session environment.
+Outside Luvus, pass `--session <name>` explicitly when the default session is
+not your target. Begin with capability discovery and read-only calls. Add
+mutation or terminal-control authority only when the workflow requires it.
+
+## Discover and inspect
+
+```sh
+luvus session list --json
+luvus uhp schema
+luvus uhp capabilities
+luvus uhp snapshot
+```
+
+UHP is always available to the local owner. Capability discovery returns
+`luvus-uhp` version `1.0`, the complete method registry, access contracts,
+limits, event sequence, identity rules, and terminal capabilities. Schema
+discovery includes `event_catalog.properties`, which maps general event names to
+their payload field schemas.
+
+## Send one request
+
+Each ordinary connection carries one UTF-8 JSON request and response. Both are
+terminated by LF and bounded to the advertised frame limit.
+
+```json
+{"id":"pane-1","method":"pane.list","params":{}}
+```
+
+Inside a Luvus pane, `$LUVUS_SOCKET_PATH` contains the selected endpoint. On
+macOS or Linux you can send a request directly:
+
+```sh
+printf '%s\n' '{"id":"pane-1","method":"pane.list","params":{}}' \
+  | nc -U "$LUVUS_SOCKET_PATH"
+```
+
+For a transport-neutral one-frame bridge, including over SSH:
+
+```sh
+printf '%s\n' '{"id":"snap","method":"session.snapshot","params":{}}' \
+  | luvus uhp proxy
+
+printf '%s\n' '{"id":"snap","method":"session.snapshot","params":{}}' \
+  | ssh host luvus uhp proxy
+```
+
+`uhp proxy` forwards one bounded request and response. Persistent event and
+terminal streams must connect to the discovered local endpoint.
+
+It also owns the on-demand host profile, which works without a running session:
+
+```sh
+printf '%s\n' '{"id":"host","method":"host.info","params":{}}' | luvus uhp proxy
+printf '%s\n' '{"id":"sessions","method":"session.list","params":{}}' | luvus uhp proxy
+```
+
+Use `host.capabilities` to discover that separate profile. Host mutations such
+as `session.delete`, `skill.enable`, and `integration.install` require
+`confirm:true`, reject delegated session tokens, and are not exposed by
+`luvus uhp access`.
+
+## Mission Control data
+
+`mission.snapshot` returns read-only live and resumable agent rows plus usage
+totals without opening or focusing the dashboard. `mission.refresh` schedules
+one off-render-path usage scan; take another snapshot after the refresh
+completes. Both accept `scope:"workspace"` or `scope:"all"` and an optional
+workspace target.
+
+```json
+{"id":"mission","method":"mission.snapshot","params":{"scope":"all"}}
+```
+
+## Responses and mutations
+
+A success returns the request ID and `result`. A failure returns the request ID
+and a structured `error`.
+
+```json
+{"id":"pane-1","result":{"type":"pane_list","panes":[]}}
+{"id":"pane-1","error":{"code":"not_found","message":"pane not found"}}
+```
+
+If a connection is lost during a mutation, reconcile state before retrying.
+Never blindly repeat prompts, terminal input, or agent launches. State results
+include a monotonic `revision`; mutations can pass `if_revision` and stale
+callers receive `revision_conflict` before execution.
+
+## Agents and terminals
+
+```json
+{"id":"explain","method":"agent.explain","params":{"pane":"7"}}
+{"id":"prompt","method":"agent.prompt","params":{"target":"reviewer","text":"Review the diff","wait":true,"until":["idle","done","blocked"],"timeout_s":600}}
+```
+
+Terminal methods use stable PTY identity. Discover terminals first, then reuse
+the returned `server_generation`, `terminal_id`, and `pane_id`:
+
+```json
+{"id":"inventory","method":"terminal.backend.inventory","params":{}}
+{"id":"capture","method":"terminal.backend.capture","params":{"server_generation":"...","terminal_id":"...","pane_id":"7","mode":"recent_unwrapped","lines":100,"ansi":false}}
+```
+
+`terminal.backend.observe` provides a bounded read-only ANSI stream.
+`terminal.backend.control` adds correlated input frames and gives one client an
+exclusive control lease. Both are change-driven and idle without polling.
+
+## Events without races
+
+1. Subscribe with `events.subscribe`.
+2. Fetch `session.snapshot` on another connection.
+3. Discard buffered events at or below the snapshot sequence.
+4. Apply later events in order.
+5. Resnapshot after a gap, overflow, EOF, reconnect, or generation change.
+
+Use `luvus uhp events` for a stream test. Production clients should reconnect
+through the discovered endpoint and pass `after_sequence`.
+
+## Delegated access
+
+The endpoint is owner-only and grants the owner full authority. Create an
+in-memory, expiring token when a harness needs narrower access:
+
+```json
+{"id":"token","method":"uhp.token.create","params":{"scopes":["read","terminal"],"ttl_s":3600}}
+```
+
+Supply the returned secret in `auth`. Use `uhp.token.list` and
+`uhp.token.revoke` to manage it. Never log the secret.
+
+For a provider or client that must work beyond the owner-only local endpoint,
+use `luvus uhp access`. It creates a scoped loopback gateway, emits a versioned
+machine-readable descriptor, and keeps transport outside Luvus core. See
+[Connecting UHP transports and clients](/docs/uhp/remote-access/).
+
+## Continue building
+
+- Copy complete request flows from [Practical examples](/docs/uhp/examples/).
+- Find parameters and results in the [Method reference](/docs/uhp/methods/).
+- Build PTY capture and control with [Terminal methods](/docs/uhp/terminal/).
+- Carry UHP through a secure provider with [Remote access](/docs/uhp/remote-access/).
+- Validate a client with [Schemas and conformance](/docs/uhp/conformance/).

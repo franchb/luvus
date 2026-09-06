@@ -508,6 +508,13 @@ pub trait Handler {
     /// A character to be displayed.
     fn input(&mut self, _c: char) {}
 
+    /// A contiguous run of printable ASCII characters.
+    fn input_ascii(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.input(char::from(*byte));
+        }
+    }
+
     /// Set cursor to position.
     fn goto(&mut self, _line: i32, _col: usize) {}
 
@@ -531,6 +538,9 @@ pub trait Handler {
 
     /// Report device status.
     fn device_status(&mut self, _: usize) {}
+
+    /// Report private device status.
+    fn private_device_status(&mut self, _: usize) {}
 
     /// Move cursor forward `cols`.
     fn move_forward(&mut self, _col: usize) {}
@@ -917,6 +927,7 @@ impl PrivateMode {
             1049 => Self::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor),
             2004 => Self::Named(NamedPrivateMode::BracketedPaste),
             2026 => Self::Named(NamedPrivateMode::SyncUpdate),
+            2031 => Self::Named(NamedPrivateMode::ReportColorScheme),
             _ => Self::Unknown(mode),
         }
     }
@@ -968,6 +979,8 @@ pub enum NamedPrivateMode {
     BracketedPaste = 2004,
     /// The mode is handled automatically by [`Processor`].
     SyncUpdate = 2026,
+    /// Send unsolicited dark/light color-scheme reports.
+    ReportColorScheme = 2031,
 }
 
 /// Mode for clearing line.
@@ -1296,6 +1309,19 @@ where
     }
 
     #[inline]
+    fn print_ascii(&mut self, bytes: &[u8]) {
+        self.handler.input_ascii(bytes);
+        self.state.preceding_char = bytes.last().copied().map(char::from);
+    }
+
+    #[inline]
+    fn ascii_print_never_terminates(&self) -> bool {
+        // Only escape/control dispatch changes this performer's termination
+        // state; Handler::input_ascii has no access to that state.
+        true
+    }
+
+    #[inline]
     fn execute(&mut self, byte: u8) {
         match byte {
             C0::HT => self.handler.put_tab(1),
@@ -1341,7 +1367,7 @@ where
                 }
                 buf.push_str("],");
             }
-            debug!("[unhandled osc_dispatch]: [{}] at line {}", &buf, line!());
+            debug!("[unhandled osc_dispatch]: [{}] at line {}", buf, line!());
         }
 
         if params.is_empty() || params[0].is_empty() {
@@ -1702,6 +1728,7 @@ where
                 }
             },
             ('n', []) => handler.device_status(next_param_or(0) as usize),
+            ('n', [b'?']) => handler.private_device_status(next_param_or(0) as usize),
             ('P', []) => handler.delete_chars(next_param_or(1) as usize),
             ('p', [b'$']) => {
                 let mode = next_param_or(0);

@@ -1,36 +1,30 @@
-//! Explicit, remotely distributed agent skills.
+//! One bundled Luvus skill with host-specific installation adapters.
 //!
-//! Luvus never installs or refreshes a skill during startup. A user opts one
-//! agent in with `luvus skill enable <agent>`, after which `skill update` may
-//! replace only that managed installation. Production skill instructions live
-//! outside this repository and are authenticated by a signed manifest.
+//! The skill is part of the Luvus release, so its instructions always match the
+//! binary that installs them. `luvus skill enable` copies the same logical skill
+//! into each detected supported skill host. No command here downloads prompt
+//! instructions or changes an agent configuration during Luvus startup.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::str::FromStr;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use fs2::FileExt;
-use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const DEFAULT_MANIFEST_URL: &str = "https://luvus.dev/skills/manifest.json";
+pub const BUNDLED_SKILL: &str = include_str!("../skills/luvus/SKILL.md");
+const BUNDLED_ADVANCED_CONTROL: &str =
+    include_str!("../skills/luvus/references/advanced-control.md");
+const BUNDLED_UHP_CONTROL: &str = include_str!("../skills/luvus/references/uhp-control.md");
+const BUNDLED_OPENAI_METADATA: &str = include_str!("../skills/luvus/agents/openai.yaml");
+
 const STATE_SCHEMA: u32 = 1;
-const MANIFEST_SCHEMA: u32 = 1;
-const PACKAGE_SCHEMA: u32 = 1;
-const MAX_MANIFEST_BYTES: usize = 256 * 1024;
-const MAX_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_FILE_BYTES: usize = 512 * 1024;
-const MAX_FETCH_ERROR_BYTES: usize = 64 * 1024;
+const BUNDLED_SOURCE: &str = "bundled";
 const MIGRATION_MARKER: &str = ".migrated-opt-in-v1";
 
 const POINTER_BEGIN: &str = "<!-- BEGIN luvus (managed by luvus; do not edit inside) -->";
@@ -52,42 +46,67 @@ const KNOWN_REFERENCE_HASHES: &[&str] = &[
 
 static INSTALL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// A native location capable of loading the one bundled Luvus skill.
+///
+/// This is intentionally an installation detail, not a user-selectable skill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum SkillAgent {
+pub enum SkillHost {
     Claude,
-    Codex,
+    /// The open `~/.agents/skills` location shared by Codex, Copilot, Gemini,
+    /// Pi, Cursor, Amp, Droid, and fx.
+    Shared,
     Opencode,
+    Kimi,
+    Grok,
+    Qwen,
+    Kiro,
+    Omp,
+    Hermes,
 }
 
-impl SkillAgent {
-    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Opencode];
+impl SkillHost {
+    const ALL: [Self; 9] = [
+        Self::Shared,
+        Self::Claude,
+        Self::Opencode,
+        Self::Kimi,
+        Self::Grok,
+        Self::Qwen,
+        Self::Kiro,
+        Self::Omp,
+        Self::Hermes,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
-            Self::Codex => "codex",
+            Self::Shared => "shared",
             Self::Opencode => "opencode",
+            Self::Kimi => "kimi",
+            Self::Grok => "grok",
+            Self::Qwen => "qwen",
+            Self::Kiro => "kiro",
+            Self::Omp => "omp",
+            Self::Hermes => "hermes",
+        }
+    }
+
+    /// Preserve the schema-1 `codex` ownership key for the shared destination.
+    /// Older Luvus releases already managed the same `~/.agents/skills` path,
+    /// so changing the key would orphan their ownership record.
+    fn state_key(self) -> &'static str {
+        if self == Self::Shared {
+            "codex"
+        } else {
+            self.as_str()
         }
     }
 }
 
-impl fmt::Display for SkillAgent {
+impl fmt::Display for SkillHost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for SkillAgent {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            "opencode" => Ok(Self::Opencode),
-            _ => bail!("unknown skill agent `{value}`; expected claude, codex, or opencode"),
-        }
     }
 }
 
@@ -105,6 +124,9 @@ pub struct InstalledSkill {
     pub files: Vec<ManagedFile>,
 }
 
+/// Keep the schema-1 `agents` field so state written by Luvus 0.11 and 0.12 is
+/// read without migration. Keys now identify installation hosts, not separate
+/// logical skills.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillState {
     #[serde(default = "state_schema")]
@@ -126,56 +148,6 @@ fn state_schema() -> u32 {
     STATE_SCHEMA
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct SignedEnvelope {
-    signed: String,
-    signature: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct SkillManifest {
-    schema: u32,
-    release: String,
-    requires_luvus: String,
-    artifacts: BTreeMap<String, SkillArtifact>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct SkillArtifact {
-    url: String,
-    sha256: String,
-    size: usize,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct SkillPackage {
-    schema: u32,
-    agent: SkillAgent,
-    release: String,
-    files: Vec<PackageFile>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PackageFile {
-    path: String,
-    content: String,
-    sha256: String,
-}
-
-#[derive(Debug, Clone)]
-struct VerifiedPackage {
-    agent: SkillAgent,
-    release: String,
-    files: Vec<VerifiedFile>,
-}
-
-#[derive(Debug, Clone)]
-struct VerifiedFile {
-    path: PathBuf,
-    content: Vec<u8>,
-    sha256: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Integrity {
     Current,
@@ -193,11 +165,117 @@ impl fmt::Display for Integrity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationState {
+    Current,
+    Outdated,
+    Missing,
+    Modified,
+    ExternalCurrent,
+    External,
+    Available,
+    NotDetected,
+}
+
+impl DestinationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Outdated => "outdated",
+            Self::Missing => "missing",
+            Self::Modified => "modified",
+            Self::ExternalCurrent => "external-current",
+            Self::External => "external",
+            Self::Available => "not-installed",
+            Self::NotDetected => "not-detected",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct SkillStatus {
-    pub agent: SkillAgent,
-    pub installed: Option<InstalledSkill>,
-    pub integrity: Option<Integrity>,
+pub struct DestinationStatus {
+    pub host: SkillHost,
+    pub target: PathBuf,
+    pub state: DestinationState,
+    pub managed_release: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeAction {
+    Installed,
+    Refreshed,
+    Repaired,
+    Current,
+    External,
+    PreservedModified,
+    Disabled,
+    AlreadyDisabled,
+}
+
+impl ChangeAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Refreshed => "refreshed",
+            Self::Repaired => "repaired",
+            Self::Current => "current",
+            Self::External => "external-preserved",
+            Self::PreservedModified => "modified-preserved",
+            Self::Disabled => "disabled",
+            Self::AlreadyDisabled => "already-disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillChange {
+    pub host: SkillHost,
+    pub target: PathBuf,
+    pub action: ChangeAction,
+}
+
+#[derive(Clone, Copy)]
+struct BundledFile {
+    path: &'static str,
+    content: &'static str,
+}
+
+fn bundled_files(host: SkillHost) -> Vec<BundledFile> {
+    let mut files = vec![
+        BundledFile {
+            path: "SKILL.md",
+            content: BUNDLED_SKILL,
+        },
+        BundledFile {
+            path: "references/advanced-control.md",
+            content: BUNDLED_ADVANCED_CONTROL,
+        },
+        BundledFile {
+            path: "references/uhp-control.md",
+            content: BUNDLED_UHP_CONTROL,
+        },
+    ];
+    if host == SkillHost::Shared {
+        files.push(BundledFile {
+            path: "agents/openai.yaml",
+            content: BUNDLED_OPENAI_METADATA,
+        });
+    }
+    files
+}
+
+fn bundled_managed_files(host: SkillHost) -> Vec<ManagedFile> {
+    bundled_files(host)
+        .into_iter()
+        .map(|file| ManagedFile {
+            path: file.path.to_string(),
+            sha256: sha256_hex(file.content.as_bytes()),
+        })
+        .collect()
+}
+
+pub fn bundled_release() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 fn state_path() -> PathBuf {
@@ -294,23 +372,47 @@ fn atomic_replace_file(tmp: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn target_dir_at(agent: SkillAgent, home: &Path, xdg_config: Option<&Path>) -> PathBuf {
-    match agent {
-        SkillAgent::Claude => home.join(".claude").join("skills").join("luvus"),
-        SkillAgent::Codex => home.join(".agents").join("skills").join("luvus"),
-        SkillAgent::Opencode => xdg_config
+fn target_dir_at(host: SkillHost, home: &Path, xdg_config: Option<&Path>) -> PathBuf {
+    match host {
+        SkillHost::Claude => home.join(".claude").join("skills").join("luvus"),
+        SkillHost::Shared => home.join(".agents").join("skills").join("luvus"),
+        SkillHost::Opencode => xdg_config
             .map(Path::to_path_buf)
             .unwrap_or_else(|| home.join(".config"))
             .join("opencode")
             .join("skills")
             .join("luvus"),
+        SkillHost::Kimi => home.join(".kimi-code").join("skills").join("luvus"),
+        SkillHost::Grok => home.join(".grok").join("skills").join("luvus"),
+        SkillHost::Qwen => home.join(".qwen").join("skills").join("luvus"),
+        SkillHost::Kiro => home.join(".kiro").join("skills").join("luvus"),
+        SkillHost::Omp => crate::agent::omp::default_skill_dir_at(home),
+        SkillHost::Hermes => home.join(".hermes").join("skills").join("luvus"),
     }
 }
 
-fn target_dir(agent: SkillAgent) -> Result<PathBuf> {
+fn target_dir(host: SkillHost) -> Result<PathBuf> {
+    if host == SkillHost::Omp {
+        return crate::agent::omp::skill_dir();
+    }
     let home = crate::platform::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
+    if host == SkillHost::Claude {
+        if let Some(config) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+            return Ok(PathBuf::from(config).join("skills").join("luvus"));
+        }
+    }
+    if host == SkillHost::Kimi {
+        if let Some(config) = std::env::var_os("KIMI_CODE_HOME") {
+            return Ok(PathBuf::from(config).join("skills").join("luvus"));
+        }
+    }
+    if host == SkillHost::Hermes {
+        if let Some(config) = std::env::var_os("HERMES_HOME").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(config).join("skills").join("luvus"));
+        }
+    }
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
-    Ok(target_dir_at(agent, &home, xdg.as_deref()))
+    Ok(target_dir_at(host, &home, xdg.as_deref()))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -321,361 +423,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn hash_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(sha256_hex(&bytes))
-}
-
-fn decode_b64<const N: usize>(label: &str, encoded: &str) -> Result<[u8; N]> {
-    let bytes = BASE64
-        .decode(encoded.trim())
-        .with_context(|| format!("decoding {label}"))?;
-    bytes
-        .try_into()
-        .map_err(|bytes: Vec<u8>| anyhow!("{label} has {} bytes; expected {N}", bytes.len()))
-}
-
-fn verification_key() -> Result<VerifyingKey> {
-    let encoded = option_env!("LUVUS_SKILL_PUBLIC_KEY_B64")
-        .map(str::to_owned)
-        .or_else(|| {
-            cfg!(debug_assertions)
-                .then(|| std::env::var("LUVUS_SKILL_PUBLIC_KEY_B64").ok())
-                .flatten()
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "this Luvus build has no skill verification key; release builds must set LUVUS_SKILL_PUBLIC_KEY_B64"
-            )
-        })?;
-    VerifyingKey::from_bytes(&decode_b64("skill verification key", &encoded)?)
-        .context("invalid skill verification key")
-}
-
-fn parse_signed_manifest(bytes: &[u8], key: &VerifyingKey) -> Result<SkillManifest> {
-    if bytes.len() > MAX_MANIFEST_BYTES {
-        bail!("skill manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit");
-    }
-    let envelope: SignedEnvelope =
-        serde_json::from_slice(bytes).context("parsing signed skill manifest envelope")?;
-    let signed = BASE64
-        .decode(envelope.signed.trim())
-        .context("decoding signed skill manifest")?;
-    if signed.len() > MAX_MANIFEST_BYTES {
-        bail!("signed skill manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit");
-    }
-    let signature = Signature::from_slice(
-        &BASE64
-            .decode(envelope.signature.trim())
-            .context("decoding skill manifest signature")?,
-    )
-    .context("invalid skill manifest signature shape")?;
-    key.verify(&signed, &signature)
-        .context("skill manifest signature verification failed")?;
-    let manifest: SkillManifest =
-        serde_json::from_slice(&signed).context("parsing verified skill manifest")?;
-    validate_manifest(&manifest)?;
-    Ok(manifest)
-}
-
-fn validate_manifest(manifest: &SkillManifest) -> Result<()> {
-    if manifest.schema != MANIFEST_SCHEMA {
-        bail!(
-            "unsupported skill manifest schema {}; expected {MANIFEST_SCHEMA}",
-            manifest.schema
-        );
-    }
-    if manifest.release.trim().is_empty() {
-        bail!("skill manifest release is empty");
-    }
-    let requirement = VersionReq::parse(&manifest.requires_luvus)
-        .context("invalid skill manifest Luvus version requirement")?;
-    let current = Version::parse(env!("CARGO_PKG_VERSION"))
-        .context("invalid compiled Luvus package version")?;
-    if !requirement.matches(&current) {
-        bail!(
-            "skill release {} requires Luvus {}; current Luvus is {}",
-            manifest.release,
-            manifest.requires_luvus,
-            current
-        );
-    }
-    for (agent, artifact) in &manifest.artifacts {
-        if agent.parse::<SkillAgent>().is_err() {
-            continue;
-        }
-        if artifact.size == 0 || artifact.size > MAX_PACKAGE_BYTES {
-            bail!("{agent} skill artifact has invalid size {}", artifact.size);
-        }
-        validate_sha256(&artifact.sha256)?;
-        validate_remote_url(&artifact.url)?;
-    }
-    Ok(())
-}
-
-fn validate_sha256(value: &str) -> Result<()> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("invalid SHA-256 digest `{value}`");
-    }
-    Ok(())
-}
-
-fn validate_remote_url(url: &str) -> Result<()> {
-    if url.starts_with("https://") {
-        return Ok(());
-    }
-    if cfg!(debug_assertions)
-        && std::env::var_os("LUVUS_SKILL_ALLOW_FILE").as_deref() == Some(std::ffi::OsStr::new("1"))
-        && url.starts_with("file://")
-    {
-        return Ok(());
-    }
-    bail!(
-        "skill sources must use HTTPS (file:// requires LUVUS_SKILL_ALLOW_FILE=1 in debug builds)"
-    )
-}
-
-fn fetch_bytes(url: &str, limit: usize) -> Result<Vec<u8>> {
-    validate_remote_url(url)?;
-    if let Some(path) = url.strip_prefix("file://") {
-        let bytes = fs::read(path).with_context(|| format!("reading {path}"))?;
-        if bytes.len() > limit {
-            bail!("download from {url} exceeds the {limit}-byte limit");
-        }
-        return Ok(bytes);
-    }
-
-    let max = limit.to_string();
-    let curl = [
-        "--fail",
-        "--silent",
-        "--show-error",
-        "--location",
-        "--max-time",
-        "20",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
-        "--max-filesize",
-        max.as_str(),
-        "--header",
-        "Accept: application/json",
-        "--header",
-        "User-Agent: luvus",
-        url,
-    ];
-    if let Some(bytes) = try_fetch_command("curl", &curl, limit)? {
-        return Ok(bytes);
-    }
-
-    let quota = format!("--quota={limit}");
-    let wget = [
-        "-q",
-        "-O",
-        "-",
-        "--timeout=20",
-        "--tries=1",
-        "--https-only",
-        quota.as_str(),
-        "--header=Accept: application/json",
-        "--header=User-Agent: luvus",
-        url,
-    ];
-    if let Some(bytes) = try_fetch_command("wget", &wget, limit)? {
-        return Ok(bytes);
-    }
-    bail!("need curl or wget to download Luvus skills")
-}
-
-fn try_fetch_command(prog: &str, args: &[&str], limit: usize) -> Result<Option<Vec<u8>>> {
-    let mut child = match crate::platform::no_window(
-        Command::new(prog)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    )
-    .spawn()
-    {
-        Ok(child) => child,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("running {prog}")),
-    };
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("capturing {prog} output"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("capturing {prog} errors"))?;
-    let errors = std::thread::spawn(move || {
-        let mut stderr = stderr;
-        let mut bytes = Vec::new();
-        let mut truncated = false;
-        let mut chunk = [0u8; 8192];
-        loop {
-            match stderr.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    let keep = read.min(MAX_FETCH_ERROR_BYTES.saturating_sub(bytes.len()));
-                    bytes.extend_from_slice(&chunk[..keep]);
-                    truncated |= keep < read;
-                }
-            }
-        }
-        (bytes, truncated)
-    });
-
-    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
-    let read = stdout.take((limit + 1) as u64).read_to_end(&mut bytes);
-    if read.is_err() || bytes.len() > limit {
-        let _ = child.kill();
-    }
-    let status = child
-        .wait()
-        .with_context(|| format!("waiting for {prog}"))?;
-    let (stderr, stderr_truncated) = errors.join().unwrap_or_default();
-    read.with_context(|| format!("reading {prog} response"))?;
-    if bytes.len() > limit {
-        bail!("{prog} response exceeds the {limit}-byte limit");
-    }
-    if !status.success() {
-        let mut message = String::from_utf8_lossy(&stderr).trim().to_string();
-        if stderr_truncated {
-            message.push('…');
-        }
-        bail!("{prog}: {message}");
-    }
-    Ok(Some(bytes))
-}
-
-fn fetch_manifest(url: &str) -> Result<SkillManifest> {
-    let key = verification_key()?;
-    let bytes = fetch_bytes(url, MAX_MANIFEST_BYTES)?;
-    parse_signed_manifest(&bytes, &key)
-}
-
-fn fetch_package(manifest: &SkillManifest, agent: SkillAgent) -> Result<VerifiedPackage> {
-    let artifact = manifest
-        .artifacts
-        .get(agent.as_str())
-        .ok_or_else(|| anyhow!("skill release {} has no {agent} artifact", manifest.release))?;
-    let bytes = fetch_bytes(&artifact.url, artifact.size.min(MAX_PACKAGE_BYTES))?;
-    if bytes.len() != artifact.size {
-        bail!(
-            "{agent} skill artifact size mismatch: got {}, expected {}",
-            bytes.len(),
-            artifact.size
-        );
-    }
-    if sha256_hex(&bytes) != artifact.sha256.to_ascii_lowercase() {
-        bail!("{agent} skill artifact SHA-256 mismatch");
-    }
-    let package: SkillPackage =
-        serde_json::from_slice(&bytes).context("parsing verified skill package")?;
-    validate_package(package, manifest, agent)
-}
-
-fn validate_package(
-    package: SkillPackage,
-    manifest: &SkillManifest,
-    agent: SkillAgent,
-) -> Result<VerifiedPackage> {
-    if package.schema != PACKAGE_SCHEMA {
-        bail!(
-            "unsupported skill package schema {}; expected {PACKAGE_SCHEMA}",
-            package.schema
-        );
-    }
-    if package.agent != agent {
-        bail!(
-            "skill package targets {}, not {agent}",
-            package.agent.as_str()
-        );
-    }
-    if package.release != manifest.release {
-        bail!(
-            "skill package release {} does not match manifest {}",
-            package.release,
-            manifest.release
-        );
-    }
-    if package.files.is_empty() {
-        bail!("skill package contains no files");
-    }
-
-    let mut seen = BTreeSet::new();
-    let mut verified = Vec::with_capacity(package.files.len());
-    let mut has_skill = false;
-    let mut total = 0usize;
-    for file in package.files {
-        validate_sha256(&file.sha256)?;
-        let path = safe_package_path(&file.path)?;
-        if !seen.insert(path.clone()) {
-            bail!("duplicate skill package path {}", path.display());
-        }
-        let content = file.content.into_bytes();
-        if content.len() > MAX_FILE_BYTES {
-            bail!("skill file {} exceeds the size limit", path.display());
-        }
-        total = total
-            .checked_add(content.len())
-            .ok_or_else(|| anyhow!("skill package size overflow"))?;
-        if total > MAX_PACKAGE_BYTES {
-            bail!("expanded skill package exceeds the size limit");
-        }
-        let digest = sha256_hex(&content);
-        if digest != file.sha256.to_ascii_lowercase() {
-            bail!("skill file {} SHA-256 mismatch", path.display());
-        }
-        if path == Path::new("SKILL.md") {
-            validate_skill_text(&content)?;
-            has_skill = true;
-        }
-        verified.push(VerifiedFile {
-            path,
-            content,
-            sha256: digest,
-        });
-    }
-    if !has_skill {
-        bail!("skill package is missing SKILL.md");
-    }
-    Ok(VerifiedPackage {
-        agent,
-        release: package.release,
-        files: verified,
-    })
-}
-
-fn safe_package_path(value: &str) -> Result<PathBuf> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || !path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-    {
-        bail!("unsafe skill package path `{value}`");
-    }
-    let allowed =
-        value == "SKILL.md" || value == "agents/openai.yaml" || value.starts_with("references/");
-    if !allowed {
-        bail!("unsupported skill package path `{value}`");
-    }
-    Ok(path.to_path_buf())
-}
-
-fn validate_skill_text(bytes: &[u8]) -> Result<()> {
-    let text = std::str::from_utf8(bytes).context("SKILL.md is not UTF-8")?;
-    let trimmed = text.trim_start();
-    if !(400..=MAX_FILE_BYTES).contains(&bytes.len())
-        || !trimmed.starts_with("---")
-        || !trimmed.contains("name: luvus")
-        || !trimmed.contains("description:")
-        || !trimmed.contains("=target")
-        || !trimmed.contains("agent send")
-    {
-        bail!("SKILL.md failed Luvus skill validation");
-    }
-    Ok(())
 }
 
 fn collect_relative_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
@@ -730,15 +477,158 @@ fn integrity(record: &InstalledSkill) -> Result<Integrity> {
     Ok(Integrity::Current)
 }
 
-fn stage_package(target: &Path, package: &VerifiedPackage) -> Result<(PathBuf, Vec<ManagedFile>)> {
+fn record_matches_bundle(record: &InstalledSkill, host: SkillHost) -> Result<bool> {
+    Ok(record.release == bundled_release()
+        && record.source == BUNDLED_SOURCE
+        && record.files == bundled_managed_files(host)
+        && integrity(record)? == Integrity::Current)
+}
+
+fn external_matches_bundle(path: &Path, host: SkillHost) -> Result<bool> {
+    if !path.is_dir() {
+        return Ok(false);
+    }
+    for file in bundled_files(host) {
+        let candidate = path.join(file.path);
+        if !candidate.is_file() || hash_file(&candidate)? != sha256_hex(file.content.as_bytes()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn command_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let mut candidates = vec![name.to_string()];
+    if cfg!(windows) {
+        let extensions = std::env::var_os("PATHEXT")
+            .and_then(|value| value.into_string().ok())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+        candidates.extend(
+            extensions
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| format!("{name}{}", extension.to_ascii_lowercase())),
+        );
+        candidates.extend([format!("{name}.exe"), format!("{name}.cmd")]);
+    }
+    std::env::split_paths(&path).any(|dir| {
+        candidates
+            .iter()
+            .any(|candidate| dir.join(candidate).is_file())
+    })
+}
+
+fn any_command_on_path(names: &[&str]) -> bool {
+    names.iter().any(|name| command_on_path(name))
+}
+
+fn any_dir(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| path.is_dir())
+}
+
+fn host_commands(host: SkillHost) -> &'static [&'static str] {
+    match host {
+        SkillHost::Claude => &["claude"],
+        SkillHost::Shared => &[
+            "codex",
+            "copilot",
+            "gemini",
+            "pi-coding-agent",
+            "cursor-agent",
+            "amp",
+            "droid",
+            "fx",
+        ],
+        SkillHost::Opencode => &["opencode"],
+        SkillHost::Kimi => &["kimi"],
+        SkillHost::Grok => &["grok"],
+        SkillHost::Qwen => &["qwen"],
+        SkillHost::Kiro => &["kiro", "kiro-cli"],
+        SkillHost::Omp => &["omp"],
+        SkillHost::Hermes => &["hermes"],
+    }
+}
+
+fn host_config_dirs(
+    host: SkillHost,
+    home: &Path,
+    xdg_config: Option<&Path>,
+    claude_config: Option<&Path>,
+    codex_home: Option<&Path>,
+    kimi_home: Option<&Path>,
+    hermes_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let xdg = xdg_config
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".config"));
+    match host {
+        SkillHost::Claude => vec![claude_config
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join(".claude"))],
+        SkillHost::Shared => vec![
+            codex_home
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| home.join(".codex")),
+            home.join(".agents"),
+            home.join(".copilot"),
+            home.join(".gemini"),
+            home.join(".pi").join("agent"),
+            home.join(".cursor"),
+            xdg.join("amp"),
+            home.join(".factory"),
+            home.join(".fx"),
+        ],
+        SkillHost::Opencode => vec![xdg.join("opencode")],
+        SkillHost::Kimi => vec![kimi_home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join(".kimi-code"))],
+        SkillHost::Grok => vec![home.join(".grok")],
+        SkillHost::Qwen => vec![home.join(".qwen")],
+        SkillHost::Kiro => vec![home.join(".kiro")],
+        SkillHost::Omp => vec![crate::agent::omp::default_agent_dir_at(home)],
+        SkillHost::Hermes => vec![hermes_home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join(".hermes"))],
+    }
+}
+
+fn host_detected(host: SkillHost, state: &SkillState, target: &Path) -> Result<bool> {
+    if state.agents.contains_key(host.state_key()) || target.exists() {
+        return Ok(true);
+    }
+    let home = crate::platform::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+    let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+    let kimi = std::env::var_os("KIMI_CODE_HOME").map(PathBuf::from);
+    let hermes = std::env::var_os("HERMES_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    if host == SkillHost::Omp && crate::agent::omp::agent_dir().is_ok_and(|path| path.is_dir()) {
+        return Ok(true);
+    }
+    Ok(any_dir(&host_config_dirs(
+        host,
+        &home,
+        xdg.as_deref(),
+        claude.as_deref(),
+        codex.as_deref(),
+        kimi.as_deref(),
+        hermes.as_deref(),
+    )) || any_command_on_path(host_commands(host)))
+}
+
+fn stage_bundle(target: &Path, host: SkillHost) -> Result<(PathBuf, Vec<ManagedFile>)> {
     let parent = target
         .parent()
         .ok_or_else(|| anyhow!("skill target has no parent"))?;
     ensure_private_dir(parent)?;
     let sequence = INSTALL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let stage = parent.join(format!(
-        ".luvus-skill-stage-{}-{}-{sequence}",
-        package.agent,
+        ".luvus-skill-stage-{host}-{}-{sequence}",
         std::process::id()
     ));
     if stage.exists() {
@@ -748,16 +638,17 @@ fn stage_package(target: &Path, package: &VerifiedPackage) -> Result<(PathBuf, V
     ensure_private_dir(&stage)?;
 
     let result = (|| {
-        let mut managed = Vec::with_capacity(package.files.len());
-        for file in &package.files {
-            let path = stage.join(&file.path);
+        let files = bundled_files(host);
+        let mut managed = Vec::with_capacity(files.len());
+        for file in files {
+            let path = stage.join(file.path);
             if let Some(dir) = path.parent() {
                 ensure_private_dir(dir)?;
             }
             let mut output = File::create(&path)
                 .with_context(|| format!("creating staged skill file {}", path.display()))?;
             output
-                .write_all(&file.content)
+                .write_all(file.content.as_bytes())
                 .with_context(|| format!("writing staged skill file {}", path.display()))?;
             output
                 .sync_all()
@@ -768,8 +659,8 @@ fn stage_package(target: &Path, package: &VerifiedPackage) -> Result<(PathBuf, V
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
             }
             managed.push(ManagedFile {
-                path: file.path.to_string_lossy().into_owned(),
-                sha256: file.sha256.clone(),
+                path: file.path.to_string(),
+                sha256: sha256_hex(file.content.as_bytes()),
             });
         }
         Ok(managed)
@@ -783,73 +674,121 @@ fn stage_package(target: &Path, package: &VerifiedPackage) -> Result<(PathBuf, V
     }
 }
 
-fn install_package(
-    state: &mut SkillState,
-    source: &str,
-    package: &VerifiedPackage,
-) -> Result<InstalledSkill> {
-    let target = target_dir(package.agent)?;
-    install_package_at(state, source, package, target)
-}
-
-fn install_package_at(
-    state: &mut SkillState,
-    source: &str,
-    package: &VerifiedPackage,
-    target: PathBuf,
-) -> Result<InstalledSkill> {
-    let key = package.agent.as_str();
+fn install_one_at(state: &mut SkillState, host: SkillHost, target: PathBuf) -> Result<SkillChange> {
+    let key = host.state_key();
     let previous = state.agents.get(key).cloned();
-    match previous.as_ref() {
-        Some(record) => {
-            if record.target != target {
-                bail!(
-                    "managed {key} skill target changed from {} to {}; disable it first",
-                    record.target.display(),
-                    target.display()
-                );
-            }
-            if integrity(record)? != Integrity::Current {
-                bail!("managed {key} skill was modified or is incomplete; disable or repair it before updating");
-            }
+    let previous_integrity = previous.as_ref().map(integrity).transpose()?;
+
+    if let Some(record) = previous.as_ref() {
+        if previous_integrity == Some(Integrity::Modified) {
+            return Ok(SkillChange {
+                host,
+                target: record.target.clone(),
+                action: ChangeAction::PreservedModified,
+            });
         }
-        None if target.exists() => {
-            bail!(
-                "{} already exists but is not owned by Luvus; move it or choose not to enable {key}",
-                target.display()
-            );
+        if record.target == target && record_matches_bundle(record, host)? {
+            return Ok(SkillChange {
+                host,
+                target,
+                action: ChangeAction::Current,
+            });
         }
-        None => {}
+        if record.target != target && target.exists() {
+            return Ok(SkillChange {
+                host,
+                target,
+                action: ChangeAction::External,
+            });
+        }
+    } else if target.exists() {
+        return Ok(SkillChange {
+            host,
+            target,
+            action: ChangeAction::External,
+        });
     }
 
-    let (stage, files) = stage_package(&target, package)?;
-    let parent = target.parent().expect("target parent checked");
-    let sequence = INSTALL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let backup = parent.join(format!(
-        ".luvus-skill-backup-{}-{}-{sequence}",
-        package.agent,
-        std::process::id()
-    ));
+    let (stage, files) = stage_bundle(&target, host)?;
+    // Staging can take long enough for another process to replace a missing
+    // destination. Recheck ownership before moving or deleting anything.
+    let managed_source = match previous.as_ref() {
+        Some(record) => match integrity(record)? {
+            Integrity::Modified => {
+                let _ = fs::remove_dir_all(&stage);
+                return Ok(SkillChange {
+                    host,
+                    target: record.target.clone(),
+                    action: ChangeAction::PreservedModified,
+                });
+            }
+            Integrity::Current => Some(record.target.clone()),
+            Integrity::Missing => None,
+        },
+        None => None,
+    };
+    if managed_source.as_ref() != Some(&target) && target.exists() {
+        let _ = fs::remove_dir_all(&stage);
+        return Ok(SkillChange {
+            host,
+            target,
+            action: ChangeAction::External,
+        });
+    }
+
+    let backup = managed_source.as_ref().map(|source| {
+        let sequence = INSTALL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        source
+            .parent()
+            .expect("managed target parent checked")
+            .join(format!(
+                ".luvus-skill-backup-{host}-{}-{sequence}",
+                std::process::id()
+            ))
+    });
+    if let (Some(source), Some(backup)) = (managed_source.as_ref(), backup.as_ref()) {
+        if let Err(err) = fs::rename(source, backup) {
+            let _ = fs::remove_dir_all(&stage);
+            return Err(err).with_context(|| format!("backing up {}", source.display()));
+        }
+    }
     if target.exists() {
-        fs::rename(&target, &backup).with_context(|| format!("backing up {}", target.display()))?;
+        let _ = fs::remove_dir_all(&stage);
+        if let (Some(source), Some(backup)) = (managed_source.as_ref(), backup.as_ref()) {
+            if !source.exists() {
+                let _ = fs::rename(backup, source);
+            }
+        }
+        bail!(
+            "{} appeared while installing the {host} skill; existing content was preserved",
+            target.display()
+        );
     }
     if let Err(err) = fs::rename(&stage, &target) {
-        let _ = fs::rename(&backup, &target);
+        if let (Some(source), Some(backup)) = (managed_source.as_ref(), backup.as_ref()) {
+            if !source.exists() {
+                let _ = fs::rename(backup, source);
+            }
+        }
         let _ = fs::remove_dir_all(&stage);
-        return Err(err).with_context(|| format!("installing {} skill", package.agent));
+        return Err(err).with_context(|| format!("installing {host} skill adapter"));
     }
 
     let installed = InstalledSkill {
-        release: package.release.clone(),
-        source: source.to_string(),
+        release: bundled_release().to_string(),
+        source: BUNDLED_SOURCE.to_string(),
         target: target.clone(),
         files,
     };
     state.agents.insert(key.to_string(), installed.clone());
     if let Err(err) = save_state(state) {
-        let _ = fs::remove_dir_all(&target);
-        if backup.exists() {
-            let _ = fs::rename(&backup, &target);
+        if matches!(integrity(&installed), Ok(Integrity::Current)) {
+            let _ = fs::remove_dir_all(&target);
+        }
+        if let (Some(source), Some(backup)) = (managed_source.as_ref(), backup.as_ref()) {
+            if !source.exists() {
+                let _ = fs::rename(backup, source);
+            }
         }
         match previous {
             Some(record) => {
@@ -861,84 +800,82 @@ fn install_package_at(
         }
         return Err(err).context("saving skill ownership; installation rolled back");
     }
-    if backup.exists() {
-        // The new tree and ownership state are already committed. Leaving a
-        // stale backup is preferable to reporting that a successful update
-        // failed and encouraging an unsafe retry.
-        let _ = fs::remove_dir_all(&backup);
+    if let (Some(record), Some(backup)) = (previous.as_ref(), backup.as_ref()) {
+        if backup.exists() {
+            let mut backed_up_record = record.clone();
+            backed_up_record.target = backup.clone();
+            if integrity(&backed_up_record)? == Integrity::Current {
+                fs::remove_dir_all(backup)
+                    .with_context(|| format!("removing managed backup {}", backup.display()))?;
+            } else {
+                bail!(
+                    "managed backup changed during installation and was preserved at {}",
+                    backup.display()
+                );
+            }
+        }
     }
-    Ok(installed)
+
+    let action = match previous_integrity {
+        None => ChangeAction::Installed,
+        Some(Integrity::Missing) => ChangeAction::Repaired,
+        Some(Integrity::Current) => ChangeAction::Refreshed,
+        Some(Integrity::Modified) => unreachable!("modified installations are preserved above"),
+    };
+    Ok(SkillChange {
+        host,
+        target,
+        action,
+    })
 }
 
-pub fn enable(agents: &[SkillAgent], manifest_url: &str) -> Result<Vec<InstalledSkill>> {
-    if agents.is_empty() {
-        bail!("skill enable requires an agent or --all");
-    }
-    let unique: BTreeSet<_> = agents.iter().copied().collect();
-    let agents: Vec<_> = unique.into_iter().collect();
-    validate_remote_url(manifest_url)?;
-    let manifest = fetch_manifest(manifest_url)?;
+/// Install or refresh the one bundled skill in every detected supported host.
+pub fn enable() -> Result<Vec<SkillChange>> {
     let lock = lock_state()?;
     let mut state = load_state()?;
-    let mut installed = Vec::with_capacity(agents.len());
-    let mut pending = Vec::new();
-    for agent in agents {
-        let existing = state.agents.get(agent.as_str());
-        if existing.is_some_and(|record| {
-            record.release == manifest.release && integrity(record).ok() == Some(Integrity::Current)
-        }) {
-            installed.push(existing.cloned().expect("checked above"));
-            continue;
+    let mut selected = Vec::new();
+    for host in SkillHost::ALL {
+        let target = target_dir(host)?;
+        if host_detected(host, &state, &target)? {
+            selected.push((host, target));
         }
-        pending.push(agent);
     }
-    let mut packages = BTreeMap::new();
-    for agent in &pending {
-        packages.insert(*agent, fetch_package(&manifest, *agent)?);
+    if selected.is_empty() {
+        bail!(
+            "no native Agent Skills host detected; use `luvus skill show` for this session or install a supported skill-capable agent, then run `luvus skill enable`"
+        );
     }
-    for agent in pending {
-        installed.push(install_package(
-            &mut state,
-            manifest_url,
-            packages.get(&agent).expect("loaded for every agent"),
-        )?);
+
+    let mut changes = Vec::with_capacity(selected.len());
+    for (host, target) in selected {
+        changes.push(install_one_at(&mut state, host, target)?);
     }
     FileExt::unlock(&lock).ok();
-    Ok(installed)
+    Ok(changes)
 }
 
-pub fn update(agent: Option<SkillAgent>, manifest_url: &str) -> Result<Vec<InstalledSkill>> {
-    let state = load_state()?;
-    let agents: Vec<SkillAgent> = match agent {
-        Some(agent) => {
-            if !state.agents.contains_key(agent.as_str()) {
-                bail!("{agent} skill is disabled; run `luvus skill enable {agent}` first");
-            }
-            vec![agent]
-        }
-        None => SkillAgent::ALL
-            .into_iter()
-            .filter(|agent| state.agents.contains_key(agent.as_str()))
-            .collect(),
-    };
-    if agents.is_empty() {
-        return Ok(Vec::new());
-    }
-    enable(&agents, manifest_url)
-}
-
-pub fn disable(agent: SkillAgent) -> Result<Option<PathBuf>> {
-    let lock = lock_state()?;
-    let mut state = load_state()?;
-    let Some(record) = state.agents.get(agent.as_str()).cloned() else {
-        FileExt::unlock(&lock).ok();
-        return Ok(None);
+fn disable_one_at(
+    state: &mut SkillState,
+    host: SkillHost,
+    external_target: PathBuf,
+) -> Result<SkillChange> {
+    let Some(record) = state.agents.get(host.state_key()).cloned() else {
+        return Ok(SkillChange {
+            host,
+            action: if external_target.exists() {
+                ChangeAction::External
+            } else {
+                ChangeAction::AlreadyDisabled
+            },
+            target: external_target,
+        });
     };
     if record.target.exists() && integrity(&record)? != Integrity::Current {
-        bail!(
-            "managed {agent} skill at {} was modified; it was preserved",
-            record.target.display()
-        );
+        return Ok(SkillChange {
+            host,
+            target: record.target,
+            action: ChangeAction::PreservedModified,
+        });
     }
 
     let parent = record
@@ -947,54 +884,86 @@ pub fn disable(agent: SkillAgent) -> Result<Option<PathBuf>> {
         .ok_or_else(|| anyhow!("managed skill target has no parent"))?;
     let sequence = INSTALL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let backup = parent.join(format!(
-        ".luvus-skill-disable-{agent}-{}-{sequence}",
+        ".luvus-skill-disable-{host}-{}-{sequence}",
         std::process::id()
     ));
     if record.target.exists() {
         fs::rename(&record.target, &backup)
             .with_context(|| format!("staging removal of {}", record.target.display()))?;
     }
-    state.agents.remove(agent.as_str());
-    if let Err(err) = save_state(&state) {
+    state.agents.remove(host.state_key());
+    if let Err(err) = save_state(state) {
         if backup.exists() {
             let _ = fs::rename(&backup, &record.target);
         }
+        state.agents.insert(host.state_key().to_string(), record);
         return Err(err).context("saving disabled skill state; removal rolled back");
     }
     if backup.exists() {
-        // The target is disabled in state already; cleanup failure must not
-        // turn that committed result into a misleading command failure.
         let _ = fs::remove_dir_all(&backup);
     }
-    FileExt::unlock(&lock).ok();
-    Ok(Some(record.target))
-}
-
-pub fn status(agent: SkillAgent) -> Result<SkillStatus> {
-    let state = load_state()?;
-    let installed = state.agents.get(agent.as_str()).cloned();
-    let integrity = installed
-        .as_ref()
-        .map(super::skill::integrity)
-        .transpose()?;
-    Ok(SkillStatus {
-        agent,
-        installed,
-        integrity,
+    Ok(SkillChange {
+        host,
+        target: record.target,
+        action: ChangeAction::Disabled,
     })
 }
 
-pub fn statuses() -> Result<Vec<SkillStatus>> {
-    SkillAgent::ALL.into_iter().map(status).collect()
+/// Remove every unchanged Luvus-managed installation. External and modified
+/// copies are always preserved.
+pub fn disable() -> Result<Vec<SkillChange>> {
+    let lock = lock_state()?;
+    let mut state = load_state()?;
+    let mut changes = Vec::with_capacity(SkillHost::ALL.len());
+    for host in SkillHost::ALL {
+        changes.push(disable_one_at(&mut state, host, target_dir(host)?)?);
+    }
+    FileExt::unlock(&lock).ok();
+    Ok(changes)
 }
 
-pub fn show(agent: SkillAgent) -> Result<String> {
-    let status = status(agent)?;
-    let installed = status
-        .installed
-        .ok_or_else(|| anyhow!("{agent} skill is disabled"))?;
-    fs::read_to_string(installed.target.join("SKILL.md"))
-        .with_context(|| format!("reading installed {agent} SKILL.md"))
+pub fn status() -> Result<Vec<DestinationStatus>> {
+    let state = load_state()?;
+    SkillHost::ALL
+        .into_iter()
+        .map(|host| {
+            let target = target_dir(host)?;
+            let detected = host_detected(host, &state, &target)?;
+            let record = state.agents.get(host.state_key());
+            let (state_value, managed_release) = match record {
+                Some(record) => {
+                    let integrity = integrity(record)?;
+                    let value = match integrity {
+                        Integrity::Missing => DestinationState::Missing,
+                        Integrity::Modified => DestinationState::Modified,
+                        Integrity::Current if record_matches_bundle(record, host)? => {
+                            DestinationState::Current
+                        }
+                        Integrity::Current => DestinationState::Outdated,
+                    };
+                    (value, Some(record.release.clone()))
+                }
+                None if target.exists() && external_matches_bundle(&target, host)? => {
+                    (DestinationState::ExternalCurrent, None)
+                }
+                None if target.exists() => (DestinationState::External, None),
+                None if detected => (DestinationState::Available, None),
+                None => (DestinationState::NotDetected, None),
+            };
+            Ok(DestinationStatus {
+                host,
+                target: record.map_or(target, |record| record.target.clone()),
+                state: state_value,
+                managed_release,
+            })
+        })
+        .collect()
+}
+
+/// Return the canonical, version-matched skill regardless of installation
+/// state. `luvus skill show` writes this value to stdout.
+pub fn show() -> &'static str {
+    BUNDLED_SKILL
 }
 
 fn strip_all_blocks(text: &str, begin: &str, end_marker: &str) -> String {
@@ -1095,9 +1064,8 @@ fn migrate_legacy_at(
 
 /// One-time cleanup for the former default-on installer. Debug builds skip
 /// automatic external-agent edits so development never touches the user's
-/// production agent configuration. Release builds still migrate users who
-/// intentionally configure a custom Luvus state directory. Tests exercise
-/// `migrate_legacy_at` with explicit isolated paths.
+/// production agent configuration. Tests exercise `migrate_legacy_at` with
+/// explicit isolated paths.
 pub fn migrate_legacy_installation() -> Result<Vec<PathBuf>> {
     if cfg!(debug_assertions) {
         return Ok(Vec::new());
@@ -1116,160 +1084,256 @@ pub fn migrate_legacy_installation() -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
 
-    fn valid_skill() -> String {
-        format!(
-            "---\nname: luvus\ndescription: Control Luvus only when explicitly requested.\n---\n\n# Luvus\n\n=target uses luvus agent send.\n{}",
-            "Detailed safe control instructions. ".repeat(16)
-        )
-    }
-
-    fn package(agent: SkillAgent, release: &str) -> SkillPackage {
-        let skill = valid_skill();
-        SkillPackage {
-            schema: PACKAGE_SCHEMA,
-            agent,
-            release: release.to_string(),
-            files: vec![PackageFile {
-                path: "SKILL.md".into(),
-                sha256: sha256_hex(skill.as_bytes()),
-                content: skill,
-            }],
+    #[test]
+    fn canonical_and_plugin_skill_artifacts_stay_identical() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let plugin = root.join("plugins/luvus/skills/luvus");
+        if !plugin.is_dir() {
+            return;
         }
-    }
-
-    /// Test manifests must remain compatible with the package being built so
-    /// release verification does not depend on a hand-updated minor-version cap.
-    fn compatible_requires_luvus() -> String {
-        format!(">={}", env!("CARGO_PKG_VERSION"))
-    }
-
-    fn manifest(release: &str) -> SkillManifest {
-        SkillManifest {
-            schema: MANIFEST_SCHEMA,
-            release: release.to_string(),
-            requires_luvus: compatible_requires_luvus(),
-            artifacts: BTreeMap::new(),
-        }
-    }
-
-    #[test]
-    fn signed_manifest_requires_the_expected_key() {
-        let signing = SigningKey::from_bytes(&[7; 32]);
-        let other = SigningKey::from_bytes(&[8; 32]);
-        let signed = serde_json::to_vec(&serde_json::json!({
-            "schema": 1,
-            "release": "0.4.0",
-            "requires_luvus": compatible_requires_luvus(),
-            "artifacts": {}
-        }))
-        .unwrap();
-        let envelope = serde_json::to_vec(&serde_json::json!({
-            "signed": BASE64.encode(&signed),
-            "signature": BASE64.encode(signing.sign(&signed).to_bytes())
-        }))
-        .unwrap();
-        let parsed = parse_signed_manifest(&envelope, &signing.verifying_key()).unwrap();
-        assert_eq!(parsed.release, "0.4.0");
-        assert!(parse_signed_manifest(&envelope, &other.verifying_key()).is_err());
-    }
-
-    #[test]
-    fn manifest_rejects_an_incompatible_luvus_version() {
-        let mut manifest = manifest("0.4.0");
-        manifest.requires_luvus = format!("<{}", env!("CARGO_PKG_VERSION"));
-        assert!(validate_manifest(&manifest).is_err());
-    }
-
-    #[test]
-    fn manifest_ignores_artifacts_for_future_agents() {
-        let mut manifest = manifest("0.4.0");
-        manifest.artifacts.insert(
-            "future-agent".into(),
-            SkillArtifact {
-                url: "not-used".into(),
-                sha256: "not-used".into(),
-                size: 0,
-            },
+        assert_eq!(
+            fs::read_to_string(plugin.join("SKILL.md")).unwrap(),
+            BUNDLED_SKILL
         );
-        validate_manifest(&manifest).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_fetch_is_bounded_while_reading() {
-        let error = try_fetch_command("sh", &["-c", "printf 12345678901"], 10)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("10-byte limit"), "{error}");
-    }
-
-    #[test]
-    fn package_validation_rejects_traversal_and_hash_mismatch() {
-        let manifest = manifest("0.4.0");
-        let mut bad_path = package(SkillAgent::Codex, "0.4.0");
-        bad_path.files[0].path = "../SKILL.md".into();
-        assert!(validate_package(bad_path, &manifest, SkillAgent::Codex).is_err());
-
-        let mut bad_hash = package(SkillAgent::Codex, "0.4.0");
-        bad_hash.files[0].sha256 = "0".repeat(64);
-        assert!(validate_package(bad_hash, &manifest, SkillAgent::Codex).is_err());
+        assert_eq!(
+            fs::read_to_string(plugin.join("references/advanced-control.md")).unwrap(),
+            BUNDLED_ADVANCED_CONTROL
+        );
+        assert_eq!(
+            fs::read_to_string(plugin.join("references/uhp-control.md")).unwrap(),
+            BUNDLED_UHP_CONTROL
+        );
+        assert_eq!(
+            fs::read_to_string(plugin.join("agents/openai.yaml")).unwrap(),
+            BUNDLED_OPENAI_METADATA
+        );
     }
 
     #[test]
-    fn native_targets_do_not_use_agents_md() {
+    fn native_targets_are_internal_adapters_not_agents_md() {
         let home = Path::new("/home/tester");
         assert_eq!(
-            target_dir_at(SkillAgent::Codex, home, None),
+            target_dir_at(SkillHost::Shared, home, None),
             PathBuf::from("/home/tester/.agents/skills/luvus")
         );
-        assert!(!target_dir_at(SkillAgent::Codex, home, None).ends_with("AGENTS.md"));
-        assert!(!target_dir_at(SkillAgent::Opencode, home, None).ends_with("AGENTS.md"));
+        assert!(!target_dir_at(SkillHost::Shared, home, None).ends_with("AGENTS.md"));
+        assert!(!target_dir_at(SkillHost::Opencode, home, None).ends_with("AGENTS.md"));
         assert_eq!(
-            target_dir_at(SkillAgent::Opencode, home, Some(Path::new("/xdg/config"))),
+            target_dir_at(SkillHost::Opencode, home, Some(Path::new("/xdg/config"))),
             PathBuf::from("/xdg/config/opencode/skills/luvus")
+        );
+        assert_eq!(
+            target_dir_at(SkillHost::Kimi, home, None),
+            PathBuf::from("/home/tester/.kimi-code/skills/luvus")
+        );
+        assert_eq!(
+            target_dir_at(SkillHost::Grok, home, None),
+            PathBuf::from("/home/tester/.grok/skills/luvus")
+        );
+        assert_eq!(
+            target_dir_at(SkillHost::Qwen, home, None),
+            PathBuf::from("/home/tester/.qwen/skills/luvus")
+        );
+        assert_eq!(
+            target_dir_at(SkillHost::Kiro, home, None),
+            PathBuf::from("/home/tester/.kiro/skills/luvus")
+        );
+        assert_eq!(
+            target_dir_at(SkillHost::Hermes, home, None),
+            PathBuf::from("/home/tester/.hermes/skills/luvus")
+        );
+        assert_eq!(SkillHost::Shared.state_key(), "codex");
+    }
+
+    #[test]
+    fn every_native_skill_host_has_detection_markers() {
+        for host in SkillHost::ALL {
+            assert!(!host_commands(host).is_empty());
+            assert!(!host_config_dirs(
+                host,
+                Path::new("/home/tester"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_empty());
+        }
+        let shared = host_commands(SkillHost::Shared);
+        for agent in [
+            "codex",
+            "copilot",
+            "gemini",
+            "pi-coding-agent",
+            "cursor-agent",
+            "amp",
+            "droid",
+            "fx",
+        ] {
+            assert!(
+                shared.contains(&agent),
+                "missing shared host detection for {agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_install_refresh_and_modified_preservation_are_safe() {
+        let _env = crate::persist::test_env("skill-bundled-install");
+        let target = crate::persist::skills_dir().join("agent-home/skills/luvus");
+        let mut state = SkillState::default();
+
+        let installed = install_one_at(&mut state, SkillHost::Shared, target.clone()).unwrap();
+        assert_eq!(installed.action, ChangeAction::Installed);
+        assert_eq!(
+            install_one_at(&mut state, SkillHost::Shared, target.clone())
+                .unwrap()
+                .action,
+            ChangeAction::Current
+        );
+
+        state.agents.get_mut("codex").unwrap().release = "0.1.0".into();
+        assert_eq!(
+            install_one_at(&mut state, SkillHost::Shared, target.clone())
+                .unwrap()
+                .action,
+            ChangeAction::Refreshed
+        );
+
+        fs::write(target.join("SKILL.md"), "user changed this skill").unwrap();
+        assert_eq!(
+            install_one_at(&mut state, SkillHost::Shared, target.clone())
+                .unwrap()
+                .action,
+            ChangeAction::PreservedModified
+        );
+        assert_eq!(
+            disable_one_at(&mut state, SkillHost::Shared, target.clone())
+                .unwrap()
+                .action,
+            ChangeAction::PreservedModified
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            "user changed this skill"
         );
     }
 
     #[test]
-    fn managed_install_and_disable_preserve_modified_files() {
-        let _env = crate::persist::test_env("skill-managed-install");
-        let root = crate::persist::skills_dir().join("agent-home");
-        let target = root.join(".agents/skills/luvus");
-        let manifest = manifest("0.4.0");
-        let package = validate_package(
-            package(SkillAgent::Codex, "0.4.0"),
-            &manifest,
-            SkillAgent::Codex,
-        )
-        .unwrap();
+    fn changed_host_path_moves_only_an_unmodified_managed_skill() {
+        let _env = crate::persist::test_env("skill-host-path-change");
+        let root = crate::persist::skills_dir().join("host-path-change");
+        let old_target = root.join("old/luvus");
+        let new_target = root.join("new/luvus");
+        let blocked_target = root.join("blocked/luvus");
         let mut state = SkillState::default();
-        let installed = install_package_at(
-            &mut state,
-            "https://luvus.dev/skills/manifest.json",
-            &package,
-            target.clone(),
-        )
-        .unwrap();
-        assert_eq!(installed.target, target);
-        assert_eq!(integrity(&installed).unwrap(), Integrity::Current);
 
-        fs::write(target.join("SKILL.md"), "user changed this skill").unwrap();
-        let err = disable(SkillAgent::Codex).unwrap_err().to_string();
-        assert!(err.contains("modified"), "{err}");
-        assert!(target.join("SKILL.md").is_file());
+        install_one_at(&mut state, SkillHost::Shared, old_target.clone()).unwrap();
+        assert_eq!(
+            install_one_at(&mut state, SkillHost::Shared, new_target.clone())
+                .unwrap()
+                .action,
+            ChangeAction::Refreshed
+        );
+        assert!(!old_target.exists());
+        assert_eq!(state.agents["codex"].target, new_target);
 
-        fs::write(target.join("SKILL.md"), &package.files[0].content).unwrap();
-        assert_eq!(disable(SkillAgent::Codex).unwrap(), Some(target.clone()));
-        assert!(!target.exists());
+        fs::create_dir_all(&blocked_target).unwrap();
+        fs::write(blocked_target.join("SKILL.md"), "external replacement").unwrap();
+        assert_eq!(
+            install_one_at(&mut state, SkillHost::Shared, blocked_target.clone())
+                .unwrap()
+                .action,
+            ChangeAction::External
+        );
+        assert!(new_target.exists());
+        assert_eq!(
+            fs::read_to_string(blocked_target.join("SKILL.md")).unwrap(),
+            "external replacement"
+        );
+
+        let later_target = root.join("later/luvus");
+        fs::write(new_target.join("SKILL.md"), "managed copy was edited").unwrap();
+        assert_eq!(
+            install_one_at(&mut state, SkillHost::Shared, later_target.clone())
+                .unwrap()
+                .action,
+            ChangeAction::PreservedModified
+        );
+        assert!(!later_target.exists());
+        assert_eq!(
+            fs::read_to_string(new_target.join("SKILL.md")).unwrap(),
+            "managed copy was edited"
+        );
+    }
+
+    #[test]
+    fn missing_managed_target_never_overwrites_replacement_content() {
+        let _env = crate::persist::test_env("skill-missing-replacement");
+        let target = crate::persist::skills_dir().join("missing-replacement/luvus");
+        let mut state = SkillState::default();
+
+        install_one_at(&mut state, SkillHost::Claude, target.clone()).unwrap();
+        fs::remove_dir_all(&target).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "replacement content").unwrap();
+
+        assert_eq!(
+            install_one_at(&mut state, SkillHost::Claude, target.clone())
+                .unwrap()
+                .action,
+            ChangeAction::PreservedModified
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            "replacement content"
+        );
+    }
+
+    #[test]
+    fn external_skill_is_never_overwritten_or_removed() {
+        let _env = crate::persist::test_env("skill-external-install");
+        let target = crate::persist::skills_dir().join("external/luvus");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "external skill").unwrap();
+        let mut state = SkillState::default();
+
+        assert_eq!(
+            install_one_at(&mut state, SkillHost::Claude, target.clone())
+                .unwrap()
+                .action,
+            ChangeAction::External
+        );
+        assert_eq!(
+            disable_one_at(&mut state, SkillHost::Claude, target.clone())
+                .unwrap()
+                .action,
+            ChangeAction::External
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            "external skill"
+        );
+    }
+
+    #[test]
+    fn show_is_the_canonical_release_matched_skill() {
+        assert_eq!(show(), BUNDLED_SKILL);
+        assert!(show().contains("name: luvus"));
+        assert!(show().contains("agent send"));
+        assert!(show().contains("luvus uhp capabilities"));
+        assert!(show().contains("luvus mission open"));
+        assert!(show().contains("mission.open"));
+        assert!(show().contains("ui.bar.*"));
+        assert!(show().contains("Agent detection is built into Luvus"));
     }
 
     #[test]
     fn migration_removes_only_managed_blocks_and_preserves_unknown_skills() {
-        let root =
-            std::env::temp_dir().join(format!("luvus-skill-migration-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let _env = crate::persist::test_env("skill-migration");
+        let root = crate::persist::skills_dir().join("migration-home");
         let codex = root.join(".codex");
         let opencode = root.join(".config/opencode");
         fs::create_dir_all(&codex).unwrap();
@@ -1302,7 +1366,6 @@ mod tests {
         assert!(migrate_legacy_at(&root, None, None, &marker)
             .unwrap()
             .is_empty());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1320,23 +1383,45 @@ mod tests {
     }
 
     #[test]
-    fn no_enabled_skills_means_update_needs_no_manifest() {
-        let _env = crate::persist::test_env("skill-update-disabled");
-        assert!(update(None, "https://invalid.example/never-fetched")
-            .unwrap()
-            .is_empty());
-        let err = update(
-            Some(SkillAgent::Codex),
-            "https://invalid.example/never-fetched",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("disabled"), "{err}");
+    fn omp_is_a_recognized_skill_host_by_dir_or_binary() {
+        let _env = crate::persist::test_env("skill-omp-host");
+        // Detection must fire on either signal: the ~/.omp/agent config dir
+        // or the omp executable on PATH. OMP receives its own managed skill
+        // copy because profiles and PI_CODING_AGENT_DIR can isolate agent data.
+        let root = crate::persist::skills_dir().join("omp-host-home");
+        let _ = fs::remove_dir_all(&root);
+        let agent_dir = root.join(".omp").join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+
+        let dirs = host_config_dirs(SkillHost::Omp, &root, None, None, None, None, None);
+        assert_eq!(dirs, vec![agent_dir.clone()]);
+        assert!(any_dir(&dirs), "config dir presence detects the omp host");
+        assert_eq!(host_commands(SkillHost::Omp), &["omp"]);
+        assert_eq!(SkillHost::Omp.as_str(), "omp");
+        assert!(SkillHost::ALL.contains(&SkillHost::Omp));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn skill_text_validation_is_strict_and_bounded() {
-        assert!(validate_skill_text(valid_skill().as_bytes()).is_ok());
-        assert!(validate_skill_text(b"<html>not a skill</html>").is_err());
+    fn hermes_detection_respects_a_custom_home_without_a_path_binary() {
+        let _env = crate::persist::test_env("skill-hermes-custom-home");
+        let root = crate::persist::skills_dir().join("hermes-custom-home");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let dirs = host_config_dirs(
+            SkillHost::Hermes,
+            Path::new("/home/tester"),
+            None,
+            None,
+            None,
+            None,
+            Some(&root),
+        );
+        assert_eq!(dirs, vec![root.clone()]);
+        assert!(any_dir(&dirs));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

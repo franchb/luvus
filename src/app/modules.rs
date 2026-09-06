@@ -438,6 +438,7 @@ impl App {
     /// any enabled module's matching `[[events]]` hook (MOD-3). The payload is
     /// passed to hooks as `LUVUS_MODULE_EVENT_JSON`.
     pub fn emit_event(&mut self, name: &str, data: serde_json::Value) {
+        self.invalidate_cwd_topology(name);
         let event_json = data.to_string();
         let backend_data = data.clone();
         api::publish_event(&self.events, name, data);
@@ -530,6 +531,7 @@ impl App {
             &argv,
             &env,
             history_budget_bytes,
+            self.pane_appearance,
         )
         .map_err(|e| format!("cannot spawn module pane: {e}"))?;
         let cmd = pane.command.clone();
@@ -1460,7 +1462,7 @@ max = 10
 [[actions]]
 id = "show"
 title = "Show"
-command = ["sh", "-c", "echo t=$LUVUS_SETTING_TOKEN l=$LUVUS_SETTING_LIMIT old_t=$BOHAY_SETTING_TOKEN old_l=$BOHAY_SETTING_LIMIT"]
+command = ["sh", "-c", "echo t=$LUVUS_SETTING_TOKEN l=$LUVUS_SETTING_LIMIT"]
 "#,
         );
 
@@ -1483,7 +1485,7 @@ command = ["sh", "-c", "echo t=$LUVUS_SETTING_TOKEN l=$LUVUS_SETTING_LIMIT old_t
         let log = app.module_logs.iter().find(|l| l.id == log_id).unwrap();
         assert_eq!(log.status, ModuleStatus::Succeeded, "stderr: {}", log.err);
         assert!(
-            log.out.contains("t=abc123 l=10 old_t=abc123 old_l=10"),
+            log.out.contains("t=abc123 l=10"),
             "settings reached the command: {:?}",
             log.out
         );

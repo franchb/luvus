@@ -38,6 +38,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use super::{create_engine, VtEngine, VtEngineKind};
+use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::CaptureMode;
 use crate::terminal::pty::InputAction;
 
@@ -88,7 +89,14 @@ fn new_engine(kind: VtEngineKind) -> Arc<Mutex<dyn VtEngine>> {
     // The engine sends replies; a dropped receiver would turn every send into
     // an error and measure a path no running pane takes.
     std::mem::forget(rx);
-    create_engine(kind, COLS, ROWS, tx, HISTORY_BUDGET)
+    create_engine(
+        kind,
+        COLS,
+        ROWS,
+        tx,
+        HISTORY_BUDGET,
+        PaneAppearance::default(),
+    )
 }
 
 fn feed(engine: &mut dyn VtEngine, corpus: &[u8]) {

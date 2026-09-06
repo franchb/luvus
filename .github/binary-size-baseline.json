@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "thresholds": {
+    "warn_percent": 5,
+    "block_percent": 10
+  },
+  "targets": {
+    "aarch64-apple-darwin": {
+      "executable_bytes": 9711424,
+      "archive_bytes": 4162039
+    },
+    "x86_64-apple-darwin": {
+      "executable_bytes": 9550124,
+      "archive_bytes": 4031584
+    },
+    "aarch64-unknown-linux-musl": {
+      "executable_bytes": 10345896,
+      "archive_bytes": 4779731
+    },
+    "x86_64-unknown-linux-musl": {
+      "executable_bytes": 12213712,
+      "archive_bytes": 5157914
+    },
+    "x86_64-pc-windows-msvc": {
+      "executable_bytes": 13441536,
+      "archive_bytes": 4915845
+    }
+  }
+}

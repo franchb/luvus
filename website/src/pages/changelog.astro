@@ -33,7 +33,7 @@ const ogImage = 'https://luvus.dev/og.png';
 // Read `changelog/*.md` from the repo at build time. `?raw` gives the file text;
 // eager so it resolves during the build rather than at runtime.
 const files = import.meta.glob('../../../changelog/*.md', { query: '?raw', import: 'default', eager: true });
-const videoFiles = import.meta.glob('../assets/video/*.mp4', { query: '?url', import: 'default', eager: true });
+const videoFiles = import.meta.glob('../assets/video/**/*.mp4', { query: '?url', import: 'default', eager: true });
 const videos = Object.fromEntries(
   Object.entries(videoFiles).map(([path, url]) => [path.split('/').pop(), url])
 );
@@ -41,6 +41,55 @@ const videos = Object.fromEntries(
 // Website-only release media. The app, release notes, and terminal changelog
 // continue to consume plain `changelog/*.md`; richer demos stay in the site.
 const WEBSITE_RELEASE_MEDIA = {
+  'v0.13.1': {
+    heading: 'See Luvus v0.13.1 in action',
+    intro:
+      'Seven focused demos show the new Mission Control, localization, agent, workspace, folder, and theme workflows.',
+    media: [
+      {
+        file: 'mission-control.mp4',
+        title: 'Supervise every agent from Mission Control',
+        caption:
+          'Review agent state, location, model, tokens, context, and cost across the active workspace or the complete Luvus session.',
+      },
+      {
+        file: 'cli-i18n.mp4',
+        title: 'Use the CLI in your language',
+        caption:
+          'Read help and human-facing command output in any supported language while command syntax and machine-readable output remain stable.',
+      },
+      {
+        file: 'i18n.mp4',
+        title: 'Navigate localized Settings',
+        caption:
+          'Switch the interface language and use translated Settings labels, actions, hints, key references, messages, and values immediately.',
+      },
+      {
+        file: 'grok.mp4',
+        title: 'Fork a Grok Build session',
+        caption:
+          'Create a sibling Grok session from the current context while the original agent keeps running in its existing pane.',
+      },
+      {
+        file: 'cwd-root.mp4',
+        title: 'Open panes from the current directory',
+        caption:
+          'Start new tabs and splits from the focused pane directory, or retain the previous workspace-root behavior through Settings.',
+      },
+      {
+        file: 'showhidden.mp4',
+        title: 'Reveal hidden folders when you need them',
+        caption:
+          'Toggle hidden entries from the folder picker and jump directly to a pasted path before confirming the workspace.',
+      },
+      {
+        file: 'theme.mp4',
+        title: 'Choose new community themes',
+        caption:
+          'Preview and apply the latest community palettes from the same theme workflow used by built-in Luvus themes.',
+      },
+    ],
+  },
   'v0.12.0': {
     heading: 'See Luvus v0.12.0 in action',
     intro:
@@ -113,6 +162,49 @@ const splitLead = (body) => {
     : { lead: text.slice(0, boundary), rest: text.slice(boundary).trim() };
 };
 
+// Contributor and issue-reporter links remain ordinary Markdown for the
+// terminal app and GitHub. The website extracts the same rows into compact
+// avatar cards without making a build-time API request or duplicating profile
+// metadata in front matter.
+const extractPeopleSection = (body, heading) => {
+  const lines = body.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === `## ${heading}`);
+  if (start === -1) return { body: body.trim(), people: [] };
+  const nextHeading = lines.slice(start + 1).findIndex((line) => /^##\s+/.test(line.trim()));
+  const end = nextHeading === -1 ? lines.length : start + 1 + nextHeading;
+  const people = lines.slice(start + 1, end).flatMap((line) => {
+    const match = /^\s*-\s+\[([^\]]+)\]\(https:\/\/github\.com\/([A-Za-z0-9-]+)\/?\)\s*$/.exec(line);
+    if (!match) return [];
+    const label = match[1].trim();
+    const login = match[2];
+    const handle = /\s+\(@[^)]+\)$/.exec(label);
+    const name = handle ? label.slice(0, handle.index).trim() : label;
+    const initials = name
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((part) => Array.from(part)[0] || '')
+      .join('')
+      .toUpperCase();
+    return [{ name, login, initials, url: `https://github.com/${login}`, avatar: `https://github.com/${login}.png?size=80` }];
+  });
+  const withoutSection = [...lines.slice(0, start), ...lines.slice(end)]
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return { body: withoutSection, people };
+};
+
+const extractCredits = (body) => {
+  const contributors = extractPeopleSection(body, 'Contributors');
+  const reporters = extractPeopleSection(contributors.body, 'Issue reporters');
+  return {
+    body: reporters.body,
+    contributors: contributors.people,
+    reporters: reporters.people,
+  };
+};
+
 // Newest first, comparing version numbers rather than strings so v0.10.0 sorts
 // above v0.9.0.
 const rank = (tag) =>
@@ -135,9 +227,10 @@ const entries = await Promise.all(
     const media = (websiteMedia?.media || r.media)
       .map((item) => ({ ...item, url: videos[item.file] || '' }))
       .filter((item) => item.url);
+    const extracted = extractCredits(r.body);
     const { lead, rest } = media.length > 0
-      ? splitLead(r.body)
-      : { lead: '', rest: r.body.trim() };
+      ? splitLead(extracted.body)
+      : { lead: '', rest: extracted.body };
     return {
       tag: r.tag,
       date: fmtDate(r.date),
@@ -146,6 +239,8 @@ const entries = await Promise.all(
       media,
       mediaHeading: websiteMedia?.heading || '',
       mediaIntro: websiteMedia?.intro || '',
+      contributors: extracted.contributors,
+      reporters: extracted.reporters,
       leadHtml: lead ? (await md.render(lead)).code : '',
       html: (await md.render(rest || (lead ? '' : '_No release notes._'))).code,
     };
@@ -318,6 +413,39 @@ const entries = await Promise.all(
                     </div>
                   )}
                   <div class="notes" set:html={e.html} />
+                  {[
+                    { key: 'contributors', title: 'Contributors', people: e.contributors },
+                    { key: 'issue-reporters', title: 'Issue reporters', people: e.reporters },
+                  ].filter((group) => group.people.length > 0).map((group) => (
+                    <div class="release-contributors" aria-labelledby={`${group.key}-${e.tag}`}>
+                      <h2 id={`${group.key}-${e.tag}`}>{group.title}</h2>
+                      <ul>
+                        {group.people.map((person) => (
+                          <li>
+                            <a href={person.url} title={`View ${person.name} on GitHub`}>
+                              <span class="contributor-avatar" aria-hidden="true">
+                                <span>{person.initials}</span>
+                                <img
+                                  src={person.avatar}
+                                  alt=""
+                                  width="40"
+                                  height="40"
+                                  loading="lazy"
+                                  decoding="async"
+                                  referrerpolicy="no-referrer"
+                                  data-contributor-avatar
+                                />
+                              </span>
+                              <span class="contributor-name">
+                                <strong>{person.name}</strong>
+                                {person.name !== person.login && <small>@{person.login}</small>}
+                              </span>
+                            </a>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
                 </article>
               </li>
             ))}
@@ -404,6 +532,10 @@ const entries = await Promise.all(
         previous?.addEventListener('click', () => show(active - 1));
         next?.addEventListener('click', () => show(active + 1));
         show(0);
+      });
+      document.querySelectorAll('[data-contributor-avatar]').forEach((avatar) => {
+        if (!(avatar instanceof HTMLImageElement)) return;
+        avatar.addEventListener('error', () => { avatar.hidden = true; }, { once: true });
       });
     </script>
 
@@ -599,6 +731,36 @@ const entries = await Promise.all(
       .notes blockquote {
         border-left: 2px solid var(--line); padding-left: 0.9rem; margin: 0.6rem 0; color: var(--sub);
       }
+      .release-contributors { margin-top: 1.35rem; }
+      .release-contributors h2 {
+        color: var(--sub); font: 700 0.76rem/1.2 'IBM Plex Mono', ui-monospace, monospace;
+        text-transform: uppercase; letter-spacing: 0.09em; margin-bottom: 0.7rem;
+      }
+      .release-contributors ul {
+        display: flex; flex-wrap: wrap; gap: 0.55rem; list-style: none; padding: 0; margin: 0;
+      }
+      .release-contributors li { min-width: 0; max-width: 100%; }
+      .release-contributors a {
+        display: flex; align-items: center; gap: 0.55rem; min-height: 48px;
+        max-width: 100%;
+        padding: 0.28rem 0.62rem 0.28rem 0.28rem; border: 1px solid var(--line);
+        background: var(--surface); transition: border-color 0.15s, color 0.15s;
+      }
+      .release-contributors a:hover, .release-contributors a:focus-visible {
+        border-color: var(--accent); color: var(--accent); outline: none;
+      }
+      .contributor-avatar {
+        position: relative; display: grid; place-items: center; flex: 0 0 40px;
+        width: 40px; height: 40px; overflow: hidden; border: 1px solid var(--line);
+        background: var(--base); color: var(--sub2);
+        font: 700 0.72rem/1 'IBM Plex Mono', ui-monospace, monospace;
+      }
+      .contributor-avatar img { position: absolute; inset: 0; display: block; width: 100%; height: 100%; object-fit: cover; }
+      .contributor-avatar img[hidden] { display: none; }
+      .contributor-name { display: grid; min-width: 0; overflow: hidden; line-height: 1.25; }
+      .contributor-name strong, .contributor-name small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .contributor-name strong { color: var(--text); font-size: 0.78rem; font-weight: 600; }
+      .contributor-name small { color: var(--sub); font: 0.66rem/1.3 'JetBrains Mono Variable', ui-monospace, monospace; }
       .release-lead > :last-child { margin-bottom: 1rem; }
       .release-showcase { margin: 1rem 0 1.5rem; }
       .release-showcase-intro { margin-bottom: 0.9rem; }
