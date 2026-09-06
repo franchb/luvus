@@ -50,6 +50,9 @@ impl VtEngineKind {
     }
 }
 
+#[cfg(all(test, feature = "shitty-engine"))]
+mod bench;
+
 /// Build the engine backing one pane.
 ///
 /// Every pane is constructed through here, so engine selection, and any

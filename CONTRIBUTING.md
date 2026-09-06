@@ -80,6 +80,18 @@ PTYs without requiring an interactive terminal. Test visible changes manually,
 measure performance changes before and after, and test platform-specific code on
 the affected platform when available.
 
+For terminal engine work there is a harness for that last point:
+
+```bash
+scripts/bench-engines.sh
+```
+
+It times feeding, grid reads and captures through Luvus's own code paths, and
+reports memory per retained row, once per `VtEngine` implementation. Run it
+before and after a change on the same machine; numbers from different machines
+are not comparable. `src/terminal/vt/bench.rs` documents what each figure
+measures and what it is worth.
+
 ## Commits
 
 Use concise Conventional Commit messages:
