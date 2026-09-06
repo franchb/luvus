@@ -52,6 +52,76 @@ jobs:
             --config 'patch.crates-io.luvus-vte.path="vendor/vte"' \
             --config 'patch.crates-io.luvus-alacritty-terminal.path="vendor/alacritty_terminal"'
 
+  # The optional shitty VT core, built from source because it is a C++ library
+  # that is not on crates.io. Runs the suite twice: once compiled in but not
+  # selected, so the feature cannot rot, and once with LUVUS_VT_ENGINE=shitty
+  # so the whole app is exercised against that engine. Engine-level tests only
+  # cover the trait, while the divergences worth catching - row indexing after
+  # a screen clear, optional history metrics - showed up in the app suite.
+  shitty-engine:
+    name: shitty engine
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Bump with the shitty-vt version in Cargo.toml: the bindings check the
+      # header and refuse a facade older than the calls they make.
+      SHITTY_REF: 8df70bffd5489bb2e3045055b170d043a24c436c
+      # The core is C++26 and this runner's default g++ is 13, which rejects
+      # -std=c++26 outright.
+      CC: gcc-14
+      CXX: g++-14
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: pg83/shitty
+          ref: ${{ env.SHITTY_REF }}
+          path: .shitty
+      - name: Cache the built VT core
+        id: shitty-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/shitty-vt
+          key: shitty-vt-${{ runner.os }}-${{ env.SHITTY_REF }}
+      # The build probes for everything the terminal can link, including the
+      # renderer, even when only the headless facade is being packaged.
+      - name: Install the C++ toolchain
+        if: steps.shitty-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            gcc-14 g++-14 make perl pkg-config python3 ragel \
+            libfreetype-dev libfontconfig-dev libharfbuzz-dev \
+            libxkbcommon-dev libvulkan-dev libwayland-dev wayland-protocols \
+            glslang-tools librsvg2-bin libncurses-dev
+      - name: Build libshitty_vt
+        if: steps.shitty-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/shitty-vt"
+          cd .shitty
+          ./build tgz
+          tar xzf .build/shitty_vt.tgz -C "$RUNNER_TEMP/shitty-vt"
+      - name: Point pkg-config and the loader at it
+        run: |
+          prefix=$(echo "$RUNNER_TEMP"/shitty-vt/shitty_vt-*)
+          test -f "$prefix/lib/pkgconfig/shitty_vt.pc" || {
+            echo "no shitty_vt.pc under $prefix" >&2
+            exit 1
+          }
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --features shitty-engine --all-targets -- -D warnings
+      - name: Test with the engine compiled in but not selected
+        run: cargo test --locked --features shitty-engine
+      - name: Test with the engine selected
+        env:
+          LUVUS_VT_ENGINE: shitty
+        run: cargo test --locked --features shitty-engine
+
   # macOS is a primary platform and ships native Apple-silicon/Intel binaries;
   # run the full test suite there too, not just at release-tag time.
   macos:
