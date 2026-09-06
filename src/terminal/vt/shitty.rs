@@ -114,13 +114,22 @@ impl ShittyEngine {
     ///
     /// A row with a non-zero wrap length continues into the next one, so a
     /// line starts wherever the row above it ended.
-    fn logical_lines(&self, lines: usize) -> Vec<Vec<u32>> {
+    fn logical_lines(&self, lines: usize) -> Vec<Vec<(u32, u16)>> {
         let count = self.term.total_rows();
-        let mut logical: Vec<Vec<u32>> = Vec::new();
-        let mut current: Vec<u32> = Vec::new();
+        let mut logical: Vec<Vec<(u32, u16)>> = Vec::new();
+        let mut current: Vec<(u32, u16)> = Vec::new();
+        // Walking backwards, each row's own wrap length is the one read to
+        // decide whether the row after it continued, so carry it along
+        // rather than asking the terminal for it twice.
+        let mut wrap = 0;
         for index in (0..count).rev() {
-            current.push(index);
-            if index == 0 || self.term.row_wrap_length(index - 1) == 0 {
+            current.push((index, wrap));
+            wrap = if index == 0 {
+                0
+            } else {
+                self.term.row_wrap_length(index - 1)
+            };
+            if wrap == 0 {
                 current.reverse();
                 logical.push(std::mem::take(&mut current));
                 if logical.len() >= lines {
@@ -518,8 +527,7 @@ impl VtEngine for ShittyEngine {
                     // One logical line, however many rows the terminal
                     // happened to split it across.
                     let mut complete = true;
-                    for index in rows {
-                        let wrap = self.term.row_wrap_length(index);
+                    for (index, wrap) in rows {
                         complete = if ansi {
                             self.append_ansi_row(index, wrap, &mut output, max_bytes)
                         } else {
