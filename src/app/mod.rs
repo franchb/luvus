@@ -14603,12 +14603,18 @@ mod tests {
             .lock()
             .expect("engine")
             .advance(b"\x1b[H\x1b[2J Hello\r\n world");
+        // Start where the user would, rather than at hardcoded rows. Copy
+        // mode addresses absolute history rows, so which row the viewport
+        // starts on depends on how much scrollback the engine kept, and
+        // clearing the screen feeds a row into alacritty's history but not
+        // into the shitty core's. Deriving the anchor, and spreading the
+        // rest of the state the entry point built, keeps this test about
+        // the indentation it is named for.
+        assert!(app.begin_copy_mode(), "copy mode starts");
+        let started = app.copy_mode.expect("copy mode is active");
         app.copy_mode = Some(CopyMode {
-            pane,
-            anchor: (1, 0),
-            cursor: (2, 5),
-            saved_scroll: 0,
-            pending_count: 0,
+            cursor: (started.anchor.0 + 1, 5),
+            ..started
         });
 
         app.finish_copy_mode();

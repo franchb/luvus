@@ -849,6 +849,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shitty-vt",
  "toml",
  "toml_edit",
  "unicode-width",
@@ -1193,6 +1194,12 @@ dependencies = [
  "fastrand",
  "futures-io",
 ]
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "polling"
@@ -1597,6 +1604,24 @@ name = "shell-words"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
+
+[[package]]
+name = "shitty-vt"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82a8baa71f5741a188405ad86f13dd27b7c2e290f482d3622658545242ed13b4"
+dependencies = [
+ "shitty-vt-sys",
+]
+
+[[package]]
+name = "shitty-vt-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60cea2cc1dc3a38b0a7f319b6ff7c9325e50039865b82b4ed6a8b3560d6eb3ab"
+dependencies = [
+ "pkg-config",
+]
 
 [[package]]
 name = "signal-hook"

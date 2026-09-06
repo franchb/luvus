@@ -10361,18 +10361,29 @@ command = ["true"]
         assert!(out["history_rows"].as_u64().is_some());
         assert!(out["history_bytes"].as_u64().is_some());
         assert!(out["history_estimated_grid_bytes"].as_u64().is_some());
+        // Both are Option on HistoryMetrics and reported as null when an
+        // engine has no such figure: only alacritty compacts cold rows. The
+        // contract is that the key is always there, as for cache_bytes.
         assert!(out.get("history_cache_bytes").is_some());
-        assert!(out["history_compacted_rows"].as_u64().is_some());
+        assert!(out.get("history_compacted_rows").is_some());
         assert!(out["history_allocated_cells"].as_u64().is_some());
-        assert!(out["history_packed_blocks"].as_u64().is_some());
-        assert!(out["history_packed_bytes"].as_u64().is_some());
-        assert!(out["history_packed_rows"].as_u64().is_some());
-        assert!(out["history_packed_rows"].as_u64().unwrap_or(0) > 0);
-        assert!(out["history_dense_row_bytes"].as_u64().is_some());
-        assert!(out["history_row_descriptor_bytes"].as_u64().is_some());
-        assert!(out["history_allocation_count"].as_u64().is_some());
+        // The packing figures describe a cold-history representation only the
+        // alacritty engine has, so they are numbers there and null elsewhere.
+        if !crate::terminal::vt::unsupported_by_selected_engine("cold-history packing") {
+            assert!(out["history_packed_blocks"].as_u64().is_some());
+            assert!(out["history_packed_bytes"].as_u64().is_some());
+            assert!(out["history_packed_rows"].as_u64().is_some());
+            assert!(out["history_packed_rows"].as_u64().unwrap_or(0) > 0);
+            assert!(out["history_dense_row_bytes"].as_u64().is_some());
+            assert!(out["history_row_descriptor_bytes"].as_u64().is_some());
+            assert!(out["history_allocation_count"].as_u64().is_some());
+        }
         assert_eq!(out["history_bytes_kind"], "estimated");
-        assert_eq!(out["history_exact"], false, "Alacritty reports an estimate");
+        assert_eq!(
+            out["history_exact"], false,
+            "neither engine counts the grapheme, hyperlink and sixel stores, \
+             so the figure is an estimate whichever is running"
+        );
 
         let listed = app.dispatch("pane.list", &json!({})).expect("pane list");
         assert!(listed["detection_extractions"].as_u64().is_some());

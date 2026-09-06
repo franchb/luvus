@@ -428,7 +428,7 @@ impl Pane {
         let (input_tx, input_rx) = io::input_channel();
         input_tx.set_notice(id, app_tx.clone());
         let engine = create_engine(
-            VtEngineKind::default(),
+            VtEngineKind::configured(),
             cols,
             rows,
             input_tx.clone(),
@@ -510,7 +510,7 @@ impl Pane {
         let (input_tx, input_rx) = io::input_channel();
         input_tx.set_notice(id, app_tx.clone());
         let engine = create_engine(
-            VtEngineKind::default(),
+            VtEngineKind::configured(),
             cols,
             rows,
             input_tx.clone(),
@@ -1383,6 +1383,10 @@ mod reap_tests {
 
     #[test]
     fn quiet_pty_history_and_resize_finish_incremental_maintenance() {
+        // Packing is what this waits on, and only the alacritty engine packs.
+        if crate::terminal::vt::unsupported_by_selected_engine("cold-history packing") {
+            return;
+        }
         let _env = crate::persist::test_env("pty-history-maintenance");
         let (tx, rx) = mpsc::channel();
         let mut pane = Pane::spawn_command(

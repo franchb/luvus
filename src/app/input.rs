@@ -6027,6 +6027,9 @@ mod link_click_tests {
 
     #[test]
     fn osc8_file_target_overrides_a_domain_shaped_label() {
+        if crate::terminal::vt::unsupported_by_selected_engine("OSC 8 hyperlink reporting") {
+            return;
+        }
         let _env = crate::persist::test_env("link-osc8-file");
         let path = std::env::current_dir().unwrap().join("Cargo.toml");
         let uri = format!("file://{}", path.display());
@@ -6044,6 +6047,9 @@ mod link_click_tests {
 
     #[test]
     fn osc8_file_label_preserves_a_visible_line_number() {
+        if crate::terminal::vt::unsupported_by_selected_engine("OSC 8 hyperlink reporting") {
+            return;
+        }
         let _env = crate::persist::test_env("link-osc8-line");
         let path = std::env::current_dir().unwrap().join("Cargo.toml");
         let uri = format!("file://{}", path.display());
@@ -6068,6 +6074,9 @@ mod link_click_tests {
 
     #[test]
     fn http_osc8_target_opens_even_when_its_label_looks_like_a_file() {
+        if crate::terminal::vt::unsupported_by_selected_engine("OSC 8 hyperlink reporting") {
+            return;
+        }
         let _env = crate::persist::test_env("link-osc8-http");
         let (app, _term, at) = fixture_showing_osc8("Cargo.toml", "https://example.com/actual", 2);
 
