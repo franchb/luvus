@@ -10509,11 +10509,16 @@ mod tests {
             .lock()
             .expect("engine")
             .advance(b"\x1b[H\x1b[2J Hello\r\n world");
+        // Start where the user would, rather than at hardcoded rows. Copy
+        // mode addresses absolute history rows, so the row the viewport
+        // starts on depends on how much scrollback the engine has - and
+        // clearing the screen feeds a row into alacritty's history and not
+        // into shitty's. Deriving the anchor keeps this about the gutter.
+        assert!(app.begin_copy_mode(), "copy mode starts");
+        let started = app.copy_mode.expect("copy mode is active");
         app.copy_mode = Some(CopyMode {
-            pane,
-            anchor: (1, 0),
-            cursor: (2, 5),
-            saved_scroll: 0,
+            cursor: (started.anchor.0 + 1, 5),
+            ..started
         });
 
         app.finish_copy_mode();
