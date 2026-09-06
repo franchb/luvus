@@ -1676,18 +1676,18 @@ checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shitty-vt"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c42ee04421aa3a08080deb9d38ee7aab551a741c291a498e3e88478f2b96ee5"
+checksum = "82a8baa71f5741a188405ad86f13dd27b7c2e290f482d3622658545242ed13b4"
 dependencies = [
  "shitty-vt-sys",
 ]
 
 [[package]]
 name = "shitty-vt-sys"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2a098249e111c00a9f28cbdefef95d377c68499c905df02a9c67ad6fd7b216a"
+checksum = "60cea2cc1dc3a38b0a7f319b6ff7c9325e50039865b82b4ed6a8b3560d6eb3ab"
 dependencies = [
  "pkg-config",
 ]

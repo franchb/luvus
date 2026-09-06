@@ -4,17 +4,10 @@
 //! Opt-in (`--features shitty-engine`) because it links a library that has to
 //! exist at build time, which `cargo install luvus` cannot assume.
 //!
-//! One thing this engine still cannot do as well as `alacritty`, because the
-//! facade resolves more than it reports:
-//!
-//! * **Soft wrap is not reported per row.** `CaptureMode::RecentUnwrapped`
-//!   rejoins rows the terminal wrapped; without the flag every physical row
-//!   reads as its own logical line.
-//!
-//! It is visible in the model and absent from the facade, like the input and
-//! preedit entry points before it - and like the cell colour sources, which
-//! this engine needed for the same reason and which landed upstream in
-//! pg83/shitty#112.
+//! Every method of the trait now has something behind it. The two things the
+//! facade used to resolve away - what a cell's colours were asked for, and
+//! where a row wrapped - were found by building this and landed upstream as
+//! pg83/shitty#112 and #114.
 
 use std::sync::mpsc::Sender;
 
@@ -93,9 +86,15 @@ impl ShittyEngine {
     }
 
     /// One row's text, wide-cell continuations skipped, clusters kept whole.
-    fn row_text(&self, index: u32, keep_clusters: bool, out: &mut String) {
+    ///
+    /// `limit` stops at that column, which is how a row that wrapped gives
+    /// up only the part belonging to it; 0 takes the whole row.
+    fn row_text(&self, index: u32, keep_clusters: bool, limit: u16, out: &mut String) {
         out.clear();
-        self.term.row_cells(index, |_, _, cell| {
+        self.term.row_cells(index, |_, column, cell| {
+            if limit != 0 && column >= limit {
+                return;
+            }
             if cell.grapheme.is_empty() {
                 out.push(' ');
                 return;
@@ -110,16 +109,63 @@ impl ShittyEngine {
         });
     }
 
-    fn append_plain_row(&self, index: u32, output: &mut String, max_bytes: usize) -> bool {
-        let mut row = String::with_capacity(self.cols as usize);
-        self.row_text(index, true, &mut row);
-        let trimmed = row.trim_end();
-        append_utf8_bounded(output, trimmed, max_bytes)
+    /// The newest `lines` logical lines, oldest first, each as the physical
+    /// rows it was written across.
+    ///
+    /// A row with a non-zero wrap length continues into the next one, so a
+    /// line starts wherever the row above it ended.
+    fn logical_lines(&self, lines: usize) -> Vec<Vec<u32>> {
+        let count = self.term.total_rows();
+        let mut logical: Vec<Vec<u32>> = Vec::new();
+        let mut current: Vec<u32> = Vec::new();
+        for index in (0..count).rev() {
+            current.push(index);
+            if index == 0 || self.term.row_wrap_length(index - 1) == 0 {
+                current.reverse();
+                logical.push(std::mem::take(&mut current));
+                if logical.len() >= lines {
+                    break;
+                }
+            }
+        }
+        logical.reverse();
+        logical
     }
 
-    fn append_ansi_row(&self, index: u32, output: &mut String, max_bytes: usize) -> bool {
+    /// Appends one row. `wrap` is the row's wrap length: non-zero means it
+    /// continues onto the next, so its text stops there and keeps its
+    /// blanks - the row is full by definition, and trimming would eat a
+    /// space the application printed. A row that ends on its own is
+    /// trimmed as before.
+    fn append_plain_row(
+        &self,
+        index: u32,
+        wrap: u16,
+        output: &mut String,
+        max_bytes: usize,
+    ) -> bool {
+        let mut row = String::with_capacity(self.cols as usize);
+        self.row_text(index, true, wrap, &mut row);
+        let text = if wrap == 0 {
+            row.trim_end()
+        } else {
+            row.as_str()
+        };
+        append_utf8_bounded(output, text, max_bytes)
+    }
+
+    fn append_ansi_row(
+        &self,
+        index: u32,
+        wrap: u16,
+        output: &mut String,
+        max_bytes: usize,
+    ) -> bool {
         let mut styled: Vec<(String, Color, Color, Modifier)> = Vec::new();
-        self.term.row_cells(index, |_, _, cell| {
+        self.term.row_cells(index, |_, column, cell| {
+            if wrap != 0 && column >= wrap {
+                return;
+            }
             styled.push((
                 cluster_text(&cell),
                 foreground(&cell),
@@ -128,10 +174,16 @@ impl ShittyEngine {
             ));
         });
         let blank = (Color::Reset, Color::Reset, Modifier::empty());
-        let last = styled
-            .iter()
-            .rposition(|(text, fg, bg, m)| !text.trim().is_empty() || (*fg, *bg, *m) != blank)
-            .map_or(0, |index| index + 1);
+        // A wrapped row keeps every cell it owns; only a row that ends on
+        // its own gives up its trailing blanks.
+        let last = if wrap != 0 {
+            styled.len()
+        } else {
+            styled
+                .iter()
+                .rposition(|(text, fg, bg, m)| !text.trim().is_empty() || (*fg, *bg, *m) != blank)
+                .map_or(0, |index| index + 1)
+        };
 
         let mut style = blank;
         // Always reserve room to reset a style we emit.
@@ -330,7 +382,7 @@ impl VtEngine for ShittyEngine {
         let top_row = self.live_top();
         let text: Vec<String> = (0..rows)
             .map(|row| {
-                self.row_text(top_row + row as u32, false, &mut buffer);
+                self.row_text(top_row + row as u32, false, 0, &mut buffer);
                 buffer.clone()
             })
             .collect();
@@ -398,7 +450,7 @@ impl VtEngine for ShittyEngine {
         let mut out = String::new();
         let mut buffer = String::with_capacity(self.cols as usize);
         for row in start..rows {
-            self.row_text(top + row as u32, true, &mut buffer);
+            self.row_text(top + row as u32, true, 0, &mut buffer);
             if !out.is_empty() {
                 out.push('\n');
             }
@@ -446,9 +498,9 @@ impl VtEngine for ShittyEngine {
                     }
                     let index = top + row as u32;
                     let complete = if plain {
-                        self.append_ansi_row(index, &mut output, max_bytes)
+                        self.append_ansi_row(index, 0, &mut output, max_bytes)
                     } else {
-                        self.append_plain_row(index, &mut output, max_bytes)
+                        self.append_plain_row(index, 0, &mut output, max_bytes)
                     };
                     returned += 1;
                     if !complete {
@@ -458,20 +510,25 @@ impl VtEngine for ShittyEngine {
                 }
             }
             CaptureMode::RecentUnwrapped => {
-                // Without a per-row soft-wrap flag every physical row reads as
-                // its own logical line, so a wrapped line comes back split.
-                let count = self.term.total_rows();
-                let start = count.saturating_sub(lines as u32);
-                for index in start..count {
+                for rows in self.logical_lines(lines) {
                     if returned > 0 && !append_utf8_bounded(&mut output, "\n", max_bytes) {
                         truncated = true;
                         break;
                     }
-                    let complete = if ansi {
-                        self.append_ansi_row(index, &mut output, max_bytes)
-                    } else {
-                        self.append_plain_row(index, &mut output, max_bytes)
-                    };
+                    // One logical line, however many rows the terminal
+                    // happened to split it across.
+                    let mut complete = true;
+                    for index in rows {
+                        let wrap = self.term.row_wrap_length(index);
+                        complete = if ansi {
+                            self.append_ansi_row(index, wrap, &mut output, max_bytes)
+                        } else {
+                            self.append_plain_row(index, wrap, &mut output, max_bytes)
+                        };
+                        if !complete {
+                            break;
+                        }
+                    }
                     returned += 1;
                     if !complete {
                         truncated = true;
@@ -550,7 +607,7 @@ impl VtEngine for ShittyEngine {
             return None;
         }
         let mut output = String::with_capacity(self.cols as usize);
-        self.row_text(index, true, &mut output);
+        self.row_text(index, true, 0, &mut output);
         let trimmed = output.trim_end().len();
         output.truncate(trimmed);
         Some(output)
@@ -559,7 +616,7 @@ impl VtEngine for ShittyEngine {
     fn for_each_retained_row(&self, f: &mut dyn FnMut(usize, &str)) {
         let mut output = String::with_capacity(self.cols as usize);
         for index in 0..self.term.total_rows() {
-            self.row_text(index, true, &mut output);
+            self.row_text(index, true, 0, &mut output);
             let trimmed = output.trim_end().len();
             output.truncate(trimmed);
             f(index as usize, &output);
@@ -613,7 +670,7 @@ impl VtEngine for ShittyEngine {
         let top = self.live_top();
         for row in 0..rows {
             let mut line = String::new();
-            self.append_ansi_row(top + row as u32, &mut line, usize::MAX);
+            self.append_ansi_row(top + row as u32, 0, &mut line, usize::MAX);
             body.push(line);
         }
         let Some(last) = body.iter().rposition(|line| !line.is_empty()) else {
@@ -837,6 +894,64 @@ mod tests {
         assert_eq!(engine.output_generation(), before + 1);
         engine.finish_output_batch();
         assert_eq!(engine.output_generation(), before + 1);
+    }
+
+    #[test]
+    fn recent_capture_joins_soft_wrapped_rows() {
+        // Named after the alacritty engine's test of the same behaviour, so
+        // the two can be compared. "abcdefghij" is written across two rows
+        // of a five-column terminal and has to come back as one line.
+        let mut engine = engine(5, 3);
+        engine.advance(b"abcdefghij\r\nnext");
+
+        let capture = engine.backend_capture(CaptureMode::RecentUnwrapped, 3, false, 512);
+        assert_eq!(capture.text, "abcdefghij\nnext");
+    }
+
+    #[test]
+    fn the_recent_capture_counts_logical_lines_not_physical_rows() {
+        // Asking for two lines gets both, with the wrapped one counting
+        // once - the whole point of asking for lines rather than rows.
+        let mut engine = engine(5, 3);
+        engine.advance(b"abcdefghij\r\nnext");
+
+        let capture = engine.backend_capture(CaptureMode::RecentUnwrapped, 2, false, 512);
+        assert_eq!(capture.text, "abcdefghij\nnext");
+        assert_eq!(capture.lines, 2);
+
+        let newest = engine.backend_capture(CaptureMode::RecentUnwrapped, 1, false, 512);
+        assert_eq!(newest.text, "next");
+    }
+
+    #[test]
+    fn a_wrapped_row_keeps_the_blanks_it_owns() {
+        // The spaces are the application's, and the row is full, so the
+        // wrap length is what says to keep them. Trimming the row the way
+        // an unwrapped one is trimmed would rejoin this as "abcd".
+        let mut engine = engine(5, 3);
+        engine.advance(b"ab   cd");
+
+        let capture = engine.backend_capture(CaptureMode::RecentUnwrapped, 2, false, 512);
+        assert!(
+            capture.text.starts_with("ab   cd"),
+            "spaces inside a rejoined line survive: {:?}",
+            capture.text
+        );
+    }
+
+    #[test]
+    fn the_visible_capture_still_reads_physical_rows() {
+        // Only the unwrapped capture rejoins; what the user is looking at
+        // is what is on the screen, wrapped where the screen wrapped it.
+        let mut engine = engine(5, 3);
+        engine.advance(b"abcdefghij");
+
+        let capture = engine.backend_capture(CaptureMode::Visible, 3, false, 512);
+        assert!(
+            capture.text.starts_with("abcde\nfghij"),
+            "visible rows stay split: {:?}",
+            capture.text
+        );
     }
 
     #[test]
