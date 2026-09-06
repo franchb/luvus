@@ -185,19 +185,25 @@ impl ShittyEngine {
         wrap: u16,
         output: &mut String,
         max_bytes: usize,
+        scratch: &mut AnsiRow,
     ) -> bool {
-        let mut styled: Vec<(String, Color, Color, Modifier)> = Vec::new();
+        scratch.clear();
+        let AnsiRow { text, cells } = scratch;
         self.term.row_cells(index, |_, column, cell| {
             if wrap != 0 && column >= wrap {
                 return;
             }
-            styled.push((
-                cluster_text(&cell),
+            let start = text.len();
+            push_cluster_text(&cell, text);
+            cells.push((
+                start,
+                text.len(),
                 foreground(&cell),
                 background(&cell),
                 modifiers(&cell),
             ));
         });
+        let styled = &cells[..];
         let blank = (Color::Reset, Color::Reset, Modifier::empty());
         // A wrapped row keeps every cell it owns; only a row that ends on
         // its own gives up its trailing blanks.
@@ -206,17 +212,20 @@ impl ShittyEngine {
         } else {
             styled
                 .iter()
-                .rposition(|(text, fg, bg, m)| !text.trim().is_empty() || (*fg, *bg, *m) != blank)
+                .rposition(|(start, end, fg, bg, m)| {
+                    !text[*start..*end].trim().is_empty() || (*fg, *bg, *m) != blank
+                })
                 .map_or(0, |index| index + 1)
         };
 
         let mut style = blank;
         // Always reserve room to reset a style we emit.
         let content_limit = max_bytes.saturating_sub(4);
-        for (text, fg, bg, m) in styled.iter().take(last) {
+        for (start, end, fg, bg, m) in styled.iter().take(last) {
+            let cell = &text[*start..*end];
             let next = (*fg, *bg, *m);
             let code = (next != style).then(|| sgr(next.0, next.1, next.2));
-            let needed = code.as_ref().map_or(0, String::len) + text.len();
+            let needed = code.as_ref().map_or(0, String::len) + cell.len();
             if output.len().saturating_add(needed) > content_limit {
                 if style != blank {
                     output.push_str("\x1b[0m");
@@ -227,7 +236,7 @@ impl ShittyEngine {
                 output.push_str(&code);
                 style = next;
             }
-            output.push_str(text);
+            output.push_str(cell);
         }
         if style != blank {
             output.push_str("\x1b[0m");
@@ -270,14 +279,39 @@ fn map_color(source: ColorSource, resolved: Rgb) -> Color {
 }
 
 fn cluster_text(cell: &VtCell<'_>) -> String {
+    let mut out = String::new();
+    push_cluster_text(cell, &mut out);
+    out
+}
+
+/// Appends what a cell shows, without allocating a string for it.
+fn push_cluster_text(cell: &VtCell<'_>, out: &mut String) {
     if cell.grapheme.is_empty() {
-        return String::from(" ");
+        out.push(' ');
+        return;
     }
-    cell.grapheme
-        .iter()
-        .filter_map(|p| char::from_u32(*p))
-        .filter(|c| !c.is_control() || *c == '\t')
-        .collect()
+    out.extend(
+        cell.grapheme
+            .iter()
+            .filter_map(|p| char::from_u32(*p))
+            .filter(|c| !c.is_control() || *c == '\t'),
+    );
+}
+
+/// Row scratch for the ANSI capture: one text buffer and one span per cell,
+/// reused across rows. Building a `String` per cell instead cost more than
+/// the rest of the capture put together.
+#[derive(Default)]
+struct AnsiRow {
+    text: String,
+    cells: Vec<(usize, usize, Color, Color, Modifier)>,
+}
+
+impl AnsiRow {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cells.clear();
+    }
 }
 
 fn modifiers(cell: &VtCell<'_>) -> Modifier {
@@ -548,6 +582,7 @@ impl VtEngine for ShittyEngine {
         let mut output = String::new();
         let mut returned = 0;
         let mut truncated = false;
+        let mut scratch = AnsiRow::default();
 
         match mode {
             CaptureMode::Detection | CaptureMode::Visible => {
@@ -560,7 +595,7 @@ impl VtEngine for ShittyEngine {
                     }
                     let index = top + row as u32;
                     let complete = if plain {
-                        self.append_ansi_row(index, 0, &mut output, max_bytes)
+                        self.append_ansi_row(index, 0, &mut output, max_bytes, &mut scratch)
                     } else {
                         self.append_plain_row(index, 0, &mut output, max_bytes)
                     };
@@ -582,7 +617,7 @@ impl VtEngine for ShittyEngine {
                     let mut complete = true;
                     for (index, wrap) in rows {
                         complete = if ansi {
-                            self.append_ansi_row(index, wrap, &mut output, max_bytes)
+                            self.append_ansi_row(index, wrap, &mut output, max_bytes, &mut scratch)
                         } else {
                             self.append_plain_row(index, wrap, &mut output, max_bytes)
                         };
@@ -905,9 +940,10 @@ impl VtEngine for ShittyEngine {
         }
         let mut body: Vec<String> = Vec::with_capacity(rows);
         let top = self.live_top();
+        let mut scratch = AnsiRow::default();
         for row in 0..rows {
             let mut line = String::new();
-            self.append_ansi_row(top + row as u32, 0, &mut line, usize::MAX);
+            self.append_ansi_row(top + row as u32, 0, &mut line, usize::MAX, &mut scratch);
             body.push(line);
         }
         let Some(last) = body.iter().rposition(|line| !line.is_empty()) else {

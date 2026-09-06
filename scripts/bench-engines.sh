@@ -35,5 +35,5 @@ for engine in "${engines[@]}"; do
         --bin luvus \
         bench_engines \
         -- --ignored --nocapture 2>/dev/null |
-        sed -n '/^engine /,/^capture /p'
+        sed -n "/^engine /,/^capture ansi /p"
 done

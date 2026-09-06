@@ -219,4 +219,21 @@ fn bench_engines() {
         "capture     50x  {capture_ms:8.2} ms  ({} lines/pass)",
         lines / 50
     );
+
+    // The styled capture, which is what a snapshot and an agent transcript
+    // read, and which does considerably more per cell than the plain one.
+    let mut bytes = 0usize;
+    let start = Instant::now();
+    for _ in 0..50 {
+        bytes += engine
+            .backend_capture(CaptureMode::RecentUnwrapped, 500, true, 1 << 20)
+            .text
+            .len();
+    }
+    let ansi_ms = start.elapsed().as_secs_f64() * 1000.0;
+    assert!(bytes > 0, "the styled capture should have returned text");
+    println!(
+        "capture ansi 50x {ansi_ms:8.2} ms  ({} KiB/pass)",
+        bytes / 50 / 1024
+    );
 }
