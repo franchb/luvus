@@ -31,6 +31,12 @@ pub struct ShittyEngine {
     rows: u16,
     history_budget_bytes: usize,
     output_generation: u64,
+    /// The facade signals a title change through a callback the bindings keep
+    /// to themselves, so the change is noticed by comparison instead. Without
+    /// a generation that moves, `Pane::take_title_change` compares a constant
+    /// and never reports one.
+    title: Option<String>,
+    title_generation: u64,
 }
 
 impl ShittyEngine {
@@ -65,6 +71,8 @@ impl ShittyEngine {
             rows,
             history_budget_bytes,
             output_generation: 0,
+            title: None,
+            title_generation: 0,
         }
     }
 
@@ -332,6 +340,14 @@ fn sgr(fg: Color, bg: Color, m: Modifier) -> String {
     if m.contains(Modifier::REVERSED) {
         s.push_str(";7");
     }
+    // `modifiers` records both, so leaving them out would reveal concealed
+    // text in a capture and drop strikeout from a restored snapshot.
+    if m.contains(Modifier::HIDDEN) {
+        s.push_str(";8");
+    }
+    if m.contains(Modifier::CROSSED_OUT) {
+        s.push_str(";9");
+    }
     push_color(&mut s, fg, 38);
     push_color(&mut s, bg, 48);
     s.push('m');
@@ -351,6 +367,11 @@ impl VtEngine for ShittyEngine {
         self.term.feed(bytes);
         self.drain_replies();
         self.output_generation = self.output_generation.wrapping_add(1);
+        let title = self.term.title();
+        if title != self.title {
+            self.title = title;
+            self.title_generation = self.title_generation.wrapping_add(1);
+        }
     }
 
     fn finish_output_batch(&mut self) {
@@ -476,6 +497,30 @@ impl VtEngine for ShittyEngine {
         out
     }
 
+    fn detection_text_non_empty(&self, n: u16) -> String {
+        // An agent with a tall blank footer puts its prompt above it, so the
+        // bottom n physical rows the default would take can be entirely
+        // blank and the state read as the wrong one.
+        let rows = self.rows as usize;
+        let top = self.live_top();
+        let wanted = usize::from(n).min(rows);
+        let mut selected: Vec<String> = Vec::with_capacity(wanted);
+        let mut buffer = String::with_capacity(self.cols as usize);
+        for row in (0..rows).rev() {
+            self.row_text(top + row as u32, true, 0, &mut buffer);
+            let line = buffer.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            selected.push(line.to_string());
+            if selected.len() == wanted {
+                break;
+            }
+        }
+        selected.reverse();
+        selected.join("\n")
+    }
+
     fn visible_rows(&self) -> Vec<String> {
         let mut lines = vec![String::new(); self.rows as usize];
         self.term.for_each_cell(|row, _, cell| {
@@ -561,7 +606,11 @@ impl VtEngine for ShittyEngine {
     }
 
     fn title(&self) -> Option<String> {
-        self.term.title()
+        self.title.clone()
+    }
+
+    fn title_generation(&self) -> u64 {
+        self.title_generation
     }
 
     fn set_history_budget(&mut self, bytes: usize) {
@@ -739,7 +788,11 @@ impl VtEngine for ShittyEngine {
             let mut row = String::new();
             self.term.row_cells(index as u32, |_, column, cell| {
                 let column = usize::from(column);
-                if column < first || column > last || (wrap != 0 && column >= wrap) {
+                // A double-width glyph occupies the column after its base as
+                // well, and row_cells reports only the base: compare the whole
+                // span, or selecting from the continuation drops the glyph.
+                let end = column + usize::from(cell.width.max(1)) - 1;
+                if end < first || column > last || (wrap != 0 && column >= wrap) {
                     return;
                 }
                 row.push_str(&cluster_text(&cell));
@@ -1078,6 +1131,76 @@ mod tests {
         assert_eq!(engine.output_generation(), before + 1);
         engine.finish_output_batch();
         assert_eq!(engine.output_generation(), before + 1);
+    }
+
+    #[test]
+    fn a_title_change_moves_the_generation() {
+        // Pane::take_title_change compares generations, so a constant would
+        // leave a renamed pane's chrome stale until something else redrew.
+        let mut engine = engine(20, 3);
+        let start = engine.title_generation();
+        engine.advance(b"\x1b]0;first\x07");
+        let renamed = engine.title_generation();
+
+        assert_eq!(engine.title().as_deref(), Some("first"));
+        assert_ne!(renamed, start, "setting a title moves the generation");
+
+        engine.advance(b"hello");
+        assert_eq!(
+            engine.title_generation(),
+            renamed,
+            "ordinary output leaves it alone"
+        );
+
+        engine.advance(b"\x1b]0;second\x07");
+        assert_ne!(engine.title_generation(), renamed, "and a rename moves it");
+    }
+
+    #[test]
+    fn detection_reads_past_a_blank_footer() {
+        // An agent puts its prompt above a tall blank footer. Taking the
+        // bottom n physical rows would return nothing but blanks and the
+        // agent's state would be read as the wrong one.
+        let mut engine = engine(20, 6);
+        engine.advance(b"approve?\r\n\r\n\r\n\r\n");
+
+        let text = engine.detection_text_non_empty(2);
+        assert!(
+            text.contains("approve?"),
+            "the prompt survives the footer: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_selection_starting_on_a_continuation_keeps_its_glyph() {
+        // A double-width glyph owns the column after its base, and the
+        // terminal reports only the base. Selecting from the continuation
+        // column must still yield the whole glyph.
+        let mut engine = engine(20, 3);
+        engine.advance("\u{4f60}\u{597d}".as_bytes());
+
+        let whole = engine.retained_selection_text(((0, 0), (0, 3)));
+        assert_eq!(whole.as_deref(), Some("\u{4f60}\u{597d}"));
+
+        let from_continuation = engine.retained_selection_text(((0, 1), (0, 3)));
+        assert_eq!(
+            from_continuation.as_deref(),
+            Some("\u{4f60}\u{597d}"),
+            "the glyph whose second column starts the selection is kept"
+        );
+    }
+
+    #[test]
+    fn an_ansi_capture_keeps_conceal_and_strikeout() {
+        // Both are recorded as modifiers, so dropping them from the escape
+        // would reveal concealed text and lose strikeout on restore.
+        let mut engine = engine(20, 3);
+        engine.advance(b"\x1b[8mhidden\x1b[0m \x1b[9mgone\x1b[0m");
+
+        // Visible takes the bottom n rows, and the text is on the first.
+        let capture = engine.backend_capture(CaptureMode::Visible, 3, true, 4096);
+        assert!(capture.text.contains(";8"), "conceal: {:?}", capture.text);
+        assert!(capture.text.contains(";9"), "strikeout: {:?}", capture.text);
     }
 
     #[test]

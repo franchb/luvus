@@ -124,10 +124,15 @@ fn feed_ms(kind: VtEngineKind, corpus: &[u8]) -> f64 {
 
 /// Resident set size in KiB, or 0 where /proc is not mounted.
 fn rss_kb() -> usize {
+    // /proc counts pages, and a page is not 4 KiB everywhere: arm64 hosts are
+    // commonly configured with 64 KiB, which would put every figure here out
+    // by a factor of sixteen.
+    let page_kb =
+        usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096) / 1024;
     std::fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|status| status.split_whitespace().nth(1)?.parse::<usize>().ok())
-        .map_or(0, |pages| pages * 4)
+        .map_or(0, |pages| pages * page_kb.max(1))
 }
 
 #[test]
