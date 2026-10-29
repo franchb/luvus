@@ -68,7 +68,7 @@ jobs:
     env:
       # Bump with the shitty-vt version in Cargo.toml: the bindings check the
       # header and refuse a facade older than the calls they make.
-      SHITTY_REF: 8df70bffd5489bb2e3045055b170d043a24c436c
+      SHITTY_REF: 030379fd51ddf84fde3a92647dfb549fbd9b25af
       # The core is C++26 and this runner's default g++ is 13, which rejects
       # -std=c++26 outright.
       CC: gcc-14
