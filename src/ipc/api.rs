@@ -158,6 +158,9 @@ impl Drop for RequestMetrics {
 struct ConnectionPermit;
 
 impl ConnectionPermit {
+    // Rust 1.99 renamed this to `try_update`, which is still unstable at
+    // the 1.88 MSRV this crate declares, so the rename waits for the MSRV.
+    #[allow(deprecated)]
     fn acquire() -> Option<Self> {
         ACTIVE_CONNECTIONS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -171,6 +174,9 @@ impl ConnectionPermit {
 struct TerminalStreamPermit;
 
 impl TerminalStreamPermit {
+    // Rust 1.99 renamed this to `try_update`, which is still unstable at
+    // the 1.88 MSRV this crate declares, so the rename waits for the MSRV.
+    #[allow(deprecated)]
     fn acquire() -> Option<Self> {
         ACTIVE_TERMINAL_STREAMS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {

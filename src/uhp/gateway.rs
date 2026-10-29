@@ -160,6 +160,9 @@ impl Drop for Gateway {
     }
 }
 
+// Rust 1.99 renamed `fetch_update` to `try_update`, which is still unstable
+// at the 1.88 MSRV this crate declares, so the rename waits for the MSRV.
+#[allow(deprecated)]
 fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     let mut workers = Vec::new();
     while !shared.cancelled.load(Ordering::Acquire) {
