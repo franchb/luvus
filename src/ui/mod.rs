@@ -3,16 +3,17 @@
 
 pub mod theme;
 
-use std::path::Path;
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Paragraph, Widget};
 use ratatui::Frame;
 
-use crate::app::{App, DockKind, Mode, Side};
+use crate::app::{App, DockKind, Mode, PaneNavigationTarget, Side};
 use crate::ids::PaneId;
 use crate::ui::theme::{State, Theme};
 
@@ -82,8 +83,9 @@ mod preview;
 mod search;
 mod session_menu;
 mod settings;
-mod sidebar;
-pub(crate) use sidebar::SIDEBAR_CHROME_ROWS;
+pub(crate) mod sidebar;
+pub(crate) mod workspace_row;
+pub(crate) use sidebar::{DOCK_HEADER_ROWS, SIDEBAR_CHROME_ROWS};
 mod status;
 pub(crate) mod switcher;
 mod tabbar;
@@ -126,7 +128,123 @@ pub fn render_into(f: &mut RenderTarget, app: &mut App) {
 /// client's cursor, scroll position, compact mode, or click targets.
 /// Return the passive client's content geometry before restoring all active
 /// hit-test state. Each client owns this baseline, never the shared App.
-pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(PaneId, Rect)> {
+pub(crate) struct ClientProjection {
+    pub pane_content: Vec<(PaneId, Rect)>,
+    pub hyperlinks: Vec<crate::app::RenderedHyperlink>,
+    pub shell_dock: Option<Rect>,
+    pub left_seam: Option<Rect>,
+    pub right_seam: Option<Rect>,
+    pub main_area: Rect,
+    pub pane_area: Rect,
+    pub shell_overlay: Option<Rect>,
+    pub session_slot: Option<Rect>,
+    pub session_button: Option<Rect>,
+}
+
+/// Semantic server-owned overlay bounds for a machine-aware thin client.
+/// These bounds come from render geometry, never inferred from cell colors.
+pub(crate) fn shell_overlay_rect(app: &App, area: Rect) -> Option<Rect> {
+    if area.width < 24 || area.height < 6 || app.workspaces.is_empty() {
+        return None;
+    }
+    // The machine-aware client owns the Workspaces rows outside this modal.
+    // Publish the picker's exact bounds so those rows remain visible instead
+    // of treating its dimmed backdrop as an opaque full-screen surface.
+    if app.picker.is_some() {
+        if let Some((_, rect)) = app
+            .picker_rects
+            .iter()
+            .find(|(hit, _)| matches!(hit, crate::app::PickerHit::Modal))
+        {
+            return Some(*rect);
+        }
+    }
+    if let Some(rect) = app
+        .settings_modal_rect
+        .or(app.changelog_modal_rect)
+        .or(app.named_session_menu_rect)
+    {
+        return Some(rect);
+    }
+
+    let mut popup: Option<Rect> = None;
+    let mut include = |rect: Rect| {
+        popup = Some(match popup {
+            None => rect,
+            Some(current) => current.union(rect),
+        });
+    };
+    if let Some(menu) = &app.ws_menu {
+        menu.items.iter().for_each(|(_, rect)| include(*rect));
+    }
+    if let Some(menu) = &app.tab_menu {
+        menu.items.iter().for_each(|(_, rect)| include(*rect));
+        menu.swap_rects.iter().for_each(|(_, rect)| include(*rect));
+    }
+    if let Some(menu) = &app.pane_menu {
+        menu.items.iter().for_each(|(_, rect)| include(*rect));
+        menu.tab_rects.iter().for_each(|(_, rect)| include(*rect));
+    }
+    if let Some(menu) = &app.agent_menu {
+        menu.items.iter().for_each(|(_, rect)| include(*rect));
+    }
+    if let Some(menu) = &app.file_menu {
+        menu.items.iter().for_each(|(_, rect)| include(*rect));
+    }
+    if let Some(menu) = &app.diff_menu {
+        menu.items.iter().for_each(|(_, rect)| include(*rect));
+    }
+    if let Some(menu) = &app.orch_menu {
+        menu.items.iter().for_each(|(_, rect)| include(*rect));
+    }
+    if let Some(menu) = &app.session_menu {
+        menu.items.iter().for_each(|(_, rect)| include(*rect));
+    }
+    if let Some(menu) = &app.dock_menu {
+        menu.rects.iter().for_each(|rect| include(*rect));
+    }
+    if let Some(rect) = popup {
+        let left = rect.x.saturating_sub(1).max(area.x);
+        let top = rect.y.saturating_sub(1).max(area.y);
+        let right = rect.right().saturating_add(1).min(area.right());
+        let bottom = rect.bottom().saturating_add(1).min(area.bottom());
+        return Some(Rect::new(
+            left,
+            top,
+            right.saturating_sub(left),
+            bottom.saturating_sub(top),
+        ));
+    }
+
+    let unbounded_overlay = app.settings.is_some()
+        || app.picker.is_some()
+        || app.help_open
+        || app.changelog_open
+        || app.cmd_inspect.is_some()
+        || app.worktree_prompt.is_some()
+        || app.worktree_open.is_some()
+        || app.tab_rename.is_some()
+        || app.ws_rename.is_some()
+        || app.pane_rename.is_some()
+        || app.file_prompt.is_some()
+        || app.file_delete.is_some()
+        || app.worktree_delete.is_some()
+        || app.switcher
+        || app.search.is_some()
+        || app.orch_form.is_some()
+        || app.orch_start.is_some()
+        || app.orch_detail.is_some()
+        || app.mission_detail.is_some()
+        || app.mission_answer.is_some()
+        || app.bar.overflow.is_some();
+    unbounded_overlay.then_some(area)
+}
+
+pub(crate) fn workspace_picker_modal_rect(area: Rect, mobile: bool) -> Rect {
+    picker::workspace_picker_modal_rect(area, mobile)
+}
+
+pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> ClientProjection {
     let compact = app.compact;
     let last_main_area = app.last_main_area;
     let last_pane_area = app.last_pane_area;
@@ -155,6 +273,7 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
     // client's values aside instead of cloning them on every secondary frame.
     let pane_rects = std::mem::take(&mut app.pane_rects);
     let pane_content_rects = std::mem::take(&mut app.pane_content_rects);
+    let rendered_hyperlinks = std::mem::take(&mut app.rendered_hyperlinks);
     let pane_title_rects = std::mem::take(&mut app.pane_title_rects);
     let tab_rects = std::mem::take(&mut app.tab_rects);
     let tab_close_rects = std::mem::take(&mut app.tab_close_rects);
@@ -174,6 +293,8 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
     let module_dock_rects = std::mem::take(&mut app.module_dock_rects);
     let dock_dividers = std::mem::take(&mut app.dock_dividers);
     let picker_rects = std::mem::take(&mut app.picker_rects);
+    let worktree_open_rects = std::mem::take(&mut app.worktree_open_rects);
+    let worktree_prompt_rect = app.worktree_prompt_rect;
     let settings_tab_rects = std::mem::take(&mut app.settings_tab_rects);
     let settings_ctl_rects = std::mem::take(&mut app.settings_ctl_rects);
     let settings_theme_remove_rects = std::mem::take(&mut app.settings_theme_remove_rects);
@@ -236,6 +357,7 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
     let settings_icon_rect = app.settings_icon_rect;
     let sidebar_toggle_rect = app.sidebar_toggle_rect;
     let right_sidebar_toggle_rect = app.right_sidebar_toggle_rect;
+    let client_shell_dock_rect = app.client_shell_dock_rect;
     let version_rect = app.version_rect;
     let files_area = app.files_area;
     let workspaces_area = app.workspaces_area;
@@ -249,6 +371,7 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
     let mobile_pane_prev_rect = app.mobile_pane_prev_rect;
     let mobile_pane_next_rect = app.mobile_pane_next_rect;
     let switcher_close_rect = app.switcher_close_rect;
+    let named_session_slot_rect = app.named_session_slot_rect;
     let named_session_button_rect = app.named_session_button_rect;
     let named_session_menu_rect = app.named_session_menu_rect;
     let named_session_close_rect = app.named_session_close_rect;
@@ -271,6 +394,15 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
     });
 
     render_into_mode(f, app, false);
+
+    let projected_shell_dock = app.client_shell_dock_rect;
+    let projected_left_seam = app.left_seam;
+    let projected_right_seam = app.right_seam;
+    let projected_main_area = app.last_main_area;
+    let projected_pane_area = app.last_pane_area;
+    let projected_shell_overlay = shell_overlay_rect(app, f.area());
+    let projected_session_slot = app.named_session_slot_rect;
+    let projected_session_button = app.named_session_button_rect;
 
     app.compact = compact;
     app.last_main_area = last_main_area;
@@ -297,6 +429,7 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
     app.menu_scroll = menu_scroll;
     app.pane_rects = pane_rects;
     let projected_content = std::mem::replace(&mut app.pane_content_rects, pane_content_rects);
+    let projected_hyperlinks = std::mem::replace(&mut app.rendered_hyperlinks, rendered_hyperlinks);
     app.pane_title_rects = pane_title_rects;
     app.tab_rects = tab_rects;
     app.tab_close_rects = tab_close_rects;
@@ -316,6 +449,8 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
     app.module_dock_rects = module_dock_rects;
     app.dock_dividers = dock_dividers;
     app.picker_rects = picker_rects;
+    app.worktree_open_rects = worktree_open_rects;
+    app.worktree_prompt_rect = worktree_prompt_rect;
     app.settings_tab_rects = settings_tab_rects;
     app.settings_ctl_rects = settings_ctl_rects;
     app.settings_theme_remove_rects = settings_theme_remove_rects;
@@ -332,6 +467,7 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
     app.bar.hits = bar_hits;
     app.bar.overflow_hits = bar_overflow_hits;
     app.bar.overflow = bar_overflow;
+    app.named_session_slot_rect = named_session_slot_rect;
     app.named_session_button_rect = named_session_button_rect;
     app.named_session_menu_rect = named_session_menu_rect;
     app.named_session_close_rect = named_session_close_rect;
@@ -373,6 +509,7 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
     app.settings_icon_rect = settings_icon_rect;
     app.sidebar_toggle_rect = sidebar_toggle_rect;
     app.right_sidebar_toggle_rect = right_sidebar_toggle_rect;
+    app.client_shell_dock_rect = client_shell_dock_rect;
     app.version_rect = version_rect;
     app.files_area = files_area;
     app.workspaces_area = workspaces_area;
@@ -400,7 +537,18 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
             git.contributors_more_rect = contributors_more_rect;
         }
     }
-    projected_content
+    ClientProjection {
+        pane_content: projected_content,
+        hyperlinks: projected_hyperlinks,
+        shell_dock: projected_shell_dock,
+        left_seam: projected_left_seam,
+        right_seam: projected_right_seam,
+        main_area: projected_main_area,
+        pane_area: projected_pane_area,
+        shell_overlay: projected_shell_overlay,
+        session_slot: projected_session_slot,
+        session_button: projected_session_button,
+    }
 }
 
 /// Whether a PTY-only frame may reuse a client's complete UI buffer.
@@ -415,7 +563,9 @@ pub(crate) fn retained_pty_eligible(app: &App) -> bool {
         && app.copy_mode.is_none()
         && app.hover_link.is_none()
         && app.search_flash.is_none()
+        && app.pane_search.is_none()
         && app.settings.is_none()
+        && app.commander.is_none()
         && app.picker.is_none()
         && !app.help_open
         && !app.changelog_open
@@ -456,8 +606,9 @@ pub(crate) fn patch_terminal_damage(
     app: &App,
     content_rects: &[(PaneId, Rect)],
     snapshots: &std::collections::HashMap<PaneId, crate::terminal::vt::DamageSnapshot>,
+    hyperlinks: &mut Vec<crate::app::RenderedHyperlink>,
 ) -> Result<(), ()> {
-    panes::patch_terminal_damage(target, app, content_rects, snapshots)
+    panes::patch_terminal_damage(target, app, content_rects, snapshots, hyperlinks)
 }
 
 fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
@@ -474,11 +625,19 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.mission_automation_rects.clear();
     app.automation_rects.clear();
     app.orch_hits.clear();
+    app.rendered_hyperlinks.clear();
     // Cleared with the other per-frame hit geometry, above every early return:
     // a frame that bails out (window too small, no workspace yet) must not
     // leave a dock divider behind as a live drag target.
     app.dock_dividers.clear();
     app.agents_elsewhere_rect = None;
+    app.client_shell_dock_rect = None;
+    app.left_seam = None;
+    app.right_seam = None;
+    app.last_main_area = Rect::ZERO;
+    app.last_pane_area = Rect::ZERO;
+    app.named_session_slot_rect = None;
+    app.named_session_button_rect = None;
     app.mobile_pane_prev_rect = None;
     app.mobile_pane_next_rect = None;
 
@@ -575,13 +734,35 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.right_seam = sidebar_right.map(|a| Rect::new(a.x, a.y, 1, a.height));
 
     let mobile_layout = app.compact.then(|| mobile::compute_layout(content));
-    let (tabbar, pane_area) = if let Some(layout) = mobile_layout {
+    let (tabbar, full_pane_area) = if let Some(layout) = mobile_layout {
         (layout.header, layout.content)
     } else {
         let [tabbar, pane_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
         (tabbar, pane_area)
     };
+    // The interactive Commander has its own bottom strip, rather than
+    // painting over terminal cells. Passive clients keep their full viewport.
+    let commander_height = if resize_panes && app.commander.is_some() {
+        app.commander_height.min(
+            full_pane_area
+                .height
+                .saturating_sub(crate::layout::MIN_PANE),
+        )
+    } else {
+        0
+    };
+    let (pane_area, commander_area) = if commander_height >= crate::app::COMMANDER_MIN_HEIGHT {
+        let [panes, commander_strip] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(commander_height)])
+                .areas(full_pane_area);
+        (panes, Some(commander_strip))
+    } else {
+        (full_pane_area, None)
+    };
+    if resize_panes {
+        app.commander_area = commander_area;
+    }
 
     app.last_pane_area = pane_area;
 
@@ -599,9 +780,13 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     };
     // Only frame panes when the tab is split; a lone pane needs no border.
     let bordered = rects.len() > 1;
+    // Title visibility is shared by lone and split panes. A zoomed split keeps
+    // its one-row header even when titles are hidden so the mouse/touch restore
+    // control remains available.
+    let lone_header = !bordered && !app.compact && (app.config.layout.show_titles || app.zoomed);
     if resize_panes {
         for (id, rect) in &rects {
-            let Some(content) = pane_content(*rect, bordered, app.compact) else {
+            let Some(content) = pane_content(*rect, bordered, app.compact, lone_header) else {
                 continue;
             };
             let resized = app
@@ -613,6 +798,9 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
             // geometry) repaints the agent; note it so detection freezes briefly
             // and a reflowed spinner can't flip the pane to "working" (docs/07).
             if resized {
+                if let Some(search) = app.pane_search.as_mut().filter(|search| search.pane == *id) {
+                    search.invalidate_matches();
+                }
                 if let Some(s) = app.status.get_mut(id) {
                     s.last_resize = Some(std::time::Instant::now());
                     s.force_detect = true;
@@ -625,6 +813,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     // set its own. A dock mounted nowhere (or a hidden sidebar) leaves its rects
     // zeroed, so nothing fires from under a widened pane area (docs/29).
     app.settings_icon_rect = None;
+    app.named_session_slot_rect = None;
     app.named_session_button_rect = None;
     app.sidebar_toggle_rect = None;
     app.right_sidebar_toggle_rect = None;
@@ -753,17 +942,37 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         let preview_rects: Vec<(PaneId, Rect)> = rects
             .iter()
             .filter_map(|(id, rect)| {
-                pane_content(*rect, bordered, app.compact).map(|content| (*id, content))
+                pane_content(*rect, bordered, app.compact, lone_header)
+                    .map(|content| (*id, content))
             })
             .collect();
         if resize_panes {
             app.ensure_preview_layouts(&preview_rects);
         }
-        let cursor = panes::draw_panes(f, &rects, bordered, app, &t);
+        let cursor = panes::draw_panes(f, &rects, bordered, lone_header, app, &t);
         // Draw all pane borders in one overlay pass (manual cell-by-cell), then
         // the dot+path+close titles ON each top border row.
         if bordered {
-            borders::render_pane_borders(f, &rects, focus, app.hover_divider.as_ref(), &t);
+            let border_focus = app
+                .pane_navigation
+                .filter(|navigation| {
+                    app.mode == Mode::PaneNavigate
+                        && navigation.workspace == app.active_ws
+                        && navigation.tab == app.ws().active_tab
+                })
+                .map_or(Some(focus), |navigation| match navigation.candidate {
+                    PaneNavigationTarget::Pane(pane) if rects.iter().any(|(id, _)| *id == pane) => {
+                        Some(pane)
+                    }
+                    PaneNavigationTarget::Pane(_) => Some(focus),
+                    PaneNavigationTarget::Commander => None,
+                });
+            let hover_divider = if app.mode == Mode::PaneNavigate {
+                None
+            } else {
+                app.hover_divider.as_ref()
+            };
+            borders::render_pane_borders(f, &rects, border_focus, hover_divider, &t);
             if app.config.layout.show_titles {
                 title_rects = panes::draw_pane_titles(f, &rects, focus, app, &t);
             }
@@ -780,10 +989,20 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         } else {
             rects
                 .iter()
-                .filter_map(|(id, r)| pane_content(*r, bordered, app.compact).map(|c| (*id, c)))
+                .filter_map(|(id, r)| {
+                    pane_content(*r, bordered, app.compact, lone_header).map(|c| (*id, c))
+                })
                 .collect()
         };
     status::draw_status(f, status, app, &t);
+    // The strip is pane chrome. Menus, modals, and toasts must paint over it.
+    let commander_cursor = match (commander_area, app.commander.as_ref()) {
+        (Some(commander_area), Some(commander)) => {
+            draw_commander(f, commander_area, app, commander, cat, &t)
+                .filter(|_| commander.focused && app.commander_accepts_input())
+        }
+        _ => None,
+    };
 
     // Read-only overflow is attachment-local geometry over server-owned bar
     // content. Draw it above chrome and panes, below modal workflows.
@@ -819,7 +1038,8 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     let picker_open = app.picker.is_some();
     let mut picker_rects = Vec::new();
     if let Some(p) = &app.picker {
-        picker_rects = picker::draw_picker(f, area, p, app.compact, cat, &t);
+        picker_rects =
+            picker::draw_picker(f, area, p, app.client_machine_capable, app.compact, cat, &t);
     }
     app.picker_rects = picker_rects;
 
@@ -850,27 +1070,47 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.modal_commit_rect = None;
     app.modal_cancel_rect = None;
     // The new-worktree branch prompt (docs/18 WT).
+    app.worktree_prompt_rect = None;
     if let Some(buf) = app.worktree_prompt.clone() {
         let err = app.worktree_error.clone();
-        let (c, x) = picker::draw_worktree_prompt(f, area, &buf, err.as_deref(), hover, cat, &t);
+        let (c, x, modal) =
+            picker::draw_worktree_prompt(f, area, &buf, err.as_deref(), hover, cat, &t);
         app.modal_commit_rect = c;
         app.modal_cancel_rect = x;
+        app.worktree_prompt_rect = Some(modal);
     }
+    // The open-worktree list modal (docs/18 WT).
+    let mut worktree_open_rects = Vec::new();
+    if let Some(list) = app.worktree_open.as_ref() {
+        let (c, x, rects) = picker::draw_worktree_open(f, area, list, hover, cat, &t);
+        app.modal_commit_rect = c;
+        app.modal_cancel_rect = x;
+        worktree_open_rects = rects;
+    }
+    app.worktree_open_rects = worktree_open_rects;
     // The tab-rename modal (docs/28).
-    if let Some(buf) = app.tab_rename.as_ref().map(|r| r.buffer.clone()) {
-        let (c, x) = picker::draw_tab_rename(f, area, &buf, hover, cat, &t);
+    if let Some((buf, cursor)) = app
+        .tab_rename
+        .as_ref()
+        .map(|r| (r.buffer.clone(), r.cursor))
+    {
+        let (c, x) = picker::draw_tab_rename(f, area, &buf, cursor, hover, cat, &t);
         app.modal_commit_rect = c;
         app.modal_cancel_rect = x;
     }
     // The workspace-rename modal, then the right-click context menu (on top).
-    if let Some(buf) = app.ws_rename.as_ref().map(|r| r.buffer.clone()) {
-        let (c, x) = picker::draw_ws_rename(f, area, &buf, hover, cat, &t);
+    if let Some((buf, cursor)) = app.ws_rename.as_ref().map(|r| (r.buffer.clone(), r.cursor)) {
+        let (c, x) = picker::draw_ws_rename(f, area, &buf, cursor, hover, cat, &t);
         app.modal_commit_rect = c;
         app.modal_cancel_rect = x;
     }
     // The pane-rename modal (same look), from the pane / AGENTS right-click menu.
-    if let Some(buf) = app.pane_rename.as_ref().map(|r| r.buffer.clone()) {
-        let (c, x) = picker::draw_pane_rename(f, area, &buf, hover, cat, &t);
+    if let Some((buf, cursor)) = app
+        .pane_rename
+        .as_ref()
+        .map(|r| (r.buffer.clone(), r.cursor))
+    {
+        let (c, x) = picker::draw_pane_rename(f, area, &buf, cursor, hover, cat, &t);
         app.modal_commit_rect = c;
         app.modal_cancel_rect = x;
     }
@@ -887,7 +1127,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         menu::draw_ws_menu(f, area, app, cat, &t);
     }
     // The FILES-dock context menu + its create/rename/delete modals (docs/38).
-    if app.file_menu.is_some() {
+    if app.file_menu.is_some() && app.search.is_none() {
         menu::draw_file_menu(f, area, app, cat, &t);
     }
     if app.diff_menu.is_some() {
@@ -1003,6 +1243,18 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         if app.session_menu.is_some() {
             menu::draw_session_menu(f, area, app, cat, &t);
         }
+        if let Some(name) = app.session_delete_confirm.as_deref() {
+            let (commit, cancel) = files::draw_named_delete_confirm(
+                f,
+                area,
+                name,
+                cat.session_delete_confirm,
+                app.hover,
+                &t,
+            );
+            app.modal_commit_rect = commit;
+            app.modal_cancel_rect = cancel;
+        }
     } else {
         app.named_session_menu_rect = None;
         app.named_session_close_rect = None;
@@ -1012,19 +1264,30 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     // The global scrollback-search overlay (docs/63), above the chrome.
     if app.search.is_some() {
         search::draw_search(f, area, app, &t);
+        if app.file_menu.is_some() {
+            menu::draw_file_menu(f, area, app, cat, &t);
+        }
     }
     // A transient toast (e.g. "Copied") flashes on top of everything.
     if let Some((text, _)) = &app.toast {
         draw_toast(f, area, text, &t);
     }
 
-    let cursor = if settings_hits.is_some()
+    let cursor = if app.mode == Mode::PaneNavigate
+        || settings_hits.is_some()
+        || (resize_panes
+            && app
+                .commander
+                .as_ref()
+                .is_some_and(|commander| commander.focused))
         || app.search.is_some()
         || picker_open
         || app.bar.overflow.is_some()
         || app.help_open
         || app.named_session_menu.is_some()
+        || app.session_delete_confirm.is_some()
         || app.worktree_prompt.is_some()
+        || app.worktree_open.is_some()
         || app.tab_rename.is_some()
         || app.tab_menu.is_some()
         || app.ws_rename.is_some()
@@ -1053,6 +1316,12 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         f.set_cursor_anchor(x, y, visible);
     }
     app.last_cursor = cursor.map(|(x, y, _)| (x, y));
+    if app.commander_accepts_input() {
+        if let Some((x, y)) = commander_cursor {
+            f.set_cursor_anchor(x, y, true);
+            app.last_cursor = Some((x, y));
+        }
+    }
     app.pane_rects = rects;
     app.tab_rects = tab_rects;
     app.tab_close_rects = tab_close_rects;
@@ -1063,6 +1332,507 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.automation_rects = automation_rects;
     app.session_rects = session_rects;
     app.new_ws_rect = new_ws_rect;
+}
+
+fn draw_commander(
+    f: &mut RenderTarget,
+    rect: Rect,
+    app: &App,
+    commander: &crate::commander::Commander,
+    cat: &crate::i18n::Catalog,
+    t: &Theme,
+) -> Option<(u16, u16)> {
+    if rect.width < 24 || rect.height < 3 {
+        return None;
+    }
+    let preview = commander
+        .preview
+        .iter()
+        .filter_map(|id| {
+            let status = app.status.get(id)?;
+            app.panes.contains_key(id).then(|| {
+                if app.is_agent_pane(*id) {
+                    format!("p{} {} {}", id.0, status.agent, status.state.label())
+                } else {
+                    format!("p{} {}", id.0, status.agent)
+                }
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let title = if preview.is_empty() {
+        cat.commander_title.to_string()
+    } else {
+        format!("{} · {}", cat.commander_title, preview)
+    };
+    // Match split-pane chrome: plain border and dark terminal background.
+    // Clear the whole strip first so underlying/previous frame glyphs cannot
+    // show through the composer (including stale split-pane dividers).
+    f.render_widget(Block::new().style(Style::new().bg(t.mantle)), rect);
+    let title = truncate(&title, rect.width.saturating_sub(4) as usize);
+    let block = Block::bordered()
+        .border_type(BorderType::Plain)
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::new().fg(t.accent).bg(t.mantle).bold(),
+        ))
+        .border_style(
+            Style::new()
+                .fg(
+                    if commander.focused
+                        || (app.mode == Mode::PaneNavigate
+                            && app.pane_navigation.is_some_and(|navigation| {
+                                matches!(navigation.candidate, PaneNavigationTarget::Commander)
+                            }))
+                    {
+                        t.border_focus
+                    } else {
+                        t.border
+                    },
+                )
+                .bg(t.mantle),
+        )
+        .style(Style::new().bg(t.mantle).fg(t.text));
+    f.render_widget(block, rect);
+    let inner = Rect::new(rect.x + 2, rect.y + 1, rect.width - 4, rect.height - 2);
+    let output_rows = if commander.read_output.is_some() {
+        inner.height.saturating_sub(2)
+    } else {
+        0
+    };
+    let editor_height = inner.height.saturating_sub(output_rows + 1).max(1);
+    let (display_draft, display_cursor, display_selection) = commander_display_draft(
+        &commander.draft,
+        commander.cursor,
+        commander.selection(),
+        &commander.staged_images,
+    );
+    let (lines, cursor_row, cursor_column) = commander_editor_lines(
+        &display_draft,
+        display_cursor,
+        display_selection,
+        inner.width.saturating_sub(2) as usize,
+        editor_height as usize,
+        t,
+    );
+    for (visible_row, line) in lines.into_iter().enumerate() {
+        f.render_widget(
+            Paragraph::new(line).style(Style::new().bg(t.mantle).fg(t.text)),
+            Rect::new(inner.x, inner.y + visible_row as u16, inner.width, 1),
+        );
+    }
+    if let Some(output) = commander.read_output.as_ref() {
+        let end = output.len().saturating_sub(commander.read_scroll);
+        let start = end.saturating_sub(output_rows as usize);
+        for (index, line) in output[start..end].iter().enumerate() {
+            f.render_widget(
+                Paragraph::new(truncate(line, inner.width as usize))
+                    .style(Style::new().bg(t.mantle).fg(t.overlay1)),
+                Rect::new(
+                    inner.x,
+                    inner.y + editor_height + index as u16,
+                    inner.width,
+                    1,
+                ),
+            );
+        }
+    }
+    // An armed confirmation prompt (kept in `receipt`) always owns this line.
+    // Otherwise results that finished while a prompt was showing come first,
+    // so they are seen even when an older message is still in `receipt`.
+    let held = if commander.confirming() {
+        None
+    } else {
+        commander.held_summary()
+    };
+    let footer = if let Some(result) = commander.delivery_results.get(commander.delivery_index) {
+        result
+    } else if let Some(held) = held.as_deref() {
+        held
+    } else if let Some(receipt) = commander.receipt.as_deref() {
+        receipt
+    } else if commander.guided_orch.is_some() {
+        cat.commander_guided_hint
+    } else {
+        if inner.width < 64 {
+            cat.commander_hint_compact
+        } else {
+            cat.commander_hint
+        }
+    };
+    if inner.height > 1 {
+        f.render_widget(
+            Paragraph::new(if commander.delivery_results.len() > 1 {
+                format!(
+                    "{}/{} {footer}  ↑↓",
+                    commander.delivery_index + 1,
+                    commander.delivery_results.len()
+                )
+            } else {
+                footer.to_string()
+            })
+            .style(Style::new().bg(t.mantle).fg(t.overlay1)),
+            Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+        );
+    }
+    if commander.focused && app.commander_accepts_input() {
+        draw_commander_slash_preview(f, rect, app.last_pane_area.y, commander, cat, t);
+        draw_commander_module_preview(f, rect, app.last_pane_area.y, commander, cat, t);
+    }
+    Some((
+        inner.x + (2 + cursor_column).min(inner.width.saturating_sub(1) as usize) as u16,
+        inner.y + cursor_row as u16,
+    ))
+}
+
+fn draw_commander_slash_preview(
+    f: &mut RenderTarget,
+    strip: Rect,
+    pane_top: u16,
+    commander: &crate::commander::Commander,
+    cat: &crate::i18n::Catalog,
+    t: &Theme,
+) {
+    let Some((matches, selected)) = commander.slash_menu() else {
+        return;
+    };
+    let Some((popup, visible)) =
+        crate::commander::slash_popup_layout(strip, pane_top, matches.len())
+    else {
+        return;
+    };
+    f.render_widget(
+        Block::bordered()
+            .border_type(BorderType::Plain)
+            .title(Span::styled(
+                format!(" {} ", cat.commander_slash_title),
+                Style::new().fg(t.accent).bold(),
+            ))
+            .border_style(Style::new().fg(t.border_focus))
+            .style(Style::new().bg(t.mantle).fg(t.text)),
+        popup,
+    );
+    let first = crate::commander::slash_window_start(selected, matches.len(), visible);
+    for (row, spec) in matches.iter().skip(first).take(visible).enumerate() {
+        let active = first + row == selected;
+        let index = crate::commander::SLASH_ACTIONS
+            .iter()
+            .position(|action| action.name == spec.name)
+            .unwrap_or(0);
+        let line = format!(
+            "{} {:<13} {}",
+            if active { "›" } else { " " },
+            spec.name,
+            cat.commander_slash_summaries[index]
+        );
+        f.render_widget(
+            Paragraph::new(truncate(&line, popup.width.saturating_sub(4) as usize)).style(
+                Style::new()
+                    .bg(if active { t.surface0 } else { t.mantle })
+                    .fg(if active { t.accent } else { t.text }),
+            ),
+            Rect::new(popup.x + 1, popup.y + 1 + row as u16, popup.width - 2, 1),
+        );
+    }
+    if first > 0 {
+        f.render_widget(
+            Paragraph::new("↑").style(Style::new().bg(t.mantle).fg(t.accent)),
+            Rect::new(popup.right() - 2, popup.y + 1, 1, 1),
+        );
+    }
+    if first + visible < matches.len() {
+        f.render_widget(
+            Paragraph::new("↓").style(Style::new().bg(t.mantle).fg(t.accent)),
+            Rect::new(popup.right() - 2, popup.y + visible as u16, 1, 1),
+        );
+    }
+    if matches.is_empty() {
+        f.render_widget(
+            Paragraph::new(cat.commander_slash_no_match)
+                .style(Style::new().bg(t.mantle).fg(t.overlay1)),
+            Rect::new(popup.x + 1, popup.y + 1, popup.width - 2, 1),
+        );
+    }
+    if let Some(spec) = matches.get(selected) {
+        let usage = if spec.usage.is_empty() {
+            spec.name.to_string()
+        } else {
+            format!("{} {}", spec.name, spec.usage)
+        };
+        let position = format!("{}/{}", selected + 1, matches.len());
+        let position_width = position.len() as u16;
+        let usage_width = popup.width.saturating_sub(position_width + 4);
+        f.render_widget(
+            Paragraph::new(truncate(&usage, usage_width as usize))
+                .style(Style::new().bg(t.mantle).fg(t.overlay1)),
+            Rect::new(popup.x + 1, popup.bottom() - 2, usage_width, 1),
+        );
+        f.render_widget(
+            Paragraph::new(position).style(Style::new().bg(t.mantle).fg(t.overlay1)),
+            Rect::new(
+                popup.right() - position_width - 1,
+                popup.bottom() - 2,
+                position_width,
+                1,
+            ),
+        );
+    }
+}
+
+fn draw_commander_module_preview(
+    f: &mut RenderTarget,
+    strip: Rect,
+    pane_top: u16,
+    commander: &crate::commander::Commander,
+    cat: &crate::i18n::Catalog,
+    t: &Theme,
+) {
+    let Some((matches, selected)) = commander.module_menu() else {
+        return;
+    };
+    let Some((popup, visible)) =
+        crate::commander::slash_popup_layout(strip, pane_top, matches.len())
+    else {
+        return;
+    };
+    f.render_widget(
+        Block::bordered()
+            .border_type(BorderType::Plain)
+            .title(Span::styled(
+                format!(" {} ", cat.commander_slash_title),
+                Style::new().fg(t.accent).bold(),
+            ))
+            .border_style(Style::new().fg(t.border_focus))
+            .style(Style::new().bg(t.mantle).fg(t.text)),
+        popup,
+    );
+    let first = crate::commander::slash_window_start(selected, matches.len(), visible);
+    for (row, entry) in matches.iter().skip(first).take(visible).enumerate() {
+        let active = first + row == selected;
+        let line = format!(
+            "{} {} · {} · {}",
+            if active { "›" } else { " " },
+            entry.command,
+            entry.spec.title,
+            entry.spec.module_name
+        );
+        f.render_widget(
+            Paragraph::new(truncate(&line, popup.width.saturating_sub(4) as usize)).style(
+                Style::new()
+                    .bg(if active { t.surface0 } else { t.mantle })
+                    .fg(if active { t.accent } else { t.text }),
+            ),
+            Rect::new(popup.x + 1, popup.y + 1 + row as u16, popup.width - 2, 1),
+        );
+    }
+    if first > 0 {
+        f.render_widget(
+            Paragraph::new("↑").style(Style::new().bg(t.mantle).fg(t.accent)),
+            Rect::new(popup.right() - 2, popup.y + 1, 1, 1),
+        );
+    }
+    if first + visible < matches.len() {
+        f.render_widget(
+            Paragraph::new("↓").style(Style::new().bg(t.mantle).fg(t.accent)),
+            Rect::new(popup.right() - 2, popup.y + visible as u16, 1, 1),
+        );
+    }
+    if matches.is_empty() {
+        f.render_widget(
+            Paragraph::new(cat.commander_slash_no_match)
+                .style(Style::new().bg(t.mantle).fg(t.overlay1)),
+            Rect::new(popup.x + 1, popup.y + 1, popup.width - 2, 1),
+        );
+    }
+    if let Some(entry) = matches.get(selected) {
+        let target = match entry.spec.target {
+            crate::module::manifest::CommanderTarget::None => "",
+            crate::module::manifest::CommanderTarget::Pane => " @pane",
+            crate::module::manifest::CommanderTarget::Agent => " @agent-pane",
+            crate::module::manifest::CommanderTarget::Tab => " @tab:name",
+            crate::module::manifest::CommanderTarget::Workspace => " @workspace:name",
+        };
+        let input = match entry.spec.input {
+            crate::module::manifest::CommanderInput::None => "",
+            crate::module::manifest::CommanderInput::Text => " [text]",
+        };
+        let usage = format!("{}{}{}", entry.command, target, input);
+        let position = format!("{}/{}", selected + 1, matches.len());
+        let position_width = position.len() as u16;
+        let usage_width = popup.width.saturating_sub(position_width + 4);
+        f.render_widget(
+            Paragraph::new(truncate(&usage, usage_width as usize))
+                .style(Style::new().bg(t.mantle).fg(t.overlay1)),
+            Rect::new(popup.x + 1, popup.bottom() - 2, usage_width, 1),
+        );
+        f.render_widget(
+            Paragraph::new(position).style(Style::new().bg(t.mantle).fg(t.overlay1)),
+            Rect::new(
+                popup.right() - position_width - 1,
+                popup.bottom() - 2,
+                position_width,
+                1,
+            ),
+        );
+    }
+}
+
+/// Keep delivery/editing tied to the real staged path, but render each live
+/// clipboard image as a short token. Cursor and selection offsets follow the
+/// visible text so a long private path cannot displace the caret or wrap rows.
+fn commander_display_draft<'a>(
+    draft: &'a str,
+    cursor: usize,
+    selection: Option<std::ops::Range<usize>>,
+    staged_images: &[PathBuf],
+) -> (Cow<'a, str>, usize, Option<std::ops::Range<usize>>) {
+    let mut images = staged_images
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| {
+            let path = path.to_string_lossy();
+            draft
+                .find(path.as_ref())
+                .map(|start| (start..start + path.len(), index + 1))
+        })
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return (Cow::Borrowed(draft), cursor, selection);
+    }
+    images.sort_by_key(|(range, _)| range.start);
+    let mut visible = String::with_capacity(draft.len());
+    let mut mappings = Vec::with_capacity(images.len());
+    let mut consumed = 0;
+    for (range, number) in images {
+        if range.start < consumed {
+            continue;
+        }
+        visible.push_str(&draft[consumed..range.start]);
+        let shown_start = visible.len();
+        visible.push_str(&format!("[Image #{number}]"));
+        mappings.push((range.clone(), shown_start..visible.len()));
+        consumed = range.end;
+    }
+    visible.push_str(&draft[consumed..]);
+
+    let map_offset = |offset: usize, end_bias: bool| {
+        let (mut raw_end, mut shown_end) = (0, 0);
+        for (raw, shown) in &mappings {
+            if offset < raw.start {
+                break;
+            }
+            if offset <= raw.end {
+                return if offset == raw.start {
+                    shown.start
+                } else if offset == raw.end || end_bias {
+                    shown.end
+                } else {
+                    shown.start
+                };
+            }
+            raw_end = raw.end;
+            shown_end = shown.end;
+        }
+        shown_end + offset - raw_end
+    };
+    let visible_cursor = map_offset(cursor, false);
+    let visible_selection =
+        selection.map(|range| map_offset(range.start, false)..map_offset(range.end, true));
+    (Cow::Owned(visible), visible_cursor, visible_selection)
+}
+
+/// Wrap the bounded draft into terminal cells while retaining byte-based
+/// selection and the caret's true position across pasted/newline input.
+fn commander_editor_lines(
+    draft: &str,
+    cursor: usize,
+    selection: Option<std::ops::Range<usize>>,
+    width: usize,
+    visible_rows: usize,
+    t: &Theme,
+) -> (Vec<Line<'static>>, usize, usize) {
+    use std::collections::VecDeque;
+    use unicode_width::UnicodeWidthChar;
+
+    let width = width.max(1);
+    let visible_rows = visible_rows.max(1);
+    let mut rows: VecDeque<(usize, Vec<(String, bool)>)> = VecDeque::new();
+    rows.push_back((0, Vec::new()));
+    let (mut row, mut column) = (0, 0);
+    let mut caret = (0, 0);
+    let mut caret_seen = false;
+    for (index, character) in draft.char_indices() {
+        let shown = if character == '\t' { '⇥' } else { character };
+        let character_width = UnicodeWidthChar::width(shown).unwrap_or(0);
+        if character != '\n' && column + character_width > width {
+            if caret_seen && rows.len() >= visible_rows {
+                break;
+            }
+            row += 1;
+            column = 0;
+            rows.push_back((row, Vec::new()));
+            if rows.len() > visible_rows {
+                rows.pop_front();
+            }
+        }
+        if index == cursor {
+            caret = (row, column);
+            caret_seen = true;
+        }
+        if character == '\n' {
+            if caret_seen && rows.len() >= visible_rows {
+                break;
+            }
+            row += 1;
+            column = 0;
+            rows.push_back((row, Vec::new()));
+            if rows.len() > visible_rows {
+                rows.pop_front();
+            }
+            continue;
+        }
+        let selected = selection
+            .as_ref()
+            .is_some_and(|range| range.contains(&index));
+        let line = &mut rows.back_mut().unwrap().1;
+        if let Some((text, state)) = line.last_mut() {
+            if *state == selected {
+                text.push(shown);
+            } else {
+                line.push((shown.to_string(), selected));
+            }
+        } else {
+            line.push((shown.to_string(), selected));
+        }
+        column += character_width;
+    }
+    if cursor == draft.len() {
+        if column >= width {
+            row += 1;
+            column = 0;
+            rows.push_back((row, Vec::new()));
+            if rows.len() > visible_rows {
+                rows.pop_front();
+            }
+        }
+        caret = (row, column);
+    }
+    let first_visible = rows.front().unwrap().0;
+    let lines = rows
+        .into_iter()
+        .map(|(index, chunks)| {
+            let mut spans = vec![Span::raw(if index == 0 { "› " } else { "  " })];
+            spans.extend(chunks.into_iter().map(|(text, selected)| {
+                if selected {
+                    Span::styled(text, Style::new().fg(t.text).bg(t.sel_bg))
+                } else {
+                    Span::raw(text)
+                }
+            }));
+            Line::from(spans)
+        })
+        .collect();
+    (lines, caret.0 - first_visible, caret.1)
 }
 
 // ── shared layout + state helpers (used across the ui submodules) ──
@@ -1174,6 +1944,31 @@ pub(crate) fn format_utc(seconds: u64) -> String {
         .unwrap_or_else(|| seconds.to_string())
 }
 
+pub(crate) fn local_search_footer<M>(search: &crate::search::local::LocalSearch<M>) -> String {
+    let case = if search.case_sensitive { " · Aa" } else { "" };
+    let position = if search.editing {
+        String::new()
+    } else if search.matches.is_empty() {
+        " · 0/0".to_string()
+    } else {
+        format!(
+            " · {}/{}{}",
+            search.current + 1,
+            search.matches.len(),
+            if search.truncated { "+" } else { "" }
+        )
+    };
+    let navigation = if !search.editing && !search.matches.is_empty() {
+        " · n/N match"
+    } else {
+        ""
+    };
+    format!(
+        " SEARCH  /{}{}{}{} · Ctrl-U clear · Ctrl-I case · Esc cancel",
+        search.query, position, case, navigation
+    )
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -1182,18 +1977,25 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
         return s.to_string();
     }
     // Reserve one column for the ellipsis.
-    let budget = max - 1;
+    let mut out = clip_columns(s, max - 1);
+    out.push('…');
+    out
+}
+
+/// The longest prefix of `s` that fits in `max` display columns, with no
+/// ellipsis. Width-aware like [`truncate`]; a wide glyph that would straddle the
+/// edge is dropped rather than split.
+pub(crate) fn clip_columns(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for ch in s.chars() {
         let cw = display_width(&ch.to_string());
-        if used + cw > budget {
+        if used + cw > max {
             break;
         }
         out.push(ch);
         used += cw;
     }
-    out.push('…');
     out
 }
 
@@ -1235,10 +2037,10 @@ pub(super) fn lone_pad(width: u16) -> u16 {
     }
 }
 
-/// The terminal content area: inside the box when bordered (the dot+path+close
-/// live on the top border row as a title), else just below the header row with a
-/// small horizontal pad so it aligns with the tab bar.
-fn pane_content(rect: Rect, bordered: bool, mobile: bool) -> Option<Rect> {
+/// The terminal content area: inside the box when bordered (the title lives on
+/// the top border row), otherwise optionally below the lone-pane header. The
+/// horizontal pad keeps desktop content aligned with the tab bar.
+fn pane_content(rect: Rect, bordered: bool, mobile: bool, lone_header: bool) -> Option<Rect> {
     if bordered {
         return pane_inner(rect, true);
     }
@@ -1246,11 +2048,12 @@ fn pane_content(rect: Rect, bordered: bool, mobile: bool) -> Option<Rect> {
         return (rect.width > 0 && rect.height > 0).then_some(rect);
     }
     let pad = lone_pad(rect.width);
+    let header_height = u16::from(lone_header);
     let c = Rect::new(
         rect.x + pad,
-        rect.y + 1,
+        rect.y + header_height,
         rect.width.saturating_sub(2 * pad),
-        rect.height.saturating_sub(1),
+        rect.height.saturating_sub(header_height),
     );
     if c.width < 1 || c.height < 1 {
         return None;
@@ -1292,7 +2095,7 @@ fn pane_state(app: &App, id: PaneId) -> State {
 }
 
 /// Collapse `$HOME` to `~` and truncate from the left to fit `max` columns.
-fn short_path(p: &Path, max: u16) -> String {
+pub(crate) fn short_path(p: &Path, max: u16) -> String {
     let mut s = p.display().to_string();
     if let Some(home) = crate::platform::home_dir() {
         if let Some(rest) = s.strip_prefix(home.to_string_lossy().as_ref()) {
@@ -1300,18 +2103,65 @@ fn short_path(p: &Path, max: u16) -> String {
         }
     }
     let max = max as usize;
-    if s.chars().count() > max && max > 1 {
-        let tail: String = s
-            .chars()
-            .rev()
-            .take(max - 1)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        format!("…{tail}")
-    } else {
-        s
+    if display_width(&s) <= max {
+        return s;
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut used = 0;
+    let mut tail_start = s.len();
+    for grapheme in s.graphemes(true).rev() {
+        let width = display_width(grapheme);
+        if used + width > max - 1 {
+            break;
+        }
+        used += width;
+        tail_start -= grapheme.len();
+    }
+
+    while tail_start < s.len() {
+        let grapheme = s[tail_start..]
+            .graphemes(true)
+            .next()
+            .expect("tail starts at a grapheme boundary");
+        if display_width(grapheme) > 0 {
+            break;
+        }
+        tail_start += grapheme.len();
+    }
+    format!("…{}", &s[tail_start..])
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn short_path_keeps_a_wide_paths_tail_within_its_column_budget() {
+        let shortened = short_path(Path::new("界界/important-project"), 20);
+        assert!(display_width(&shortened) <= 20);
+        assert!(shortened.ends_with("important-project"));
+    }
+
+    #[test]
+    fn short_path_keeps_joined_emoji_intact() {
+        let family = "👨‍👩‍👧";
+        let shortened = short_path(Path::new(&format!("/tmp/very-long-workspace/{family}")), 6);
+        assert!(display_width(&shortened) <= 6);
+        assert!(shortened.ends_with(family));
+    }
+
+    #[test]
+    fn short_path_honors_zero_and_one_column_budgets() {
+        let path = Path::new("long/path");
+        assert_eq!(short_path(path, 0), "");
+        assert_eq!(short_path(path, 1), "…");
     }
 }
 
@@ -1323,6 +2173,41 @@ mod retained_render_tests {
 
     use crate::terminal::appearance::PaneAppearance;
     use crate::terminal::vt::{create_engine, VtEngineKind};
+
+    #[test]
+    fn successful_terminal_resize_invalidates_committed_search_coordinates() {
+        let _env = crate::persist::test_env("pane-search-resize-invalidation");
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(100, 30, app_tx).expect("app starts");
+        let focus = app.layout().focus;
+        app.pane_search = Some(crate::app::PaneSearch {
+            pane: focus,
+            owner: crate::app::PaneSearchOwner::Scroll,
+            local: crate::search::local::LocalSearch {
+                query: "needle".into(),
+                editing: false,
+                case_sensitive: false,
+                matches: vec![crate::app::PaneSearchMatch {
+                    row: 0,
+                    col: 12,
+                    width: 6,
+                }],
+                current: 0,
+                truncated: false,
+            },
+            saved_scroll: 0,
+        });
+        let area = Rect::new(0, 0, 54, 16);
+        let mut buffer = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut buffer, area);
+
+        render_into(&mut target, &mut app);
+
+        let search = &app.pane_search.as_ref().expect("search retained").local;
+        assert!(search.editing, "resize makes old row coordinates unsafe");
+        assert_eq!(search.query, "needle");
+        assert!(search.matches.is_empty());
+    }
 
     #[test]
     fn damaged_rows_match_a_forced_full_projection() {
@@ -1355,16 +2240,25 @@ mod retained_render_tests {
             let initial = engine.damage_snapshot();
             assert!(engine.acknowledge_damage(initial.generation));
             engine.recycle_damage_snapshot(initial);
-            engine.advance(b"\rA\x1b[K");
+            engine.advance(
+                b"\r\x1b[2K\x1b]8;id=agent;file:///repo/server/task.mjs\x1b\\server/task.mjs\x1b]8;;\x1b\\",
+            );
         }
         let snapshot = engine.lock().expect("engine lock").damage_snapshot();
         assert_eq!(snapshot.kind, crate::terminal::vt::DamageKind::Partial);
         let snapshots = HashMap::from([(focus, snapshot)]);
+        let mut hyperlinks = app.rendered_hyperlinks.clone();
 
         let partial_cursor = {
             let mut target = RenderTarget::new(&mut retained, area);
-            patch_terminal_damage(&mut target, &app, &content_rects, &snapshots)
-                .expect("partial projection eligible");
+            patch_terminal_damage(
+                &mut target,
+                &app,
+                &content_rects,
+                &snapshots,
+                &mut hyperlinks,
+            )
+            .expect("partial projection eligible");
             (target.cursor(), target.cursor_visible())
         };
 
@@ -1375,6 +2269,7 @@ mod retained_render_tests {
             (target.cursor(), target.cursor_visible())
         };
         assert_eq!(retained, forced);
+        assert_eq!(hyperlinks, app.rendered_hyperlinks);
         assert_eq!(partial_cursor, full_cursor);
         let snapshot = snapshots.into_values().next().expect("damage snapshot");
         engine
@@ -1418,6 +2313,7 @@ mod retained_render_tests {
             .recycle_damage_snapshot(initial);
 
         const ITERATIONS: usize = 2_000;
+        let mut hyperlinks = app.rendered_hyperlinks.clone();
         let partial_started = std::time::Instant::now();
         for index in 0..ITERATIONS {
             engine
@@ -1428,7 +2324,14 @@ mod retained_render_tests {
             let generation = snapshot.generation;
             let snapshots = HashMap::from([(focus, snapshot)]);
             let mut target = RenderTarget::new(&mut retained, area);
-            patch_terminal_damage(&mut target, &app, &content_rects, &snapshots).unwrap();
+            patch_terminal_damage(
+                &mut target,
+                &app,
+                &content_rects,
+                &snapshots,
+                &mut hyperlinks,
+            )
+            .unwrap();
             assert!(engine
                 .lock()
                 .expect("engine lock")
@@ -1584,5 +2487,674 @@ mod dock_projection_tests {
             app.begin_dock_resize(col, dy),
             "the recorded divider row is still a hit target after projection"
         );
+    }
+
+    #[test]
+    fn early_projection_returns_do_not_export_stale_geometry() {
+        let _env = crate::persist::test_env("early-projection-geometry");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.open_settings();
+
+        let stale = Rect::new(5, 4, 12, 3);
+        let assert_empty_projection = |projection: ClientProjection| {
+            assert!(projection.pane_content.is_empty());
+            assert_eq!(projection.shell_dock, None);
+            assert_eq!(projection.left_seam, None);
+            assert_eq!(projection.right_seam, None);
+            assert_eq!(projection.main_area, Rect::ZERO);
+            assert_eq!(projection.pane_area, Rect::ZERO);
+            assert_eq!(projection.shell_overlay, None);
+            assert_eq!(projection.session_slot, None);
+            assert_eq!(projection.session_button, None);
+        };
+        let seed_stale_geometry = |app: &mut App| {
+            app.client_shell_dock_rect = Some(stale);
+            app.left_seam = Some(stale);
+            app.right_seam = Some(stale);
+            app.last_main_area = stale;
+            app.last_pane_area = stale;
+            app.named_session_slot_rect = Some(stale);
+            app.named_session_button_rect = Some(stale);
+            app.settings_modal_rect = Some(stale);
+        };
+
+        seed_stale_geometry(&mut app);
+        let small = Rect::new(0, 0, 20, 5);
+        let mut small_buffer = Buffer::empty(small);
+        assert_empty_projection(render_projection(
+            &mut RenderTarget::new(&mut small_buffer, small),
+            &mut app,
+        ));
+        assert_eq!(app.left_seam, Some(stale));
+
+        app.workspaces.clear();
+        seed_stale_geometry(&mut app);
+        let normal = Rect::new(0, 0, 80, 24);
+        let mut normal_buffer = Buffer::empty(normal);
+        assert_empty_projection(render_projection(
+            &mut RenderTarget::new(&mut normal_buffer, normal),
+            &mut app,
+        ));
+        assert_eq!(app.named_session_button_rect, Some(stale));
+    }
+
+    #[test]
+    fn machine_capability_without_profiles_preserves_native_workspace_rendering() {
+        let _env = crate::persist::test_env("machine-native-workspaces");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut before = Buffer::empty(area);
+        render_projection(&mut RenderTarget::new(&mut before, area), &mut app);
+        app.client_machine_capable = true;
+        app.client_shell_owns_workspaces = false;
+        let mut after = Buffer::empty(area);
+        let projection = render_projection(&mut RenderTarget::new(&mut after, area), &mut app);
+        assert_eq!(
+            before, after,
+            "machine capability must not redesign the ordinary workspace dock"
+        );
+        assert!(projection.shell_dock.is_some());
+    }
+
+    #[test]
+    fn passive_projection_reports_session_button_without_moving_active_hit_target() {
+        let _env = crate::persist::test_env("machine-session-button-projection");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(140, 40, tx).unwrap();
+        app.server_mode = true;
+        app.client_machine_capable = true;
+        app.client_shell_owns_workspaces = true;
+
+        let desktop = Rect::new(0, 0, 140, 40);
+        let mut desktop_buffer = Buffer::empty(desktop);
+        render_into(
+            &mut RenderTarget::new(&mut desktop_buffer, desktop),
+            &mut app,
+        );
+        let active = app
+            .named_session_button_rect
+            .expect("active server publishes its named-session control");
+        let active_slot = app
+            .named_session_slot_rect
+            .expect("active server publishes the complete session slot");
+
+        let secondary = Rect::new(0, 0, 100, 30);
+        let mut secondary_buffer = Buffer::empty(secondary);
+        let projection = render_projection(
+            &mut RenderTarget::new(&mut secondary_buffer, secondary),
+            &mut app,
+        );
+
+        assert!(
+            projection.session_button.is_some(),
+            "machine shell receives the owner-local named-session control"
+        );
+        assert!(
+            projection.session_slot.is_some(),
+            "machine shell receives the complete owner-local session slot"
+        );
+        assert_eq!(
+            app.named_session_button_rect,
+            Some(active),
+            "a passive machine projection cannot replace active-client input geometry"
+        );
+        assert_eq!(
+            app.named_session_slot_rect,
+            Some(active_slot),
+            "a passive machine projection cannot replace the active session slot"
+        );
+    }
+
+    #[test]
+    fn endpoint_projection_leaves_session_chrome_blank_and_inert() {
+        let _env = crate::persist::test_env("machine-session-chrome-owner");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.server_mode = true;
+        app.client_machine_capable = true;
+        app.client_shell_owns_workspaces = true;
+        app.client_shell_owns_session_chrome = true;
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buffer = Buffer::empty(area);
+        let projection = render_projection(&mut RenderTarget::new(&mut buffer, area), &mut app);
+
+        let slot = projection
+            .session_slot
+            .expect("remote endpoint reserves the local session slot");
+        assert_eq!(projection.session_button, None);
+        assert!(
+            (slot.x..slot.right()).all(|x| buffer[(x, slot.y)].symbol() == " "),
+            "remote endpoint pixels must not leak a backing-session label into the slot"
+        );
+    }
+
+    #[test]
+    fn machine_rows_follow_the_workspace_dock_without_mutating_active_geometry() {
+        let _env = crate::persist::test_env("machine-slot-projection");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.sidebars.left.visible = false;
+        app.sidebars.right.visible = true;
+        app.sidebars.right.docks = vec![DockKind::Workspaces];
+        app.client_machine_capable = true;
+        app.client_shell_owns_workspaces = true;
+        let pane = app.layout().focus;
+        let pty_size = app.panes[&pane].size();
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buffer = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut buffer, area);
+        let projection = render_projection(&mut target, &mut app);
+        let slot = projection
+            .shell_dock
+            .expect("machine-aware client owns the right Workspaces dock");
+        let expected_height = area.height - 1 - SIDEBAR_CHROME_ROWS;
+        assert_eq!(slot.y, area.y + SIDEBAR_CHROME_ROWS);
+        assert_eq!(slot.height, expected_height);
+        assert!(slot.x > area.width / 2);
+        assert_eq!(app.panes[&pane].size(), pty_size);
+        assert!(app.client_shell_dock_rect.is_none());
+
+        app.config.layout.workspace_paths = false;
+        let mut compact = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut compact, area);
+        let projection = render_projection(&mut target, &mut app);
+        assert_eq!(
+            projection
+                .shell_dock
+                .expect("hidden paths retain the client-owned Workspaces dock")
+                .height,
+            expected_height
+        );
+
+        let mut remote = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut remote, area);
+        let projection = render_projection(&mut target, &mut app);
+        let dock = projection
+            .shell_dock
+            .expect("projection keeps the complete client-owned dock");
+        assert_eq!(dock.height, expected_height);
+        assert_eq!(remote[(dock.x + 2, dock.y)].symbol(), " ");
+        assert_eq!(app.panes[&pane].size(), pty_size);
+    }
+
+    #[test]
+    fn machine_projection_reports_modal_bounds_semantically() {
+        let _env = crate::persist::test_env("machine-overlay-projection");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.client_machine_capable = true;
+        app.client_shell_owns_workspaces = true;
+        app.open_settings();
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buffer = Buffer::empty(area);
+        let projection = render_projection(&mut RenderTarget::new(&mut buffer, area), &mut app);
+        let overlay = projection
+            .shell_overlay
+            .expect("open settings publishes an overlay rectangle");
+        assert!(overlay.width > 0 && overlay.height > 0);
+        assert!(area.contains(overlay.as_position()));
+        assert!(overlay.right() <= area.right());
+        assert!(overlay.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn machine_picker_projects_only_its_native_modal_rectangle() {
+        let _env = crate::persist::test_env("machine-picker-overlay-projection");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.client_machine_capable = true;
+        app.client_shell_owns_workspaces = true;
+        app.open_folder_picker();
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buffer = Buffer::empty(area);
+        let projection = render_projection(&mut RenderTarget::new(&mut buffer, area), &mut app);
+        assert_eq!(
+            projection.shell_overlay,
+            Some(workspace_picker_modal_rect(area, false)),
+            "the owner-local dock remains visible outside the picker"
+        );
+        assert_ne!(projection.shell_overlay, Some(area));
+    }
+}
+
+#[cfg(test)]
+mod pane_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn preview_highlights_candidate_without_moving_focus_or_cursor() {
+        let _env = crate::persist::test_env("pane-navigation-render");
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.sidebars.left.visible = false;
+        app.sidebars.right.visible = false;
+        let left = app.layout().focus;
+        app.run_cmd(crate::app::Cmd::SplitRight);
+        let right = app.layout().focus;
+        app.focus_location(0, 0, left);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut initial = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut initial, area), &mut app);
+
+        app.handle_event(crate::event::AppEvent::Key(app.prefix.key_event()));
+        app.handle_event(crate::event::AppEvent::Key(
+            ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Right,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+        let mut preview = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut preview, area), &mut app);
+        let rect = |id| {
+            app.pane_rects
+                .iter()
+                .find(|(pane, _)| *pane == id)
+                .unwrap()
+                .1
+        };
+        let left_rect = rect(left);
+        let right_rect = rect(right);
+        assert_ne!(
+            preview[(left_rect.x, left_rect.y)].fg,
+            preview[(right_rect.x, right_rect.y)].fg,
+            "the candidate border is distinct from the still-active pane"
+        );
+        assert_eq!(app.layout().focus, left);
+        assert_eq!(app.last_cursor, None);
+    }
+
+    #[test]
+    fn commander_preview_highlights_strip_without_focusing_input() {
+        let _env = crate::persist::test_env("commander-navigation-render");
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.sidebars.left.visible = false;
+        app.sidebars.right.visible = false;
+        app.open_commander();
+        app.commander.as_mut().unwrap().focused = false;
+        let area = Rect::new(0, 0, 100, 30);
+        let mut initial = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut initial, area), &mut app);
+        let strip = app.commander_area.unwrap();
+
+        app.handle_event(crate::event::AppEvent::Key(app.prefix.key_event()));
+        app.handle_event(crate::event::AppEvent::Key(
+            ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Down,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+        let mut preview = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut preview, area), &mut app);
+        assert_eq!(
+            app.pane_navigation.unwrap().candidate,
+            PaneNavigationTarget::Commander
+        );
+        assert_ne!(
+            initial[(strip.x, strip.y + 1)].fg,
+            preview[(strip.x, strip.y + 1)].fg,
+            "the strip border highlights before Commander receives focus"
+        );
+        assert!(!app.commander.as_ref().unwrap().focused);
+        assert_eq!(app.last_cursor, None);
+    }
+}
+
+#[cfg(test)]
+mod commander_tests {
+    use super::*;
+
+    #[test]
+    fn commander_editor_keeps_suffix_visible_after_mid_draft_caret() {
+        let theme = Theme::quattro_rally();
+        for (draft, cursor, width, expected) in [
+            ("abcdef", 2, 4, ["› abcd", "  ef"]),
+            ("ab\ncd", 1, 4, ["› ab", "  cd"]),
+        ] {
+            let (lines, caret_row, caret_column) =
+                commander_editor_lines(draft, cursor, None, width, 2, &theme);
+            let visible = lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(visible, expected, "draft: {draft:?}");
+            assert_eq!((caret_row, caret_column), (0, cursor));
+        }
+    }
+
+    #[test]
+    fn composer_gets_own_bottom_strip_and_is_private_to_active_view() {
+        let _env = crate::persist::test_env("commander-projection");
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let pane = app.layout().focus;
+        let area = Rect::new(0, 0, 100, 30);
+        let mut initial = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut initial, area), &mut app);
+        let size = app.panes[&pane].size();
+        let content = app.pane_content_rects.clone();
+
+        app.open_commander();
+        let commander = app.commander.as_mut().unwrap();
+        commander.draft = "private prompt".into();
+        commander.cursor = commander.draft.len();
+        let mut active = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut active, area), &mut app);
+        let row = app.last_pane_area.bottom() + 1;
+        let active_line: String = (0..area.width).map(|x| active[(x, row)].symbol()).collect();
+        assert!(active_line.contains("private prompt"));
+        assert!(app.panes[&pane].size().1 < size.1);
+        assert!(app.pane_content_rects[0].1.bottom() <= app.last_pane_area.bottom());
+        assert_ne!(app.pane_content_rects, content);
+        let strip = app.commander_area.expect("interactive strip hitbox");
+        assert_eq!(strip.height, 5);
+        assert!(app.last_cursor.is_some_and(|(_, y)| y >= strip.y));
+
+        app.commander.as_mut().unwrap().focused = false;
+        let mut unfocused = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut unfocused, area), &mut app);
+        assert!(app.last_cursor.is_none_or(|(_, y)| y < strip.y));
+
+        let mut passive = Buffer::empty(area);
+        render_projection(&mut RenderTarget::new(&mut passive, area), &mut app);
+        let passive_line: String = (0..area.width)
+            .map(|x| passive[(x, row)].symbol())
+            .collect();
+        assert!(!passive_line.contains("private prompt"));
+        assert!(app.commander.is_some());
+
+        app.commander.as_mut().unwrap().focused = true;
+        app.help_open = true;
+        let mut help = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut help, area), &mut app);
+        let help_line: String = (0..area.width).map(|x| help[(x, row)].symbol()).collect();
+        assert!(!help_line.contains("private prompt"));
+        assert!(app.last_cursor.is_none());
+    }
+
+    #[test]
+    fn commander_shared_seam_drag_resizes_without_covering_the_terminal() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let _env = crate::persist::test_env("commander-drag-height");
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.open_commander();
+        let area = Rect::new(0, 0, 100, 30);
+        let mut initial = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut initial, area), &mut app);
+        let strip = app.commander_area.unwrap();
+        let pane_height = app.last_pane_area.height;
+        let mouse = |kind, row| {
+            crate::event::AppEvent::Mouse(MouseEvent {
+                kind,
+                column: strip.x + 2,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), strip.y - 1));
+        assert!(app.commander_resize);
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), strip.y - 3));
+        let mut grown = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut grown, area), &mut app);
+        assert_eq!(app.commander_area.unwrap().height, strip.height + 3);
+        assert_eq!(app.last_pane_area.height, pane_height - 3);
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 0));
+        let mut clamped = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut clamped, area), &mut app);
+        assert!(app.last_pane_area.height >= crate::layout::MIN_PANE);
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 0));
+        assert!(!app.commander_resize);
+
+        let grown_strip = app.commander_area.unwrap();
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            grown_strip.y,
+        ));
+        assert!(app.commander_resize, "Commander border is also draggable");
+        app.handle_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            grown_strip.bottom() - 1,
+        ));
+        let mut shrunk = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut shrunk, area), &mut app);
+        assert_eq!(
+            app.commander_area.unwrap().height,
+            crate::app::COMMANDER_DEFAULT_HEIGHT,
+            "dragging cannot shrink the composer below its default height"
+        );
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 0));
+
+        let bottom = app.commander_area.unwrap().bottom();
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), bottom - 1));
+        assert!(
+            !app.commander_resize,
+            "only the shared seam starts a resize"
+        );
+        let resized_height = app.commander_area.unwrap().height;
+        app.open_commander();
+        app.open_commander();
+        let mut reopened = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut reopened, area), &mut app);
+        assert_eq!(app.commander_area.unwrap().height, resized_height);
+    }
+
+    #[test]
+    fn commander_multiline_caret_and_text_share_the_visible_editor_rows() {
+        let _env = crate::persist::test_env("commander-multiline-render");
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(50, 20, tx).unwrap();
+        app.open_commander();
+        let commander = app.commander.as_mut().unwrap();
+        commander.draft = "@p1 first line\nsecond line".into();
+        commander.cursor = commander.draft.len();
+        let area = Rect::new(0, 0, 50, 20);
+        let mut buffer = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut buffer, area), &mut app);
+        let strip = app.commander_area.unwrap();
+        let first: String = (0..area.width)
+            .map(|x| buffer[(x, strip.y + 1)].symbol())
+            .collect();
+        let second: String = (0..area.width)
+            .map(|x| buffer[(x, strip.y + 2)].symbol())
+            .collect();
+        assert!(first.contains("first line"));
+        assert!(second.contains("second line"));
+        assert_eq!(app.last_cursor.unwrap().1, strip.y + 2);
+
+        let commander = app.commander.as_mut().unwrap();
+        commander.draft = format!("@p1 {}", "x".repeat(120));
+        commander.cursor = commander.draft.len();
+        let mut wrapped = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut wrapped, area), &mut app);
+        let final_row: String = (0..area.width)
+            .map(|x| wrapped[(x, strip.y + 2)].symbol())
+            .collect();
+        assert!(final_row.contains("xxx"));
+        assert_eq!(app.last_cursor.unwrap().1, strip.y + 2);
+    }
+
+    #[test]
+    fn commander_slash_picker_previews_actions_and_filters_prefixes() {
+        let _env = crate::persist::test_env("commander-slash-picker-render");
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 32, tx).unwrap();
+        app.open_commander();
+        let area = Rect::new(0, 0, 100, 32);
+        let commander = app.commander.as_mut().unwrap();
+        commander.draft = "/".into();
+        commander.cursor = 1;
+        let mut buffer = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut buffer, area), &mut app);
+        let strip = app.commander_area.unwrap();
+        let (bounds, _) = crate::commander::slash_popup_layout(
+            strip,
+            app.last_pane_area.y,
+            crate::commander::SLASH_ACTIONS.len(),
+        )
+        .unwrap();
+        assert_eq!(bounds.x, strip.x);
+        assert_eq!(bounds.width, strip.width);
+        assert_eq!(buffer[(bounds.x, bounds.y)].symbol(), "┌");
+        assert_eq!(buffer[(bounds.right() - 1, bounds.y)].symbol(), "┐");
+        let popup: String = (app.last_pane_area.y..strip.y)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|position| buffer[position].symbol())
+            .collect();
+        for action in ["/focus", "/split", "/automation", "/files"] {
+            assert!(popup.contains(action), "missing {action} from slash picker");
+        }
+        assert!(popup.contains("Focus an exact location"));
+
+        let commander = app.commander.as_mut().unwrap();
+        commander.draft = "/au".into();
+        commander.cursor = 3;
+        let mut filtered = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut filtered, area), &mut app);
+        let popup: String = (app.last_pane_area.y..strip.y)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|position| filtered[position].symbol())
+            .collect();
+        assert!(popup.contains("/automation"));
+        assert!(!popup.contains("/focus"));
+
+        app.commander.as_mut().unwrap().focused = false;
+        let mut unfocused = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut unfocused, area), &mut app);
+        let popup: String = (app.last_pane_area.y..strip.y)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|position| unfocused[position].symbol())
+            .collect();
+        assert!(!popup.contains("/automation"));
+    }
+
+    #[test]
+    fn commander_slash_picker_scrolls_the_selected_row_into_a_short_viewport() {
+        let _env = crate::persist::test_env("commander-slash-picker-scroll-render");
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 20, tx).unwrap();
+        app.open_commander();
+        let theme = app.theme.clone();
+        let commander = app.commander.as_mut().unwrap();
+        commander.draft = "/".into();
+        commander.cursor = 1;
+        commander.slash_selection = Some(8);
+        let area = Rect::new(0, 0, 80, 20);
+        let strip = Rect::new(2, 15, 76, 4);
+        let (popup, visible) = crate::commander::slash_popup_layout(strip, 10, 9).unwrap();
+        assert_eq!(visible, 2);
+        let mut buffer = Buffer::empty(area);
+        draw_commander_slash_preview(
+            &mut RenderTarget::new(&mut buffer, area),
+            strip,
+            10,
+            commander,
+            &crate::i18n::EN,
+            &theme,
+        );
+        let shown: String = (popup.y..popup.bottom())
+            .flat_map(|y| (popup.x..popup.right()).map(move |x| (x, y)))
+            .map(|position| buffer[position].symbol())
+            .collect();
+        assert!(shown.contains("/files"));
+        assert!(shown.contains("/diff"));
+        assert!(!shown.contains("/focus"));
+        assert!(shown.contains("↑"));
+        assert!(shown.contains("9/9"));
+    }
+
+    #[test]
+    fn commander_clipboard_images_render_as_markers_without_changing_delivery_text() {
+        let _env = crate::persist::test_env("commander-image-marker");
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 24, tx).unwrap();
+        app.open_commander();
+        let png = crate::clipboard_image::encode_rgba_png(1, 1, |_, _| [1, 2, 3, 255])
+            .expect("valid png");
+        let first = crate::clipboard_image::stage_png(&png).expect("first image");
+        let second = crate::clipboard_image::stage_png(&png).expect("second image");
+        assert!(app.handle_event(crate::event::AppEvent::PasteImage(first.clone())));
+        assert!(app.commander_paste(" then "));
+        assert!(app.handle_event(crate::event::AppEvent::PasteImage(second.clone())));
+        let commander = app.commander.as_ref().unwrap();
+        assert!(commander
+            .draft
+            .contains(&first.to_string_lossy().to_string()));
+        assert!(commander
+            .draft
+            .contains(&second.to_string_lossy().to_string()));
+        let (shown, cursor, _) = commander_display_draft(
+            &commander.draft,
+            commander.cursor,
+            None,
+            &commander.staged_images,
+        );
+        assert!(shown.contains("[Image #1] then [Image #2]"));
+        assert!(!shown.contains("luvus-image-"));
+        assert_eq!(cursor, shown.len());
+
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buffer = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut buffer, area), &mut app);
+        let strip = app.commander_area.unwrap();
+        let editor: String = (strip.y + 1..strip.bottom() - 1)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|position| buffer[position].symbol())
+            .collect();
+        assert!(editor.contains("[Image #1] then [Image #2]"));
+        assert!(!editor.contains("luvus-image-"));
+        assert!(app
+            .last_cursor
+            .is_some_and(|(_, y)| y > strip.y && y < strip.bottom()));
+    }
+
+    #[test]
+    fn commander_image_marker_maps_selection_to_the_visible_token() {
+        let path = PathBuf::from("/private/clipboard-images/luvus-image-test.png");
+        let path_text = path.to_string_lossy();
+        let draft = format!("before {path_text} after");
+        let start = draft.find(path_text.as_ref()).unwrap();
+        let end = start + path_text.len();
+        let (shown, cursor, selection) =
+            commander_display_draft(&draft, end, Some(start + 1..end - 1), &[path]);
+        assert_eq!(shown, "before [Image #1] after");
+        assert_eq!(cursor, "before [Image #1]".len());
+        assert_eq!(selection.unwrap(), "before ".len()..cursor);
+    }
+
+    #[test]
+    fn commander_read_preview_uses_extra_rows_without_covering_the_editor_or_footer() {
+        let _env = crate::persist::test_env("commander-read-preview");
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.open_commander();
+        app.commander_height = 12;
+        let commander = app.commander.as_mut().unwrap();
+        commander.draft = "/read @p1".into();
+        commander.cursor = commander.draft.len();
+        commander.read_output = Some(vec!["first output".into(), "latest output".into()]);
+        commander.receipt = Some("p1 · 2 lines · PgUp/PgDn".into());
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        render_into(&mut RenderTarget::new(&mut buffer, area), &mut app);
+        let strip = app.commander_area.unwrap();
+        let row = |y| -> String { (0..area.width).map(|x| buffer[(x, y)].symbol()).collect() };
+        assert!(row(strip.y + 1).contains("/read @p1"));
+        assert!(row(strip.y + 2).contains("first output"));
+        assert!(row(strip.y + 3).contains("latest output"));
+        assert!(row(strip.bottom() - 2).contains("PgUp/PgDn"));
     }
 }

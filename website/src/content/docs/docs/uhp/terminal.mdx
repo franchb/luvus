@@ -39,6 +39,12 @@ running row, validate its `endpoint`, then discover the global contract:
 The response returns the protocol version, a random `server_generation`, and
 the exact methods and active limits. Never call an unannounced method.
 
+For a control stream, also check each exact action name in
+`terminal.capabilities`. Do not infer action support from `control_stream`, the
+protocol version, or a Luvus release number. For example, file attachment
+requires `upload_start`, `upload_chunk`, `upload_finish`, and `upload_cancel`;
+image paste requires `paste_image`; sizing a terminal requires `set_viewport`.
+
 ## Identity and lifecycle
 
 Every terminal has a random `terminal_id` for one successful PTY lifetime and a
@@ -59,18 +65,144 @@ never follows a moved terminal implicitly for a write.
 | `process_inspection` | `terminal.backend.processes` | Cached executable identities under a validated root; never full argv |
 | `capture` | `terminal.backend.capture` | Bounded `visible`, `recent_unwrapped`, or detection text; optional safe SGR for the first two; recent capture includes passively retained alternate-screen rows |
 | `observe` | `terminal.backend.observe` | Initial safe ANSI frame followed by revision-deduplicated frames when this terminal emits output |
-| `control_stream` | `terminal.backend.control` | The observe stream plus correlated `type_literal`, `submit_text`, and `send_key` action frames |
+| `control_stream` | `terminal.backend.control` | The observe stream plus correlated input, key, image, and bounded `upload_*` action frames |
 | `type_literal` | `terminal.backend.type_literal` | Literal UTF-8 with no implicit Enter |
+| `paste_text` | `terminal.backend.paste_text` | Text with terminal bracketed-paste semantics and no implicit Enter |
 | `submit_text` | `terminal.backend.submit_text` | One atomic paste-and-Enter queue action |
 | `send_key` | `terminal.backend.send_key` | One documented logical key with terminal-mode-aware navigation |
 | `set_title` | `terminal.backend.set_title` | Bounded Luvus label; does not inject OSC into the child |
 | `notify_terminal` | `terminal.backend.notify` | Terminal-scoped message through the existing notification policy |
-| `create_workspace` / `create_sibling` | `terminal.backend.create` | Explicit cwd and optional argv; returns only after the PTY is live |
+| `create_workspace` / `create_sibling` | `terminal.backend.create` | Explicit cwd, optional argv, and optional restart policy; returns only after the PTY is live |
 | `close` | `terminal.backend.close` | Removes only the fully validated terminal |
 | `snapshot` | `terminal.backend.snapshot` | Inventory plus an event-sequence consistency fence |
 | `events` | `terminal.backend.events.subscribe` | Bounded, sequenced terminal lifecycle and output-ready events |
 | `wait_change` | `terminal.backend.wait_change` | Event-driven wait for a newer terminal content revision |
 | `wait_output` | `terminal.backend.wait_output` | Event-driven wait for bounded literal text after a revision advances |
+
+## Choose who restores a created terminal
+
+By default, a terminal created through UHP participates in normal Luvus
+session restoration. Its bounded Luvus label survives a restart, while native
+agent resume and launch-flag behavior continues to follow the user's existing
+session settings.
+
+An external process manager can instead retain sole responsibility for the
+terminal lifecycle:
+
+```json
+{"id":"create-supervisor","method":"terminal.backend.create","params":{"cwd":"/work/project","command":["claude","--session-id","example"],"label":"hand-supervisor","placement":{"kind":"workspace"},"focus":false,"restore":false}}
+```
+
+With `restore:false`, the terminal remains a normal live pane until it exits,
+is closed, or the server stops. It is omitted from the next restored layout,
+so Luvus does not replace it with a shell or resume its detected agent. Other
+panes in the same layout restore normally and the remaining layout collapses
+around the omitted leaf. Omitting `restore` preserves the default value of
+`true`.
+
+Clients must first check for `create_restore_policy` in `terminal.features`.
+When a request supplies `restore`, the create response echoes its effective
+value, and each inventory entry exposes the current policy so a manager can
+reconcile ownership without guessing from a release number. Requests that omit
+the field keep the original create-response shape. This policy intentionally
+does not persist and replay arbitrary original command arguments.
+
+## Program status
+
+Programs running in a pane can report structured lifecycle state with OSC 7501,
+for example `ESC ] 7501 ; state=blocked:kind=permission:msg=<base64> ESC \\`.
+Luvus treats valid reports as authoritative state evidence and exposes the
+bounded records through `agent.explain`, with `state_source: "program_status"`.
+Identity continues to come from process, launch, title, and session evidence.
+The self-reported `app` value is grouping metadata only; it cannot grant native
+agent capabilities or impersonate a built-in agent identity. An `app` that names
+a built-in or manifest agent — its id, a distinct executable, or an ambiguous
+alias — is displayed as `program` unless process or session evidence proves
+that agent is running in the pane. An active leased
+integration report takes precedence over OSC 7501 state.
+
+While valid OSC 7501 records provide state, Luvus skips legacy screen-state
+manifest rules. If a process scan proves identity, it also skips the screen
+text extraction needed only by those rules. Where process evidence is
+unavailable, bounded title/screen identity detection remains available.
+Agent-specific input-composer checks remain independent: a protocol `idle` or
+`done` does not prove that the program can receive a prompt, and a fresh
+protocol `blocked` report rejects submission even before the normal detection
+pass. Clearing all records restores the heuristic state path. Messages shown
+outside the terminal grid (such as blocked hints in Mission Control) disarm
+invisible/directional formatting; `agent.explain.program_status` retains the
+raw decoded data.
+
+Reports support `idle`, `working`, `blocked`, `done`, `error`, and `clear`, with
+nested `id` records, optional progress, titles, and messages. Malformed or
+oversized reports are ignored. Existing heuristic detection remains the
+fallback when a pane does not report OSC 7501 or clears its records.
+
+Each report replaces one record completely. The terminal retains at most 256
+records, evicting the least recently updated one on insertion past capacity.
+Updates are reduced in PTY wire order into a bounded metadata snapshot, not a
+lossy report queue. A query `OSC 7501 ; ? ST` receives the fixed `?` reply.
+
+OSC 133 `A` prompt starts remove unfinished records (`idle`, `working`, and
+`blocked`). Confirmed producer exit removes `idle`, `working`, and `blocked`
+records from that producer. Both retain `done` and `error` results. OSC 133 `C`
+command starts remove only results left behind before that prompt, not freshly
+reported records. RIS clears every record;
+alternate-screen switches do not. Pane closure removes the pane and its
+metadata.
+
+A program that is interrupted or crashes never sends its clear. Without OSC 133
+markers, Luvus uses its existing process scan instead: when two consecutive
+scans find only the pane's shell (no foreground job), `idle`, `working`, and
+`blocked` records reported before the first of those scans are removed. Reports made
+after it are kept, and results are retained. Retained results left behind by a
+prompt or confirmed producer exit remain queryable, but do not override a new
+agent's screen-derived state or `agent.send` prompt readiness unless fresh
+OSC 7501 reports arrive.
+Status emitted by the shell itself
+with no child process is treated the same way. This needs a working process
+scan, so a pane whose root is not a shell (an SSH session, or a program launched
+directly) still relies on explicit clears, prompt markers, or exit. No heartbeat
+or new process polling is added.
+
+OSC 7501 follows the existing asymmetric state debounce: `working` and
+`blocked` publish immediately; a quiet `idle` or `done` candidate must remain
+stable for the existing 2500 ms `QUIET_DWELL`. Renewed work cancels a pending
+quiet transition. Active leased integration reports retain their existing
+immediate-publication policy.
+
+Multiple records are summarized as `blocked`, then `working`, then an unread
+`done`/`error` result, then `idle`. A finished child cannot hide ongoing root or
+background work. Results hidden behind working/blocked records stay unread
+until they become the pane's representative result.
+
+A result in an unfocused pane shows `done` after the dwell. Focusing the pane
+acknowledges a visible result at the next detection, then `done` remains visible
+until the `idle` candidate has held for 2500 ms. Results in an already focused
+pane are acknowledged when visible to an active client but still use the same
+quiet-state debounce. Detached servers retain unread results until a client views
+the pane.
+Acknowledgement does not alter raw protocol state in `agent.explain.program_status`.
+Repeated identical reports from the same run do not re-arm unread results;
+a state change or a new report after a prompt does. `blocked` cannot be dismissed
+by focus. Protocol working-to-idle without an explicit result is not a completion
+notification. Retained results from before a new working/blocked stretch do not
+trigger that stretch's completion sound.
+
+The existing four-state Luvus presentation maps protocol `error` to `done`;
+`agent.explain.program_status` preserves the original `error` state. Consumers
+that need to distinguish failed results should inspect those records rather
+than interpreting `done` as success.
+
+Ordinary program reporters appear in the AGENTS dock, Mission Control, and
+status navigation using `app` (or `program`) as a display label; progress appears
+in the AGENTS row when supplied. This visibility does not make the pane a native
+agent. `agent.list` keeps the trusted `agent` identity and adds `display_agent`
+and `is_agent`; retained results do not reject `agent.start` in a shell pane.
+`agent.explain.program_status` preserves raw `app` and includes `effective_app`
+for ancestor inheritance. Summary reads are cached; no full record walk occurs
+on the UI render path. The pane's output path checks a lock-free flag and only
+takes the terminal lock when the records actually changed.
 
 Capture responses include `content_revision`. To initialize without a race,
 subscribe first, request a snapshot on another connection, discard
@@ -85,6 +217,17 @@ snapshot. It requests a new snapshot for created, moved, or exited terminals
 because those deliberately compact events do not repeat the full inventory
 record.
 
+`terminal.exited` reports `data.detail.exit_code` (non-negative integer or
+`null`) and `data.detail.signal` (string or `null`). A signal-terminated child
+has a `null` exit code. Known Unix signals use stable names such as `SIGKILL`;
+an unrecognized signal retains the host-provided text. If the child status cannot be recovered,
+both fields are `null`. Luvus waits briefly for both the process result and
+the final PTY output before publishing exit, with a bounded fallback if one
+notification never arrives. The subsequent `terminal.closed` has
+`data.detail.reason: "exited"` and the same status fields. An explicit close
+instead emits only `terminal.closed` with `reason: "closed"`, plus status fields
+if the child was already reaped.
+
 For a rendered live view, use `terminal.backend.observe` instead of repeatedly
 calling capture. It sends one `terminal.frame` immediately and then captures
 only when the selected terminal's existing coalesced `terminal.output_ready`
@@ -94,17 +237,80 @@ combined observe/control streams. Slow clients receive best-effort
 `terminal.resync_required` and disconnect. Treat EOF the same way and reconnect
 for a fresh initial frame.
 
+Frames are complete replacements. Their `content_revision` identifies the
+captured text, and the sender advances its cursor to that revision only after
+writing the frame successfully. Output arriving during the initial or a later
+write remains eligible for delivery, even when the child then becomes quiet.
+The acknowledgment revision does not mean that output has already been emitted.
+When `terminal.features` advertises `stream_cursor`, a client can add
+`cursor:true` to the observe or control request. Those frames also carry
+`cursor`, either `null` or a Unicode-scalar `offset` in the normalized rendered
+text plus `padding_cells`, the blank terminal cells trimmed immediately before
+the live cursor. ANSI control bytes do not count toward the offset. Renderers
+insert the padding only before their visual caret, after applying terminal
+styles. Omitting the opt-in preserves the original strict UHP 1.0 frame shape.
+
 `terminal.backend.control` has the same output stream and accepts correlated
 action frames after its acknowledgment:
 
 ```json
 {"id":"input-1","action":"type_literal","params":{"text":"cargo test"}}
+{"id":"paste-1","action":"paste_text","params":{"text":"first line\nsecond line"}}
 {"id":"input-2","action":"send_key","params":{"key":"enter"}}
 ```
 
 Actions reuse ordinary strict UHP validation and replies. Only one
 API control stream can lease a terminal at a time. Observe streams remain
 read-only, and local owner/TUI authority is unchanged.
+
+When `terminal.capabilities` includes `set_viewport`, a control stream can ask
+for the terminal's size:
+
+```json
+{"id":"size-1","action":"set_viewport","params":{"cols":40,"rows":18}}
+```
+
+`cols` and `rows` are bounded by the `viewport_cols` and `viewport_rows` limits.
+The request applies only while no native client is rendering, for example on a
+detached server whose panes would otherwise keep their last size. While any
+native client is rendering, the reply is `unavailable` with dispatch `rejected`
+and the PTY is untouched, so a browser never competes with an attached TUI for
+geometry. A native client that attaches later lays the pane out again. After a
+successful resize the stream sends a replacement frame at the new size, even
+when the child prints nothing. Observe streams cannot set a viewport.
+
+For native command-line editing, `send_key` includes `ctrl-w` and `alt-d` for
+backward and forward word deletion, and `ctrl-u` and `ctrl-k` for deletion
+toward the start and end of the current line.
+It also includes `ctrl-a`, `ctrl-b`, `ctrl-e`, `ctrl-f`, `ctrl-g`, `ctrl-l`,
+`ctrl-n`, `ctrl-o`, `ctrl-p`, `ctrl-r`, `ctrl-t`, and `ctrl-y` for line
+movement, history search, screen clearing, and agent shortcuts. On servers
+without `modified_keys`, job-control and flow-control keys such as `ctrl-z`,
+`ctrl-s`, and `ctrl-q` are not accepted.
+
+Servers advertising the `modified_keys` terminal feature also accept `ctrl-a`
+through `ctrl-z`, `ctrl-shift-a` through `ctrl-shift-z`, `ctrl-space` and
+`ctrl-shift-space`. Prefix Enter, Tab, arrows, Home, End, PageUp or PageDown
+with `ctrl-`, `shift-` or `ctrl-shift-` (for example, `shift-enter` or
+`ctrl-left`). The server uses the pane's negotiated keyboard mode; legacy
+Shift+Enter uses Luvus's configured newline sequence. Raw escape sequences
+remain unsupported.
+Each action is a complete key tap, including the release when the child
+requests Kitty key-event reporting.
+
+`paste_image` takes `{png_base64}` for one validated PNG up to 160 KiB. Luvus
+stages the image beneath private selected-session storage and delivers its
+owned path through the same bracketed-paste route as native clipboard images.
+Invalid encodings, non-PNG data, and oversized images are rejected before a
+path is published.
+
+Browser and remote clients can attach other files without giving Luvus a local
+browser path. Send `upload_start` with the leaf name and total size, ordered
+`upload_chunk` actions with an exact byte offset and base64 data, then
+`upload_finish`. Each chunk is at most 160 KiB and the completed file is at most
+32 MiB. Luvus writes into private selected-session storage, atomically publishes
+the completed remote file, and bracket-pastes only its owned path. A disconnect
+or `upload_cancel` removes an incomplete upload.
 
 Each pane admits at most 4,096 pending input actions and 8 MiB of owned input
 buffer capacity across the channel and writer queues together. Capabilities
@@ -185,7 +391,10 @@ rejected before dispatch.
 
 Input success means the complete action was queued to the owned PTY writer.
 Immediate metadata and lifecycle mutations report `executed`. Mutation errors
-include `dispatch: not_started` or `dispatch: rejected`. If a client wrote a
+include `dispatch: not_started` or `dispatch: rejected`. A failed backend create
+may instead report `dispatch: started` when its PTY started but was discarded
+before becoming an addressable pane; clients must not retry it automatically.
+If a client wrote a
 mutation but lost its correlated response, only the client can classify it as
 possibly executed. Do not retry it automatically. Refresh inventory instead.
 

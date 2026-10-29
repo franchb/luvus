@@ -186,7 +186,8 @@ pub fn session_usage(agent: &str, cwd: &Path, session_id: &str) -> Option<AgentU
         "fx" => fx_usage(&fx_dir(&fx::sessions::base(), session_id)),
         // These agents currently expose identity/state but no stable,
         // structured, per-session usage store Luvus can read safely.
-        "aider" | "antigravity" | "kiro" | "cursor" | "amp" | "droid" | "opencode" => None,
+        "aider" | "antigravity" | "letta" | "kilo" | "kiro" | "cursor" | "amp" | "droid"
+        | "opencode" | "devin" => None,
         _ => None, // manifest-defined agents degrade honestly too.
     }
 }
@@ -214,6 +215,15 @@ pub fn session_mtime(agent: &str, cwd: &Path, session_id: &str) -> Option<System
 
 fn canonical(agent: &str) -> &str {
     registry::find(agent).map_or(agent, |descriptor| descriptor.id)
+}
+
+/// Whether a native, structured per-session usage reader exists. An agent
+/// without one may still report exact counters through an integration.
+pub fn supports_session_usage(agent: &str) -> bool {
+    matches!(
+        canonical(agent),
+        "claude" | "codex" | "copilot" | "kimi" | "grok" | "pi" | "omp" | "gemini" | "qwen" | "fx"
+    )
 }
 
 fn claude_path(base: &Path, cwd: &Path, session_id: &str) -> PathBuf {
@@ -878,11 +888,15 @@ mod tests {
             "aider",
             "antigravity",
             "agy",
+            "kilo",
+            "kilocode",
             "kiro",
             "cursor",
             "cursor-agent",
             "amp",
             "droid",
+            "devin",
+            "letta",
             "custom",
         ] {
             assert!(session_usage(agent, Path::new("/work"), "session").is_none());

@@ -38,6 +38,8 @@ RESULT_TYPES = {
     "agent_start",
     "agent_prompt",
     "agent_wait",
+    "agent_list",
+    "agent",
     "subscription_started",
 }
 RESULT_FIELDS = {
@@ -60,6 +62,8 @@ RESULT_FIELDS = {
         "content_revision", "evidence",
     },
     "agent_wait": {"matched", "pane", "status"},
+    "agent_list": {"agents"},
+    "agent": {"pane", "agent", "status"},
     "subscription_started": {"sequence", "queue_capacity", "loss_behavior"},
 }
 FIELDS = {
@@ -73,9 +77,10 @@ FIELDS = {
     },
     "agent.release": {"pane", "source"},
     "agent.start": {"name", "kind", "pane", "anchor", "direction", "args", "timeout_s"},
-    "agent.prompt": {"target", "text", "wait", "until", "timeout_s"},
+    "agent.prompt": {"target", "text", "strict", "terminal_id", "wait", "until", "timeout_s"},
+    "agent.send": {"target", "text", "strict", "terminal_id"},
     "agent.wait": {"pane", "status", "statuses", "timeout_s"},
-    "agent.keys": {"target", "keys"},
+    "agent.keys": {"target", "keys", "if_content_revision", "terminal_id"},
     "events.subscribe": set(),
 }
 
@@ -291,13 +296,67 @@ def agent_key(value):
 
 
 def valid_agent_keys_params(params):
+    """Validate an atomic key batch and its optional paired snapshot coordinates."""
+    fields = set(params)
+    if fields == {"target", "keys", "if_content_revision", "terminal_id"}:
+        if not (
+            type(params["if_content_revision"]) is int
+            and params["if_content_revision"] >= 0
+            and isinstance(params["terminal_id"], str)
+            and re.fullmatch(r"[0-9a-f]{32}", params["terminal_id"]) is not None
+        ):
+            return False
+    elif fields != {"target", "keys"}:
+        return False
     return (
-        set(params) == {"target", "keys"}
-        and bounded_string(params["target"], 128, allow_empty=False)
+        bounded_string(params["target"], 128, allow_empty=False)
         and isinstance(params["keys"], list)
         and bool(params["keys"])
         and all(agent_key(key) for key in params["keys"])
     )
+
+
+def valid_agent_terminal_id(params):
+    return "terminal_id" not in params or (
+        isinstance(params["terminal_id"], str)
+        and re.fullmatch(r"[0-9a-f]{32}", params["terminal_id"]) is not None
+    )
+
+
+def valid_agent_send_params(params):
+    return (
+        isinstance(params, dict)
+        and {"target", "text"} <= set(params)
+        and set(params) <= FIELDS["agent.send"]
+        and bounded_string(params["target"], 128, allow_empty=False)
+        and isinstance(params["text"], str)
+        and bool(params["text"])
+        and ("strict" not in params or type(params["strict"]) is bool)
+        and valid_agent_terminal_id(params)
+    )
+
+
+def valid_agent_prompt_params(params):
+    if not (
+        isinstance(params, dict)
+        and {"target", "text"} <= set(params)
+        and set(params) <= FIELDS["agent.prompt"]
+        and bounded_string(params["target"], 128, allow_empty=False)
+        and bounded_string(params["text"], 262144, allow_empty=False)
+        and ("strict" not in params or type(params["strict"]) is bool)
+        and valid_agent_terminal_id(params)
+        and ("wait" not in params or type(params["wait"]) is bool)
+    ):
+        return False
+    if not params.get("wait", False) and ({"until", "timeout_s"} & set(params)):
+        return False
+    until = params.get("until", ["idle", "done", "blocked"])
+    if not isinstance(until, list) or not 1 <= len(until) <= 4:
+        return False
+    if not all(isinstance(state, str) and state in STATES for state in until):
+        return False
+    timeout = params.get("timeout_s", 300)
+    return type(timeout) in {int, float} and 0 <= timeout <= 3600
 
 
 def valid_request(value):
@@ -370,24 +429,9 @@ def valid_request(value):
         timeout = params.get("timeout_s", 30)
         return type(timeout) in {int, float} and 0 <= timeout <= 3600
     if method == "agent.prompt":
-        if not {"target", "text"} <= set(params):
-            return False
-        if not bounded_string(params["target"], 128, allow_empty=False):
-            return False
-        if not bounded_string(params["text"], 262144, allow_empty=False):
-            return False
-        if "wait" in params and type(params["wait"]) is not bool:
-            return False
-        wait = params.get("wait", False)
-        if not wait and ({"until", "timeout_s"} & set(params)):
-            return False
-        until = params.get("until", ["idle", "done", "blocked"])
-        if not isinstance(until, list) or not 1 <= len(until) <= 4:
-            return False
-        if len(set(until)) != len(until) or not set(until) <= STATES:
-            return False
-        timeout = params.get("timeout_s", 300)
-        return type(timeout) in {int, float} and 0 <= timeout <= 3600
+        return valid_agent_prompt_params(params)
+    if method == "agent.send":
+        return valid_agent_send_params(params)
     if method == "agent.wait":
         return valid_agent_wait_params(params)
     if method == "agent.keys":
@@ -395,7 +439,68 @@ def valid_request(value):
     return False
 
 
+def valid_effective_access(result):
+    """Validate optional endpoint authority while accepting future additive fields."""
+    if "access" not in result:
+        return True  # Owner endpoints and older gateways omit this projection.
+    access = result["access"]
+    if not isinstance(access, dict) or access.get("mode") not in ("read_only", "control"):
+        return False
+    methods = result.get("methods")
+    allowed = access.get("allowed_methods")
+    limits = access.get("limits")
+    if not isinstance(methods, list) or not methods or not all(isinstance(m, str) and m for m in methods):
+        return False
+    if not isinstance(allowed, list) or not allowed or not all(isinstance(m, str) and m for m in allowed):
+        return False
+    if len(set(allowed)) != len(allowed) or not set(allowed) <= set(methods):
+        return False
+    return isinstance(limits, dict) and all(
+        type(limits.get(key)) is int and limits[key] > 0
+        for key in ("connections", "requests_per_minute")
+    )
+
+
+def valid_agent_session_title(container):
+    """An optional live session title: display text of 1-160 characters, or null.
+
+    Older servers omit the field, so a missing title is valid. A title is never
+    an identifier; target agents by pane, terminal ID, or alias instead.
+    """
+    if "agent_session_title" not in container:
+        return True
+    title = container["agent_session_title"]
+    return title is None or bounded_string(title, 160, allow_empty=False)
+
+
+def valid_snapshot_alias_rows(result):
+    """Validate alias projection while preserving unknown additive row fields."""
+    workspaces = result.get("workspaces")
+    if not isinstance(workspaces, list):
+        return False
+    for workspace in workspaces:
+        if not isinstance(workspace, dict) or not isinstance(workspace.get("tabs"), list):
+            return False
+        for tab in workspace["tabs"]:
+            if not isinstance(tab, dict) or not isinstance(tab.get("panes"), list):
+                return False
+            for row in tab["panes"]:
+                if not isinstance(row, dict) or not pane(row.get("pane_id")) or not isinstance(row.get("kind"), str):
+                    return False
+                if row["kind"] == "terminal":
+                    # Older servers predate the additive alias projection.
+                    alias = row.get("agent_name")
+                    if alias is not None and (not isinstance(alias, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", alias) is None):
+                        return False
+                    if not valid_agent_session_title(row):
+                        return False
+                elif row["kind"] == "view" and ("agent_name" in row or "agent_session_title" in row):
+                    return False
+    return True
+
+
 def valid_response(value):
+    """Validate app-level results, effective Access authority, and alias rows."""
     if not isinstance(value, dict) or not isinstance(value.get("id"), str) or REQUEST_ID.fullmatch(value["id"]) is None:
         return False
     if set(value) == {"id", "result"}:
@@ -414,7 +519,8 @@ def valid_response(value):
                 return False
             if kind == "uhp_capabilities":
                 return (
-                    isinstance(result["methods"], list)
+                    valid_effective_access(result)
+                    and isinstance(result["methods"], list)
                     and isinstance(result["agent_authorities"], list)
                     and isinstance(result["agent_states"], list)
                     and set(result["agent_states"]) <= STATES
@@ -422,8 +528,15 @@ def valid_response(value):
                 )
             return (
                 bounded_string(result["server_generation"], 512, allow_empty=False)
-                and isinstance(result["workspaces"], list)
+                and valid_snapshot_alias_rows(result)
             )
+        if kind == "agent_list":
+            return isinstance(result["agents"], list) and all(
+                isinstance(row, dict) and pane(row.get("pane")) and valid_agent_session_title(row)
+                for row in result["agents"]
+            )
+        if kind == "agent":
+            return pane(result["pane"]) and valid_agent_session_title(result)
         if kind == "pane_processes":
             return (
                 pane(result["pane"])
@@ -475,7 +588,8 @@ def valid_response(value):
                 pane(result["pane"])
                 and type(result["submitted"]) is bool
                 and type(result["matched"]) is bool
-                and (result["status"] is None or result["status"] in STATES)
+                and (result["status"] is None or result["status"] in STATES
+                     or ("observed_state" in result and result["status"] == "unknown"))
                 and integer(result["baseline_revision"])
                 and result["baseline_revision"] >= 0
                 and integer(result["content_revision"])
@@ -544,8 +658,35 @@ def valid_global_request(value, methods):
     if value["method"] == "events.subscribe":
         after = value["params"].get("after_sequence", 0)
         return integer(after) and after >= 0
+    if value["method"] == "pane.transpose":
+        params = value["params"]
+        target = params.get("pane")
+        revision = params.get("if_revision", 0)
+        valid_target = target is None or (
+            type(target) is int and 0 <= target <= 4294967295
+        )
+        if isinstance(target, str) and target.isascii() and target.isdigit():
+            digits = target.lstrip("0") or "0"
+            valid_target = len(digits) < 10 or (
+                len(digits) == 10 and digits <= "4294967295"
+            )
+        return (
+            set(params) <= {"pane", "if_revision"}
+            and valid_target
+            and integer(revision)
+            and revision >= 0
+        )
+    if value["method"] == "pane.list":
+        params = value["params"]
+        return set(params) <= {"all_tabs"} and (
+            "all_tabs" not in params or type(params["all_tabs"]) is bool
+        )
     if value["method"] == "agent.wait":
         return valid_agent_wait_params(value["params"])
+    if value["method"] == "agent.prompt":
+        return valid_agent_prompt_params(value["params"])
+    if value["method"] == "agent.send":
+        return valid_agent_send_params(value["params"])
     if value["method"] == "agent.keys":
         return valid_agent_keys_params(value["params"])
     if value["method"] in EMPTY_HOST_METHODS:
@@ -572,7 +713,9 @@ def valid_global_request(value, methods):
         )
     if value["method"] == "task.start":
         params = value["params"]
-        if not set(params) <= {"id", "branch", "agent", "mode", "workspace_id"}:
+        if not set(params) <= {
+            "id", "branch", "agent", "mode", "workspace_id", "focus"
+        }:
             return False
         if not bounded_string(params.get("id"), 128, allow_empty=False):
             return False
@@ -584,11 +727,27 @@ def valid_global_request(value, methods):
             params["workspace_id"], 128, allow_empty=False
         ):
             return False
+        if "focus" in params and type(params["focus"]) is not bool:
+            return False
         mode = params.get("mode")
         if mode is not None and (not isinstance(mode, str) or mode not in {"worktree", "workspace"}):
             return False
         if mode == "workspace" and "branch" in params:
             return False
+    if value["method"] == "task.retry":
+        params = value["params"]
+        return (
+            set(params) == {"id"}
+            and bounded_string(params["id"], 128, allow_empty=False)
+        )
+    if value["method"] == "worktree.remove":
+        params = value["params"]
+        return (
+            set(params) <= {"path", "force"}
+            and "path" in params
+            and bounded_string(params["path"], 4096, allow_empty=False)
+            and ("force" not in params or type(params["force"]) is bool)
+        )
     if value["method"] == "task.heartbeat":
         params = value["params"]
         context = params.get("context")
@@ -654,6 +813,7 @@ def valid_global_request(value, methods):
 
 
 def valid_global_response(value):
+    """Validate global envelopes and specialized Access and snapshot results."""
     if not (
         isinstance(value, dict)
         and isinstance(value.get("id"), str)
@@ -665,8 +825,38 @@ def valid_global_response(value):
         return False
     if set(value) == {"id", "error"} and not isinstance(value["error"], dict):
         return False
+    error = value.get("error")
+    if isinstance(error, dict) and error.get("code") == "agent_not_running":
+        data = error.get("data")
+        if isinstance(data, dict) and "observed_state" in data:
+            return (
+                isinstance(error.get("message"), str)
+                and {"pane", "queued", "submitted", "observed_state", "reason",
+                 "baseline_revision", "content_revision"} <= set(data)
+                and pane(data["pane"])
+                and data["queued"] is True and data["submitted"] is True
+                and data["observed_state"] in ("working", "blocked", None)
+                and data["reason"] == "pane_closed"
+                and integer(data["baseline_revision"]) and data["baseline_revision"] >= 0
+                and integer(data["content_revision"]) and data["content_revision"] >= 0
+            )
     result = value.get("result")
-    if isinstance(result, dict) and result.get("type") == "agent_wait":
+    if isinstance(result, dict) and result.get("type") == "uhp_capabilities":
+        return valid_effective_access(result)
+    if isinstance(result, dict) and result.get("type") == "agent_prompt" and "observed_state" in result:
+        return (
+            valid_response(value)
+            and result["submitted"] is True
+            and result["observed_state"] in ("working", "blocked", None)
+            and (
+                (result["evidence"] == "state_transition" and result["matched"] is True
+                 and result["observed_state"] in ("working", "blocked"))
+                or (result["evidence"] == "timeout" and result["matched"] is False)
+            )
+        )
+    if isinstance(result, dict) and result.get("type") == "session_snapshot":
+        return valid_response(value)
+    if isinstance(result, dict) and result.get("type") in ("agent_wait", "agent_list", "agent"):
         return valid_response(value)
     return True
 
@@ -674,13 +864,19 @@ def valid_global_response(value):
 def main():
     assert not agent_key("\ud800"), "Unicode surrogates are not valid key scalars"
     assert not agent_key("ctrl+K"), "Ctrl aliases accept ASCII letters only"
-    manifest = json.loads((PACKAGE / "fixtures" / "manifest.json").read_text())
+    manifest = json.loads((PACKAGE / "fixtures" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["protocol"] == {"name": "luvus-uhp", "major": 1, "minor": 0}
-    request_schema = json.loads((PACKAGE / "schema" / "request.schema.json").read_text())
+    request_schema = json.loads((PACKAGE / "schema" / "request.schema.json").read_text(encoding="utf-8"))
+    machine_id = request_schema["$defs"]["machineIdParams"]
+    machine_mutation = request_schema["$defs"]["machineMutationParams"]
+    assert set(machine_id["required"]) == {"id"}
+    assert set(machine_mutation["required"]) == {"id", "if_revision"}
+    for shape in (machine_id, machine_mutation):
+        assert set(shape["required"]) <= set(shape["properties"])
     methods = set(request_schema["properties"]["method"]["enum"])
     checked = 0
     for entry in manifest["files"]:
-        lines = (PACKAGE / "fixtures" / entry["path"]).read_text().splitlines()
+        lines = (PACKAGE / "fixtures" / entry["path"]).read_text(encoding="utf-8").splitlines()
         assert len(lines) == entry["count"], entry["path"]
         validator = {
             "request": lambda value: valid_global_request(value, methods),
@@ -695,7 +891,7 @@ def main():
             assert valid == (entry["expect"] == "valid"), line
             checked += 1
     for path in (PACKAGE / "schema").rglob("*.json"):
-        json.loads(path.read_text())
+        json.loads(path.read_text(encoding="utf-8"))
     print(f"validated {checked} UHP fixtures and all JSON schema documents")
     return 0
 

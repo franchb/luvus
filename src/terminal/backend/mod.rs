@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 
 use crate::terminal::vt::VtEngine;
 
+mod keys;
+pub(crate) use keys::control_key;
+
 pub const PROTOCOL_NAME: &str = "luvus-uhp";
 pub const PROTOCOL_MAJOR: u64 = 1;
 pub const PROTOCOL_MINOR: u64 = 0;
@@ -28,6 +31,11 @@ pub const MAX_OBSERVE_LINES: usize = 200;
 pub const MAX_OBSERVERS: usize = 8;
 pub const OBSERVER_QUEUE_CAPACITY: usize = 2;
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;
+/// Bounds for the terminal size a control stream may request with
+/// `set_viewport`. Two cells is the smallest grid a PTY can use.
+pub const MIN_VIEWPORT_CELLS: u16 = 2;
+pub const MAX_VIEWPORT_COLS: u16 = 500;
+pub const MAX_VIEWPORT_ROWS: u16 = 300;
 pub const MAX_TITLE_BYTES: usize = 256;
 pub const MAX_NOTIFICATION_TITLE_BYTES: usize = 256;
 pub const MAX_NOTIFICATION_BODY_BYTES: usize = 8 * 1024;
@@ -43,6 +51,7 @@ pub const CAPABILITIES: &[&str] = &[
     "observe",
     "control_stream",
     "type_literal",
+    "paste_text",
     "submit_text",
     "send_key",
     "set_title",
@@ -56,6 +65,28 @@ pub const CAPABILITIES: &[&str] = &[
     "wait_output",
     "process_inspection",
 ];
+
+/// Control-stream actions without a matching one-request terminal method.
+/// These remain individually discoverable without pretending they extend the
+/// root method registry.
+pub const STREAM_ACTION_CAPABILITIES: &[&str] = &[
+    "paste_image",
+    "upload_start",
+    "upload_chunk",
+    "upload_finish",
+    "upload_cancel",
+    "set_viewport",
+];
+
+pub fn advertised_capabilities() -> Vec<&'static str> {
+    CAPABILITIES
+        .iter()
+        .chain(STREAM_ACTION_CAPABILITIES)
+        .copied()
+        .collect()
+}
+
+pub const FEATURES: &[&str] = &["stream_cursor", "create_restore_policy", "modified_keys"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureMode {
@@ -88,6 +119,12 @@ pub struct CaptureResult {
     pub text: String,
     pub lines: usize,
     pub truncated: bool,
+    /// Unicode-scalar offset in the normalized rendered text. ANSI control
+    /// bytes are excluded so semantic clients can place a caret after styling.
+    pub cursor_offset: Option<usize>,
+    /// Blank terminal cells trimmed from the rendered row immediately before
+    /// the live cursor. Stream clients restore these only for caret placement.
+    pub cursor_padding_cells: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +146,9 @@ pub struct ObserveTarget {
     pub mode: CaptureMode,
     pub lines: usize,
     pub ansi: bool,
+    /// Include semantic cursor metadata in replacement frames. This is opt-in
+    /// so strict UHP 1.0 consumers keep receiving the original frame shape.
+    pub cursor: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +162,8 @@ pub struct CreateCommit {
     pub placement: CreatePlacement,
     pub focus: bool,
     pub label: Option<String>,
+    pub restore: bool,
+    pub restore_explicit: bool,
 }
 
 /// Metadata that exists only for a successfully started PTY lifetime.
@@ -158,6 +200,14 @@ pub fn random_id() -> Result<String, String> {
     Ok(id)
 }
 
+/// One `set_viewport` dimension, or `None` when it is absent, not an integer,
+/// or outside the advertised bounds.
+pub fn viewport_dimension(value: Option<&Value>, max: u16) -> Option<u16> {
+    u16::try_from(value?.as_u64()?)
+        .ok()
+        .filter(|cells| (MIN_VIEWPORT_CELLS..=max).contains(cells))
+}
+
 pub fn valid_id(id: &str) -> bool {
     id.len() == 32
         && id
@@ -170,6 +220,8 @@ pub fn valid_id(id: &str) -> bool {
 pub enum DispatchEvidence {
     NotStarted,
     Rejected,
+    /// The PTY started, but the create was discarded before committing a pane.
+    Started,
 }
 
 impl DispatchEvidence {
@@ -177,6 +229,7 @@ impl DispatchEvidence {
         match self {
             Self::NotStarted => "not_started",
             Self::Rejected => "rejected",
+            Self::Started => "started",
         }
     }
 }
@@ -252,6 +305,8 @@ pub fn limits_json() -> Value {
         "queued_input_bytes": crate::terminal::pty::input::MAX_QUEUED_BYTES,
         "queued_input_actions": crate::terminal::pty::input::MAX_QUEUED_ACTIONS,
         "logical_keys_per_request": 1,
+        "viewport_cols": MAX_VIEWPORT_COLS,
+        "viewport_rows": MAX_VIEWPORT_ROWS,
         "title_bytes": MAX_TITLE_BYTES,
         "notification_title_bytes": MAX_NOTIFICATION_TITLE_BYTES,
         "notification_body_bytes": MAX_NOTIFICATION_BODY_BYTES,
@@ -298,6 +353,7 @@ pub fn schema_bundle() -> Value {
         "observe":schema(include_str!("../../../protocol/uhp/v1/terminal/schema/methods/observe.schema.json")),
         "control":schema(include_str!("../../../protocol/uhp/v1/terminal/schema/methods/control.schema.json")),
         "type_literal":schema(include_str!("../../../protocol/uhp/v1/terminal/schema/methods/type-literal.schema.json")),
+        "paste_text":schema(include_str!("../../../protocol/uhp/v1/terminal/schema/methods/paste-text.schema.json")),
         "submit_text":schema(include_str!("../../../protocol/uhp/v1/terminal/schema/methods/submit-text.schema.json")),
         "send_key":schema(include_str!("../../../protocol/uhp/v1/terminal/schema/methods/send-key.schema.json")),
         "set_title":schema(include_str!("../../../protocol/uhp/v1/terminal/schema/methods/set-title.schema.json")),
@@ -327,6 +383,7 @@ pub fn schema_bundle() -> Value {
         ("observe", "observe"),
         ("control", "control"),
         ("type_literal", "type-literal"),
+        ("paste_text", "paste-text"),
         ("submit_text", "submit-text"),
         ("send_key", "send-key"),
         ("set_title", "set-title"),
@@ -473,6 +530,10 @@ mod tests {
         let fixture: Value = serde_json::from_str(&capabilities_fixture).unwrap();
         assert_eq!(fixture["result"]["protocol"]["major"], PROTOCOL_MAJOR);
         assert_eq!(fixture["result"]["protocol"]["minor"], PROTOCOL_MINOR);
+        assert_eq!(
+            fixture["result"]["terminal"]["capabilities"],
+            json!(advertised_capabilities())
+        );
         assert_eq!(MAX_FRAME_BYTES, 1_048_576);
         assert_eq!(MAX_CAPTURE_BYTES, 524_288);
         assert_eq!(MAX_OBSERVE_BYTES, 65_536);

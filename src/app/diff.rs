@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -10,7 +11,7 @@ use crate::app::{App, DiffMenu, DiffMenuItem, DockKind, Tab, ViewKind};
 use crate::diff::{DiffKey, DiffListRow, DiffLoad, DiffView, FilesMode};
 use crate::event::AppEvent;
 use crate::ids::PaneId;
-use crate::layout::{Axis, TileLayout};
+use crate::layout::TileLayout;
 
 use super::files::OpenTarget;
 
@@ -164,11 +165,36 @@ impl App {
         self.set_files_mode(FilesMode::Diff);
         self.files_focused = true;
         self.diff.scroll_detached = false;
+        // Start at the active view, like WORKSPACES and AGENTS. This explicit
+        // focus transition must not be repeated by background list refreshes.
+        if let Some(ViewKind::Diff(view)) = self.views.get(&self.layout().focus) {
+            if let Some(row) = self.diff.rows.iter().position(|row| {
+                let DiffListRow::File(index) = row else {
+                    return false;
+                };
+                self.diff
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.files.get(*index))
+                    .is_some_and(|file| file.key == view.key)
+            }) {
+                self.diff.cursor = row;
+            }
+        }
         if self.diff.selected_file().is_none() {
             self.diff.move_cursor(1);
         }
         self.diff.ensure_cursor_visible();
+        self.sync_diff_list_selection();
         self.refresh_diff_status(false);
+    }
+
+    /// Keep the list's stable selection key in lockstep with its cursor. The
+    /// key is used by asynchronous row rebuilds to restore the highlighted
+    /// file, so leaving it at the file most recently opened in a preview can
+    /// make a later j/k selection jump back when a refresh completes.
+    fn sync_diff_list_selection(&mut self) {
+        self.diff.selected_key = self.diff.selected_file().map(|file| file.key.clone());
     }
 
     pub fn refresh_diff_status(&mut self, force: bool) {
@@ -421,7 +447,6 @@ impl App {
             }
             DiffMenuItem::CopyPath => {
                 self.pending_clipboard = Some(menu.key.display_path().to_string());
-                self.show_toast("path copied".to_string());
             }
         }
     }
@@ -461,6 +486,7 @@ impl App {
         self.diff.scroll_detached = false;
         self.diff.move_cursor(delta);
         self.diff.ensure_cursor_visible();
+        self.sync_diff_list_selection();
     }
 
     fn move_diff_list_page(&mut self, delta: isize) {
@@ -486,6 +512,7 @@ impl App {
             self.diff.cursor = row;
             self.diff.scroll_detached = false;
             self.diff.ensure_cursor_visible();
+            self.sync_diff_list_selection();
         }
     }
 
@@ -505,12 +532,17 @@ impl App {
             self.diff.cursor = row;
             self.diff.scroll_detached = false;
             self.diff.ensure_cursor_visible();
+            self.sync_diff_list_selection();
         }
     }
 
     /// Navigate the DIFF list while the shared FILES/DIFF dock owns keyboard
     /// focus. Opening a review returns normal keys to the new native view.
     pub fn handle_diff_list_key(&mut self, key: KeyEvent) -> bool {
+        // Filter cycling and refresh stay in this list; hold them once.
+        if super::is_key_repeat(&key) && matches!(key.code, KeyCode::Char('f' | 'r')) {
+            return true;
+        }
         let page = self.diff.viewport.max(1) as isize;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.files_focused = false,
@@ -595,7 +627,7 @@ impl App {
     pub(crate) fn load_diff_file_sync(
         &mut self,
         file: &crate::diff::DiffFile,
-    ) -> Result<crate::diff::model::FileDiff, String> {
+    ) -> Result<Arc<crate::diff::model::FileDiff>, String> {
         let root = self
             .diff
             .snapshot
@@ -607,9 +639,9 @@ impl App {
         if let Some(cached) = self.diff.cache_get(&file.key, context, &file.fingerprint) {
             return Ok(cached);
         }
-        let loaded = crate::diff::git::load_diff(&root, file, context)?;
+        let loaded = Arc::new(crate::diff::git::load_diff(&root, file, context)?);
         self.diff
-            .cache_insert(context, file.fingerprint.clone(), loaded.clone());
+            .cache_insert(context, file.fingerprint.clone(), Arc::clone(&loaded));
         Ok(loaded)
     }
 
@@ -693,7 +725,7 @@ impl App {
                 ws.active_tab = ws.tabs.len() - 1;
             }
             OpenTarget::Preview | OpenTarget::Pane => {
-                self.layout_mut().split_focused(Axis::Col, id);
+                self.split_focused_auto(id);
                 self.layout_mut().focus = id;
             }
         }
@@ -739,14 +771,14 @@ impl App {
             let result = file
                 .ok_or_else(|| "change disappeared before the diff loaded".to_string())
                 .and_then(|file| {
-                    cached.map_or_else(|| crate::diff::git::load_diff(&root, &file, context), Ok)
+                    cached.map_or_else(
+                        || crate::diff::git::load_diff(&root, &file, context).map(Arc::new),
+                        Ok,
+                    )
                 })
                 .map(|diff| {
                     crate::diff::notes::reconcile(&mut notes, &diff);
-                    crate::diff::LoadedDiff {
-                        diff,
-                        reconciled_notes: notes,
-                    }
+                    crate::diff::LoadedDiff::prepare(diff, notes)
                 });
             let _ = tx.send(AppEvent::DiffLoaded { id, token, result });
         });
@@ -777,11 +809,12 @@ impl App {
             Ok(loaded) => {
                 let diff = loaded.diff;
                 reconciled = loaded.reconciled_notes;
-                view.stack_rows = crate::diff::rows::stack_rows(&diff);
-                view.split_rows = crate::diff::rows::split_rows(&diff);
-                view.rebuild_row_indices();
-                cache = Some(diff.clone());
-                DiffLoad::Ready(Box::new(diff))
+                view.stack_rows = loaded.stack_rows;
+                view.split_rows = loaded.split_rows;
+                view.stack_indices = loaded.stack_indices;
+                view.split_indices = loaded.split_indices;
+                cache = Some(Arc::clone(&diff));
+                DiffLoad::Ready(diff)
             }
             Err(error) if view.key.layer == crate::diff::DiffLayer::Conflict => {
                 DiffLoad::Conflict(error)
@@ -796,6 +829,7 @@ impl App {
                     .position(|line| source_anchor(line) == Some(anchor))
             })
             .unwrap_or(0);
+        view.search_refresh();
         if let Some(diff) = cache {
             let mut fingerprint = String::new();
             if let Some(file) =
@@ -1069,12 +1103,7 @@ impl App {
             .find(|(pane, _)| *pane == id)
             .map(|(_, rect)| rect.width)
             .unwrap_or(120);
-        let split = !view.wrap
-            && match view.preference {
-                crate::diff::DiffLayoutPreference::Stack => false,
-                crate::diff::DiffLayoutPreference::Split => width >= 96,
-                crate::diff::DiffLayoutPreference::Auto => width >= 96,
-            };
+        let split = view.effective_split(width);
         if split {
             let anchor = view.stack_rows.get(view.selected).and_then(source_anchor)?;
             let row = view.split_rows.iter().find(|row| {
@@ -1084,11 +1113,11 @@ impl App {
             let preferred = match view.selected_side {
                 crate::diff::DiffSide::Old => row.old.as_ref().and_then(|line| {
                     line.old_line
-                        .map(|number| (crate::diff::DiffSide::Old, number, line.text.clone()))
+                        .map(|number| (crate::diff::DiffSide::Old, number, line.text.to_string()))
                 }),
                 crate::diff::DiffSide::New => row.new.as_ref().and_then(|line| {
                     line.new_line
-                        .map(|number| (crate::diff::DiffSide::New, number, line.text.clone()))
+                        .map(|number| (crate::diff::DiffSide::New, number, line.text.to_string()))
                 }),
             };
             if preferred.is_some() {
@@ -1098,12 +1127,13 @@ impl App {
                 .as_ref()
                 .and_then(|line| {
                     line.new_line
-                        .map(|number| (crate::diff::DiffSide::New, number, line.text.clone()))
+                        .map(|number| (crate::diff::DiffSide::New, number, line.text.to_string()))
                 })
                 .or_else(|| {
                     row.old.as_ref().and_then(|line| {
-                        line.old_line
-                            .map(|number| (crate::diff::DiffSide::Old, number, line.text.clone()))
+                        line.old_line.map(|number| {
+                            (crate::diff::DiffSide::Old, number, line.text.to_string())
+                        })
                     })
                 })
         } else {
@@ -1111,18 +1141,18 @@ impl App {
             match view.selected_side {
                 crate::diff::DiffSide::Old => line
                     .old_line
-                    .map(|number| (crate::diff::DiffSide::Old, number, line.text.clone())),
+                    .map(|number| (crate::diff::DiffSide::Old, number, line.text.to_string())),
                 crate::diff::DiffSide::New => line
                     .new_line
-                    .map(|number| (crate::diff::DiffSide::New, number, line.text.clone())),
+                    .map(|number| (crate::diff::DiffSide::New, number, line.text.to_string())),
             }
             .or_else(|| {
                 line.new_line
-                    .map(|number| (crate::diff::DiffSide::New, number, line.text.clone()))
+                    .map(|number| (crate::diff::DiffSide::New, number, line.text.to_string()))
             })
             .or_else(|| {
                 line.old_line
-                    .map(|number| (crate::diff::DiffSide::Old, number, line.text.clone()))
+                    .map(|number| (crate::diff::DiffSide::Old, number, line.text.to_string()))
             })
         }
     }
@@ -1659,11 +1689,14 @@ impl App {
             .map(|(_, rect)| rect.width)
             .unwrap_or(80);
         let marker_style = self.config.layout.diff_marker_style;
-        let is_split = {
+        let (is_split, wraps_lines) = {
             let Some(ViewKind::Diff(view)) = self.views.get(&id) else {
                 return false;
             };
-            view.effective_split(pane_width)
+            (
+                view.effective_split(pane_width),
+                view.effective_wrap(pane_width),
+            )
         };
 
         enum Deferred {
@@ -1687,6 +1720,43 @@ impl App {
             let Some(ViewKind::Diff(view)) = self.views.get_mut(&id) else {
                 return false;
             };
+            // A held key repeats continuous navigation and text editing only.
+            // Toggles, note mutations, file jumps, refreshes, and agent sends
+            // leave this DIFF receiver active, so their repeats do nothing.
+            if super::is_key_repeat(&key) {
+                let ctrl = super::keys::is_ctrl_chord(key.modifiers);
+                let action = if view.note_draft.is_some() || view.note_selecting {
+                    false
+                } else if view.search.is_some() {
+                    ctrl && key.code == KeyCode::Char('i')
+                } else {
+                    matches!(
+                        key.code,
+                        KeyCode::Char(
+                            's' | 'w'
+                                | 'v'
+                                | '+'
+                                | '='
+                                | '-'
+                                | 'J'
+                                | 'K'
+                                | 'N'
+                                | 'P'
+                                | ' '
+                                | 'e'
+                                | 'x'
+                                | 'D'
+                                | 'a'
+                                | 'r'
+                                | 'm'
+                                | 'f'
+                        )
+                    )
+                };
+                if action {
+                    return false;
+                }
+            }
             if view.note_draft.is_some() {
                 match key.code {
                     KeyCode::Char(c) => {
@@ -1762,33 +1832,37 @@ impl App {
                     view.scroll = view.selected.saturating_sub(viewport.saturating_sub(1));
                 }
                 view.ensure_horizontal_visible(pane_width, marker_style, is_split);
-            } else if view.search_editing {
+            } else if view.search.is_some() {
+                let editing = view.search.as_ref().is_some_and(|search| search.editing);
                 match key.code {
-                    KeyCode::Char(c) => view.search.get_or_insert_with(String::new).push(c),
-                    KeyCode::Backspace => {
-                        view.search.get_or_insert_with(String::new).pop();
-                    }
-                    KeyCode::Enter => {
-                        view.search_editing = false;
-                        if let Some(query) =
-                            view.search.as_deref().filter(|query| !query.is_empty())
-                        {
-                            if let Some(index) = view
-                                .stack_rows
-                                .iter()
-                                .position(|line| line.text.contains(query))
-                            {
-                                view.selected = index;
-                                view.scroll = index.saturating_sub(viewport / 2);
-                                view.ensure_horizontal_visible(pane_width, marker_style, is_split);
-                            }
+                    KeyCode::Char('i') if super::keys::is_ctrl_chord(key.modifiers) => {
+                        view.search_toggle_case();
+                        if !editing {
+                            view.scroll = view.selected.saturating_sub(viewport / 2);
                         }
                     }
-                    KeyCode::Esc => {
-                        view.search = None;
-                        view.search_editing = false;
+                    KeyCode::Char('u') if super::keys::is_ctrl_chord(key.modifiers) => {
+                        view.search_clear()
                     }
-                    _ => return false,
+                    KeyCode::Char(c) if editing && !super::keys::is_ctrl_chord(key.modifiers) => {
+                        view.search_push(c)
+                    }
+                    KeyCode::Backspace if editing => view.search_backspace(),
+                    KeyCode::Enter if editing => {
+                        view.search_commit();
+                        view.scroll = view.selected.saturating_sub(viewport / 2);
+                        view.ensure_horizontal_visible(pane_width, marker_style, is_split);
+                    }
+                    KeyCode::Char('n') if !editing => {
+                        view.search_step(true);
+                        view.scroll = view.selected.saturating_sub(viewport / 2);
+                    }
+                    KeyCode::Char('N') if !editing => {
+                        view.search_step(false);
+                        view.scroll = view.selected.saturating_sub(viewport / 2);
+                    }
+                    KeyCode::Esc => view.search = None,
+                    _ => {}
                 }
             } else {
                 let row_count = view.stack_rows.len();
@@ -1811,19 +1885,22 @@ impl App {
                     KeyCode::Char('G') | KeyCode::End => view.selected = max,
                     KeyCode::Left => view.selected_side = crate::diff::DiffSide::Old,
                     KeyCode::Right => view.selected_side = crate::diff::DiffSide::New,
-                    KeyCode::Char('h') => view.horizontal = view.horizontal.saturating_sub(8),
-                    KeyCode::Char('l') => view.horizontal = view.horizontal.saturating_add(8),
+                    KeyCode::Char('h') if !is_split && !wraps_lines => {
+                        view.horizontal = view.horizontal.saturating_sub(8)
+                    }
+                    KeyCode::Char('l') if !is_split && !wraps_lines => {
+                        view.horizontal = view.horizontal.saturating_add(8)
+                    }
+                    KeyCode::Char('h' | 'l') => {}
                     KeyCode::Char('s') => {
-                        // When Auto resolves to Split (wide enough, no wrap),
+                        // When Auto resolves to Split at this viewport width,
                         // skip directly to Stack so the user doesn't need to
                         // press 's' twice to see a visual change.
-                        let was_effectively_split = !view.wrap
-                            && matches!(
-                                view.preference,
-                                crate::diff::DiffLayoutPreference::Split
-                                    | crate::diff::DiffLayoutPreference::Auto
-                            )
-                            && pane_width >= 96;
+                        let was_effectively_split = matches!(
+                            view.preference,
+                            crate::diff::DiffLayoutPreference::Split
+                                | crate::diff::DiffLayoutPreference::Auto
+                        ) && pane_width >= 96;
                         if was_effectively_split
                             && view.preference == crate::diff::DiffLayoutPreference::Auto
                         {
@@ -1868,10 +1945,7 @@ impl App {
                             view.ensure_horizontal_visible(pane_width, marker_style, is_split);
                         }
                     }
-                    KeyCode::Char('/') => {
-                        view.search = Some(String::new());
-                        view.search_editing = true;
-                    }
+                    KeyCode::Char('/') => view.search_begin(),
                     KeyCode::Char('v') => {
                         view.range_anchor = match (view.range_anchor, current_anchor) {
                             (Some(_), _) => None,
@@ -1892,11 +1966,7 @@ impl App {
                     KeyCode::Char('m') => deferred = Deferred::Viewed,
                     KeyCode::Char('f') => deferred = Deferred::Filter,
                     KeyCode::Char('q') => deferred = Deferred::Close,
-                    KeyCode::Esc => {
-                        if view.search.take().is_none() {
-                            deferred = Deferred::Close;
-                        }
-                    }
+                    KeyCode::Esc => deferred = Deferred::Close,
                     _ => return false,
                 }
                 if view.selected < view.scroll {
@@ -2191,6 +2261,42 @@ mod tests {
     }
 
     #[test]
+    fn diff_search_consumes_non_search_shortcuts_before_and_after_commit() {
+        let _env = crate::persist::test_env("diff-search-input-owner");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let key = install_snapshot(&mut app);
+        app.open_diff_view(key, OpenTarget::Tab);
+        let id = app.layout().focus;
+        let tab_count = app.ws().tabs.len();
+        let preference = match app.views.get(&id) {
+            Some(ViewKind::Diff(view)) => view.preference,
+            _ => panic!("expected DIFF view"),
+        };
+
+        assert!(app.handle_diff_key(id, KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)));
+        assert!(app.handle_diff_key(id, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+        assert!(matches!(
+            app.views.get(&id),
+            Some(ViewKind::Diff(view)) if view.search.as_ref().is_some_and(|search| search.query.is_empty())
+        ));
+
+        assert!(app.handle_diff_key(id, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+        assert!(app.handle_diff_key(id, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        for shortcut in ['q', 's', 'm', 'a'] {
+            assert!(app.handle_diff_key(
+                id,
+                KeyEvent::new(KeyCode::Char(shortcut), KeyModifiers::NONE)
+            ));
+        }
+        assert_eq!(app.ws().tabs.len(), tab_count, "q must not close DIFF");
+        assert!(matches!(
+            app.views.get(&id),
+            Some(ViewKind::Diff(view)) if view.search.is_some() && view.preference == preference
+        ));
+    }
+
+    #[test]
     fn opening_diff_from_context_menu_creates_a_native_leaf_without_a_pty() {
         let _env = crate::persist::test_env("diff-native-view");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -2296,6 +2402,150 @@ mod tests {
             .views
             .values()
             .any(|view| matches!(view, ViewKind::Diff(diff) if diff.key == key)));
+    }
+
+    #[test]
+    fn diff_list_navigation_updates_selection_after_opening_a_file() {
+        let _env = crate::persist::test_env("diff-list-selection-after-open");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let first_key = install_snapshot(&mut app);
+        let second_key = add_snapshot_file(&mut app, "src/second.rs");
+        app.files_mode = FilesMode::Diff;
+        app.files_focused = true;
+
+        app.handle_diff_list_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(
+            app.diff.selected_file().map(|file| &file.key),
+            Some(&first_key)
+        );
+        app.handle_diff_list_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.diff.selected_key.as_ref(), Some(&first_key));
+
+        // Returning to the list and preselecting another file must supersede
+        // the key remembered when the first file was opened. A later status or
+        // note refresh rebuilds rows asynchronously, which is where the stale
+        // key used to move the highlight back to the first file.
+        app.files_focused = true;
+        app.handle_diff_list_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            app.diff.selected_file().map(|file| &file.key),
+            Some(&second_key)
+        );
+
+        app.diff.rebuild_rows();
+        assert_eq!(
+            app.diff.selected_file().map(|file| &file.key),
+            Some(&second_key)
+        );
+    }
+
+    #[test]
+    fn diff_list_highlight_follows_open_view_after_leaving_keyboard_selection() {
+        let _env = crate::persist::test_env("diff-list-open-view-highlight");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let first_key = install_snapshot(&mut app);
+        add_snapshot_file(&mut app, "src/second.rs");
+        app.move_dock(&DockKind::Files, crate::app::Side::Right);
+        app.sidebars.right.visible = true;
+        app.files_mode = FilesMode::Diff;
+        app.open_diff_view(first_key, OpenTarget::Preview);
+        app.files_focused = true;
+        app.handle_diff_list_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let preselected = app.diff.cursor;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let assert_highlight = |app: &mut App, terminal: &mut Terminal<TestBackend>, selected| {
+            terminal
+                .draw(|frame| crate::ui::render(frame, app))
+                .unwrap();
+            for (index, rect) in &app.diff_row_rects {
+                assert_eq!(
+                    terminal.backend().buffer()[(rect.x, rect.y)].bg,
+                    if selected == Some(*index) {
+                        app.theme.surface1
+                    } else if *index == 1 {
+                        app.theme.sel_bg
+                    } else {
+                        app.theme.base
+                    },
+                    "highlight for row {index}"
+                );
+                assert_eq!(
+                    terminal.backend().buffer()[(rect.x + 6, rect.y)].fg,
+                    if selected == Some(*index) || *index == 1 {
+                        app.theme.accent
+                    } else {
+                        app.theme.subtext0
+                    },
+                    "path color for row {index}"
+                );
+            }
+        };
+        assert_highlight(&mut app, &mut terminal, Some(preselected));
+        let (_, active_rect) = app
+            .diff_row_rects
+            .iter()
+            .find(|(row, _)| *row == 1)
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(active_rect.x + 4, active_rect.y)].fg,
+            app.theme.amber,
+            "active status badge retains its Git color"
+        );
+        let hovered_rect = app
+            .diff_row_rects
+            .iter()
+            .find(|(row, _)| *row == preselected)
+            .unwrap()
+            .1;
+        app.handle_diff_list_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.hover = Some((hovered_rect.x, hovered_rect.y));
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(hovered_rect.x, hovered_rect.y)].bg,
+            app.theme.surface1
+        );
+        app.hover = None;
+        assert_highlight(&mut app, &mut terminal, None);
+
+        app.handle_diff_list_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_highlight(&mut app, &mut terminal, None);
+        assert_eq!(
+            app.diff.cursor, preselected,
+            "rendering preserves preselection"
+        );
+        app.diff.rebuild_rows();
+        assert_highlight(&mut app, &mut terminal, None);
+
+        app.git_status_inflight = true;
+        app.focus_diff_list();
+        assert_eq!(
+            app.diff.cursor, 1,
+            "focus starts at the currently open diff"
+        );
+        assert_highlight(&mut app, &mut terminal, Some(1));
+        app.handle_diff_list_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_highlight(&mut app, &mut terminal, None);
+
+        let terminal_pane = app
+            .layout()
+            .leaves()
+            .into_iter()
+            .find(|id| app.panes.contains_key(id))
+            .unwrap();
+        app.layout_mut().focus = terminal_pane;
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        for (_, rect) in &app.diff_row_rects {
+            assert_eq!(
+                terminal.backend().buffer()[(rect.x, rect.y)].bg,
+                app.theme.base
+            );
+        }
     }
 
     #[test]
@@ -2605,7 +2855,7 @@ mod tests {
         view.split_rows = split_rows;
         view.rebuild_row_indices();
         view.horizontal = usize::MAX;
-        view.load = DiffLoad::Ready(Box::new(file_diff));
+        view.load = DiffLoad::Ready(Arc::new(file_diff));
 
         let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
         terminal
@@ -2783,7 +3033,7 @@ mod tests {
         view.split_rows = crate::diff::rows::split_rows(&file_diff);
         view.selected_side = crate::diff::DiffSide::New;
         view.rebuild_row_indices();
-        view.load = DiffLoad::Ready(Box::new(file_diff));
+        view.load = DiffLoad::Ready(Arc::new(file_diff));
         app.pane_content_rects = vec![(id, Rect::new(0, 0, 120, 4))];
 
         assert!(app.handle_event(AppEvent::Mouse(MouseEvent {
@@ -2796,6 +3046,123 @@ mod tests {
             app.views.get(&id),
             Some(ViewKind::Diff(view)) if view.selected == 3 && view.scroll == 3
         ));
+    }
+
+    fn seed_saved_note(app: &mut App) -> (PaneId, usize) {
+        let key = install_snapshot(app);
+        app.open_diff_view(key.clone(), OpenTarget::Tab);
+        let id = app.layout().focus;
+        let changed = DiffLine {
+            kind: DiffLineKind::Addition,
+            old_line: None,
+            new_line: Some(8),
+            text: "let corrected = true;".into(),
+        };
+        let file_diff = FileDiff {
+            key: key.clone(),
+            status: DiffFileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            binary: false,
+            truncated: false,
+            omitted_lines: 0,
+            hunks: vec![DiffHunk {
+                id: "hunk".into(),
+                old_start: 7,
+                new_start: 8,
+                header: "@@ -7,0 +8 @@".into(),
+                lines: vec![changed],
+            }],
+        };
+        let stack_rows = crate::diff::rows::stack_rows(&file_diff);
+        let split_rows = crate::diff::rows::split_rows(&file_diff);
+        let selected = stack_rows
+            .iter()
+            .position(|line| line.new_line == Some(8))
+            .expect("new source row");
+        let Some(ViewKind::Diff(view)) = app.views.get_mut(&id) else {
+            panic!("native DIFF view");
+        };
+        view.preference = crate::diff::DiffLayoutPreference::Stack;
+        view.stack_rows = stack_rows;
+        view.split_rows = split_rows;
+        view.selected = selected;
+        view.load = DiffLoad::Ready(Arc::new(file_diff));
+        app.diff.notes.push(crate::diff::ReviewNote {
+            id: "clicked-note".into(),
+            review_id: "review".into(),
+            author: "user".into(),
+            kind: crate::diff::NoteKind::Issue,
+            body: "Please keep this behavior".into(),
+            anchor: crate::diff::notes::NoteAnchor {
+                diff_key: key,
+                side: crate::diff::DiffSide::New,
+                start_line: 8,
+                end_line: 8,
+                context: "let corrected = true;".into(),
+                context_sha256: "hash".into(),
+            },
+            state: crate::diff::NoteState::Open,
+            deliveries: Vec::new(),
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        });
+        (id, selected)
+    }
+
+    #[test]
+    fn diff_view_left_and_right_repeat_source_side_selection() {
+        use ratatui::crossterm::event::KeyEventKind;
+
+        let _env = crate::persist::test_env("diff-side-navigation");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 32, tx).unwrap();
+        let (id, _) = seed_saved_note(&mut app);
+        let side = |app: &App| match app.views.get(&id) {
+            Some(ViewKind::Diff(view)) => view.selected_side,
+            _ => panic!("native DIFF view"),
+        };
+        let event =
+            |code, kind| AppEvent::Key(KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind));
+
+        app.handle_event(event(KeyCode::Left, KeyEventKind::Press));
+        assert_eq!(side(&app), crate::diff::DiffSide::Old);
+        app.handle_event(event(KeyCode::Left, KeyEventKind::Release));
+        app.handle_event(event(KeyCode::Right, KeyEventKind::Press));
+        assert_eq!(side(&app), crate::diff::DiffSide::New);
+        app.handle_event(event(KeyCode::Right, KeyEventKind::Release));
+
+        // Held navigation is continuous: the Repeat reaches the same view.
+        app.handle_event(event(KeyCode::Left, KeyEventKind::Press));
+        app.handle_event(event(KeyCode::Right, KeyEventKind::Press));
+        app.handle_event(event(KeyCode::Left, KeyEventKind::Repeat));
+        assert_eq!(side(&app), crate::diff::DiffSide::Old);
+    }
+
+    #[test]
+    fn diff_view_space_repeat_does_not_toggle_note_selection() {
+        use ratatui::crossterm::event::KeyEventKind;
+
+        let _env = crate::persist::test_env("diff-note-space-repeat");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 32, tx).unwrap();
+        let _ = seed_saved_note(&mut app);
+        let event = |kind| {
+            AppEvent::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                kind,
+            ))
+        };
+
+        app.handle_event(event(KeyEventKind::Press));
+        assert!(app.diff.selected_notes.contains("clicked-note"));
+        app.handle_event(event(KeyEventKind::Repeat));
+        assert!(
+            app.diff.selected_notes.contains("clicked-note"),
+            "held Space cannot toggle review-note send selection"
+        );
     }
 
     #[test]
@@ -2840,7 +3207,7 @@ mod tests {
         view.preference = crate::diff::DiffLayoutPreference::Stack;
         view.stack_rows = stack_rows;
         view.split_rows = split_rows;
-        view.load = DiffLoad::Ready(Box::new(file_diff));
+        view.load = DiffLoad::Ready(Arc::new(file_diff));
         app.diff.notes.push(crate::diff::ReviewNote {
             id: "clicked-note".into(),
             review_id: "review".into(),

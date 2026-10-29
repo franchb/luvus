@@ -54,6 +54,7 @@ pub const METHODS: &[&str] = &[
     "pane.split",
     "pane.move",
     "pane.swap",
+    "pane.transpose",
     "pane.focus",
     "pane.focus_direction",
     "pane.resize",
@@ -65,6 +66,7 @@ pub const METHODS: &[&str] = &[
     "pane.status",
     "pane.processes",
     "pane.report_session",
+    "pane.release_session",
     "pane.report_event",
     "pane.close",
     "attach.pane",
@@ -127,6 +129,7 @@ pub const METHODS: &[&str] = &[
     "task.heartbeat",
     "task.update",
     "task.done",
+    "task.retry",
     "task.merge",
     "task.release",
     "task.delete",
@@ -148,6 +151,7 @@ pub const METHODS: &[&str] = &[
     "module.list",
     "module.info",
     "module.link",
+    "module.update",
     "module.unlink",
     "module.uninstall",
     "module.enable",
@@ -168,6 +172,8 @@ pub const METHODS: &[&str] = &[
     "theme.reload",
     "manifest.reload",
     "ui.sidebar",
+    "ui.agent_title.push",
+    "ui.agent_title.clear",
     "ui.dock.push",
     "ui.dock.list",
     "ui.dock.move",
@@ -186,6 +192,7 @@ pub const METHODS: &[&str] = &[
     "terminal.backend.observe",
     "terminal.backend.control",
     "terminal.backend.type_literal",
+    "terminal.backend.paste_text",
     "terminal.backend.submit_text",
     "terminal.backend.send_key",
     "terminal.backend.set_title",
@@ -340,6 +347,8 @@ pub fn all_methods() -> impl Iterator<Item = &'static str> {
         .iter()
         .copied()
         .chain(crate::api::host::METHODS.iter().copied())
+        .chain(crate::machine::api::READ_METHODS.iter().copied())
+        .chain(crate::machine::api::CONTROL_METHODS.iter().copied())
 }
 
 fn is_idempotent(method: &str) -> bool {
@@ -399,6 +408,12 @@ pub fn capabilities(event_sequence: u64) -> Value {
             "event_wait_timeout_s":super::topology::MAX_EVENT_WAIT_S,
             "layout_depth":super::topology::MAX_LAYOUT_DEPTH,
             "workspace_move_block":super::topology::MAX_WORKSPACE_MOVE_BLOCK,
+            "task_title_bytes":crate::orch::MAX_TASK_TITLE_BYTES,
+            "task_prompt_bytes":crate::orch::MAX_TASK_PROMPT_BYTES,
+            "task_attempts":crate::orch::MAX_TASK_ATTEMPTS,
+            "agent_row_titles":crate::app::MAX_AGENT_ROW_TITLES,
+            "agent_row_title_bytes":crate::app::MAX_AGENT_ROW_TITLE_BYTES,
+            "agent_row_title_agent_bytes":crate::app::MAX_AGENT_ROW_TITLE_AGENT_BYTES,
             "automations":crate::automation::MAX_AUTOMATIONS,
             "automation_runs":crate::automation::MAX_RUNS,
             "automation_prompt_bytes":crate::automation::MAX_PROMPT_BYTES,
@@ -407,16 +422,17 @@ pub fn capabilities(event_sequence: u64) -> Value {
         },
         "identity":{"workspace":"stable","tab":"stable","terminal":"pty_lifetime"},
         "events":{"resume":"after_sequence","loss":"resync_required"},
-        "agent_authorities":["integration_report","process_tree","launch_command","osc_title","screen_text","prior_identity","command_fallback"],
+        "agent_authorities":["integration_report","program_status","process_tree","launch_command","osc_title","screen_text","prior_identity","command_fallback"],
         "agent_states":["idle","working","blocked","done"],
         "terminal":{
-            "capabilities":crate::terminal::backend::CAPABILITIES,
+            "capabilities":crate::terminal::backend::advertised_capabilities(),
+            "features":crate::terminal::backend::FEATURES,
             "limits":crate::terminal::backend::limits_json(),
         },
         "authorization":{"default":"local_owner","delegation":"scoped_ephemeral_token",
             "scopes":["read","workspace","agent","terminal","orchestration","extensions","admin","all"]},
-        "concurrency":{"mutation_guard":"if_revision"},
-        "atomic_methods":["agent.start","agent.prompt","automation.create","automation.rebind","automation.run","workspace.move_block","layout.apply","diff.note.apply"],
+        "concurrency":{"mutation_guard":"if_revision","agent_prompt_terminal_id":true},
+        "atomic_methods":["agent.start","agent.prompt","automation.create","automation.rebind","automation.run","task.retry","workspace.move_block","layout.apply","diff.note.apply"],
         "idempotency_keys":{"methods":["automation.create","automation.run"],"max_bytes":128},
         "graphics":false,
     })
@@ -457,8 +473,43 @@ mod tests {
                 && contract["idempotent"].is_boolean()
         }));
         let capabilities = capabilities(0);
+        assert_eq!(
+            capabilities["concurrency"]["agent_prompt_terminal_id"],
+            true
+        );
         assert_eq!(capabilities["limits"]["terminal_stream_capacity"], 8);
         assert_eq!(capabilities["limits"]["terminal_stream_queue"], 2);
+        assert_eq!(
+            capabilities["limits"]["task_title_bytes"],
+            crate::orch::MAX_TASK_TITLE_BYTES
+        );
+        assert_eq!(
+            capabilities["limits"]["task_prompt_bytes"],
+            crate::orch::MAX_TASK_PROMPT_BYTES
+        );
+        assert_eq!(capabilities["limits"]["agent_row_titles"], 256);
+        assert_eq!(capabilities["limits"]["agent_row_title_bytes"], 256);
+        assert_eq!(capabilities["limits"]["agent_row_title_agent_bytes"], 64);
+        assert_eq!(
+            capabilities["terminal"]["features"],
+            json!(["stream_cursor", "create_restore_policy", "modified_keys"])
+        );
+        let terminal_capabilities = capabilities["terminal"]["capabilities"]
+            .as_array()
+            .expect("terminal capabilities");
+        for action in [
+            "paste_image",
+            "upload_start",
+            "upload_chunk",
+            "upload_finish",
+            "upload_cancel",
+            "set_viewport",
+        ] {
+            assert!(
+                terminal_capabilities.iter().any(|value| value == action),
+                "missing terminal action capability {action}"
+            );
+        }
         assert!(is_idempotent("pane.list"));
         assert!(!is_read_only("mission.open"));
         assert_eq!(required_scope("mission.open"), "workspace");

@@ -21,7 +21,9 @@ port, configure SSH forwarding, or require another daemon.
 |---|---|
 | Open the full remote Luvus interface from a computer with Luvus installed | `luvus --remote devbox` |
 | Open a specific named session | `luvus --session api --remote devbox` |
+| Save and switch several SSH machines in one TUI | [Multiple Machines](/docs/guides/machines/) |
 | Connect from a phone that only has an SSH app | SSH to the host, then run `luvus` there |
+| Connect from a phone or computer browser | [Luvus Web](/docs/guides/web/) behind a trusted private TLS provider |
 | Send one JSON automation request | Pipe the request through `ssh devbox luvus uhp proxy` |
 | Build an independent remote or mobile client | Use [`luvus uhp access`](/docs/uhp/remote-access/) with a secure transport provider |
 
@@ -184,13 +186,17 @@ ssh devbox luvus session list
 ssh devbox luvus session list --json
 ```
 
-Inside a remote TUI, `Ctrl+Space t` opens the session switcher. Choosing a
+Inside a remote TUI, `Ctrl+Space t` focuses the session switcher. Choosing a
 different session starts it when needed and moves only the current client. The
-previous session and its panes stay alive.
+previous session and its panes stay alive. Press `a` on a selected row to open
+the same actions available by right click.
 
-To stop another running session from the switcher, right-click it and select
+To stop another running session from the switcher, open its actions and select
 **Stop**. This ends that session and its live panes without detaching the
-current client. The current session cannot be stopped from this menu.
+current client. A stopped session offers **Start**; a stopped named session also
+offers **Delete**, with confirmation, to remove its saved state. The current
+session cannot be stopped from this menu, and the default session cannot be
+deleted.
 
 ## Detach and reconnect
 
@@ -238,12 +244,46 @@ With `luvus --remote`, the local attached client owns effects that should happen
 where you are sitting:
 
 - copied text goes to the local clipboard
+- an explicit image paste reads the local Windows, macOS, Wayland, or X11
+  clipboard and stages the private PNG on the remote Luvus server before
+  pasting that remote path into the focused pane
 - notifications and sounds play locally
 - detected links open in the local browser
 - each attached client uses its own terminal size and mobile or desktop layout
 
+Image bytes travel inside the existing encrypted SSH connection. Luvus does not
+open another port or write the image to the local machine's Luvus server. If no
+supported image is present, the original paste key continues unchanged. Linux
+and FreeBSD display clients need `wl-paste` or `xclip`; the remote host does not.
+
 The global finder searches the selected remote Luvus home. It does not mix
 local workspaces or sessions into remote results.
+
+### Terminal colors over SSH
+
+Luvus preserves RGB colors on modern color-terminal connections, including
+`TERM=xterm-256color` when SSH does not forward `COLORTERM`. Color depth belongs
+to each display client, not the shared server or a command inside a pane.
+This is a compatibility policy, not an active terminal capability query.
+
+Known limited terminals and native Apple Terminal retain the conservative
+fallback unless explicitly opted into RGB. For other genuinely 256-color
+terminals, force that fallback on the **client attachment**:
+
+```sh
+COLORTERM=256color luvus --remote devbox
+```
+
+To explicitly request RGB on a compatible terminal:
+
+```sh
+COLORTERM=truecolor luvus --remote devbox
+
+# If you already opened an SSH shell, set it where the client runs:
+COLORTERM=truecolor luvus
+```
+
+Detach and reattach to change this choice; no server restart is needed.
 
 ## Connect from a phone or tablet
 

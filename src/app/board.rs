@@ -6,7 +6,7 @@
 //! whole flow is drivable from the UI, not only the `luvus task …` CLI.
 
 use super::*;
-use crate::orch::{TaskStatus, TaskWorkerMode, WorkspaceWorkerBinding};
+use crate::orch::{TaskCompletionSource, TaskStatus, TaskWorkerMode, WorkspaceWorkerBinding};
 
 #[derive(Debug)]
 pub struct TaskStartResult {
@@ -19,7 +19,121 @@ pub struct TaskStartResult {
     pub branch: Option<String>,
 }
 
+struct PreparedTaskStart {
+    result: TaskStartResult,
+    rollback: TaskStartRollback,
+}
+
+enum TaskStartRollback {
+    Reused,
+    Tab,
+    Workspace {
+        workspace_id: String,
+    },
+    Worktree {
+        workspace_id: String,
+        repo: std::path::PathBuf,
+        path: std::path::PathBuf,
+        branch: String,
+        worktree_created: bool,
+        branch_created: bool,
+    },
+}
+
+struct TaskStartSelection {
+    workspace_id: String,
+    tab_id: String,
+    pane: Option<PaneId>,
+    zoomed: bool,
+}
+
+enum TaskAgentLaunch {
+    Manual { agent: String, briefing: String },
+    Automation(AutomationWorkerLaunch),
+}
+
+pub enum TaskRetryResult {
+    Task(crate::orch::Task),
+    AutomationRun(crate::automation::AutomationRun),
+}
+
 impl App {
+    /// Retry a terminal task without rewriting its previous work. Manual tasks
+    /// are atomically returned to the queue. Automation-owned tasks create a
+    /// new immutable run from the original run's captured contract.
+    pub fn retry_task(&mut self, id: &str) -> Result<TaskRetryResult, (String, String)> {
+        let task = self
+            .orch
+            .validate_retry(id)
+            .map_err(|reject| (reject.code.to_string(), reject.message))?
+            .clone();
+        if let Some(provenance) = task.automation {
+            if self.workspaces.is_empty() {
+                return Err(("no_session".into(), "no active session".into()));
+            }
+            let now = crate::automation::unix_now();
+            let run = self
+                .automation
+                .request_retry(&provenance.run_id, now)
+                .map_err(|reject| (reject.code.to_string(), reject.message))?;
+            self.persist_automation();
+            self.emit_event(
+                "automation.run_queued",
+                serde_json::json!({
+                    "automation_id": run.automation_id,
+                    "run_id": run.id,
+                    "scheduled_at": run.scheduled_at,
+                    "retry_of": run.retry_of,
+                }),
+            );
+            self.start_automation_run(&run.id, now);
+            let run = self.automation.run(&run.id).cloned().unwrap_or(run);
+            self.invalidate_task_gate(id);
+            return Ok(TaskRetryResult::AutomationRun(run));
+        }
+
+        let mut candidate = self.orch.clone();
+        let task = candidate
+            .retry_task(id)
+            .map_err(|reject| (reject.code.to_string(), reject.message))?;
+        candidate
+            .try_save()
+            .map_err(|error| ("persist_failed".to_string(), error.to_string()))?;
+        self.orch = candidate;
+        self.invalidate_task_gate(id);
+        self.emit_event(
+            "task.retried",
+            serde_json::json!({"id": task.id, "attempt": task.attempt}),
+        );
+        Ok(TaskRetryResult::Task(task))
+    }
+
+    pub(crate) fn invalidate_task_gate(&mut self, id: &str) {
+        if let Some(active) = self.task_gates_inflight.get(id) {
+            active
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    pub(crate) fn release_task_to_queue(
+        &mut self,
+        id: &str,
+    ) -> Result<crate::orch::Task, crate::orch::Reject> {
+        let task = self.orch.release_task(id)?;
+        self.invalidate_task_gate(id);
+        Ok(task)
+    }
+
+    pub(crate) fn delete_task_and_gate(
+        &mut self,
+        id: &str,
+    ) -> Result<crate::orch::Task, crate::orch::Reject> {
+        let task = self.orch.delete_task(id)?;
+        self.invalidate_task_gate(id);
+        Ok(task)
+    }
+
     /// Open (or focus, if already open) the orchestration board in the active
     /// workspace. There's one board per workspace; the ledger behind it is global.
     pub fn open_orch_board(&mut self) {
@@ -44,6 +158,176 @@ impl App {
         self.session_dirty = true;
     }
 
+    /// Cached project identity for one workspace. No Git command or filesystem
+    /// probe runs here: workspace creation already resolved worktree membership.
+    pub(crate) fn task_project_at(&self, workspace: usize) -> Option<crate::orch::TaskProject> {
+        let workspace = self.workspaces.get(workspace)?;
+        let root = workspace
+            .worktree
+            .as_ref()
+            .map(|membership| membership.common_dir.as_path())
+            .unwrap_or(workspace.cwd.as_path());
+        Some(crate::orch::TaskProject {
+            workspace_id: workspace.id.clone(),
+            root: root.display().to_string(),
+        })
+    }
+
+    /// Pick a workspace for a request with no explicit workspace or pane.
+    /// Multiple non-Git projects remain ambiguous. A sole Git project may be
+    /// selected only while one of its workspaces is focused; this ignores an
+    /// incidental launch-directory workspace without guessing across repos.
+    pub(crate) fn implicit_task_workspace_index(&self) -> Result<Option<usize>, ()> {
+        let Some(active) = self.workspaces.get(self.active_ws) else {
+            return Ok(None);
+        };
+
+        let mut project_roots: Vec<&std::path::Path> = Vec::new();
+        for workspace in &self.workspaces {
+            let root = workspace
+                .worktree
+                .as_ref()
+                .map(|membership| membership.common_dir.as_path())
+                .unwrap_or(workspace.cwd.as_path());
+            if !project_roots
+                .iter()
+                .any(|known| crate::platform::same_path(known, root))
+            {
+                project_roots.push(root);
+            }
+        }
+        if project_roots.len() <= 1 {
+            return Ok(Some(self.active_ws));
+        }
+
+        let Some(active_repo) = active.worktree.as_ref() else {
+            return Err(());
+        };
+        let mut repository_roots: Vec<&std::path::Path> = Vec::new();
+        for workspace in &self.workspaces {
+            let Some(membership) = workspace.worktree.as_ref() else {
+                continue;
+            };
+            let root = membership.common_dir.as_path();
+            if !repository_roots
+                .iter()
+                .any(|known| crate::platform::same_path(known, root))
+            {
+                repository_roots.push(root);
+            }
+        }
+        (project_roots.len() == 2
+            && repository_roots.len() == 1
+            && crate::platform::same_path(repository_roots[0], active_repo.common_dir.as_path()))
+        .then_some(self.active_ws)
+        .ok_or(())
+        .map(Some)
+    }
+
+    /// Resolve the workspace that owns a task and bind projectless legacy tasks
+    /// only when the choice is explicit or the session contains one project.
+    fn resolve_task_workspace(
+        &mut self,
+        task_id: &str,
+        requested_workspace: Option<&str>,
+    ) -> Result<String, (String, String)> {
+        let existing = self
+            .orch
+            .task(task_id)
+            .ok_or_else(|| ("not_found".to_string(), format!("no such task: {task_id}")))?
+            .project
+            .clone();
+
+        let requested = requested_workspace
+            .map(|id| {
+                self.workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == id)
+                    .ok_or_else(|| {
+                        (
+                            "workspace_not_found".to_string(),
+                            format!("workspace id {id} not found"),
+                        )
+                    })
+            })
+            .transpose()?;
+
+        let target = if let Some(existing) = existing.as_ref() {
+            if let Some(requested) = requested {
+                let project = self.task_project_at(requested).ok_or_else(|| {
+                    (
+                        "workspace_not_found".to_string(),
+                        "task workspace is unavailable".to_string(),
+                    )
+                })?;
+                if !crate::platform::same_path(
+                    std::path::Path::new(&existing.root),
+                    std::path::Path::new(&project.root),
+                ) {
+                    return Err((
+                        "workspace_mismatch".to_string(),
+                        format!("{task_id} belongs to another project"),
+                    ));
+                }
+                requested
+            } else {
+                self.workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == existing.workspace_id)
+                    .or_else(|| {
+                        self.workspaces.iter().enumerate().find_map(|(index, _)| {
+                            self.task_project_at(index).and_then(|candidate| {
+                                crate::platform::same_path(
+                                    std::path::Path::new(&candidate.root),
+                                    std::path::Path::new(&existing.root),
+                                )
+                                .then_some(index)
+                            })
+                        })
+                    })
+                    .ok_or_else(|| {
+                        (
+                            "workspace_unavailable".to_string(),
+                            format!("the project workspace for {task_id} is not open"),
+                        )
+                    })?
+            }
+        } else if let Some(requested) = requested {
+            requested
+        } else {
+            match self.implicit_task_workspace_index() {
+                Ok(None) => {
+                    return Err((
+                        "workspace_not_found".to_string(),
+                        "no workspace is available for this task".to_string(),
+                    ));
+                }
+                Ok(Some(workspace)) => workspace,
+                Err(()) => {
+                    return Err((
+                        "workspace_required".to_string(),
+                        format!(
+                            "{task_id} predates project ownership; pass --workspace-id to choose its project"
+                        ),
+                    ));
+                }
+            }
+        };
+
+        if existing.is_none() {
+            let project = self.task_project_at(target).ok_or_else(|| {
+                (
+                    "workspace_not_found".to_string(),
+                    "task workspace is unavailable".to_string(),
+                )
+            })?;
+            self.orch
+                .bind_project(task_id, project)
+                .map_err(|reject| (reject.code.to_string(), reject.message))?;
+        }
+        Ok(self.workspaces[target].id.clone())
+    }
+
     /// ORCH-3: spawn a task worker in the requested mode, then claim it, bind its
     /// declared paths, mark it Running, and optionally launch an agent with the
     /// task briefing. Worktree mode preserves the isolated branch/workspace
@@ -58,6 +342,25 @@ impl App {
         workspace_id: Option<String>,
     ) -> Result<TaskStartResult, (String, String)> {
         self.task_start_impl(id, branch, agent, mode, workspace_id, None)
+    }
+
+    /// Start a manual task while optionally preserving the operator's current
+    /// workspace, tab, pane focus, and zoom state.
+    pub fn task_start_with_focus(
+        &mut self,
+        id: &str,
+        branch: Option<String>,
+        agent: Option<String>,
+        mode: TaskWorkerMode,
+        workspace_id: Option<String>,
+        focus: bool,
+    ) -> Result<TaskStartResult, (String, String)> {
+        let previous = (!focus).then(|| self.task_start_selection()).flatten();
+        let result = self.task_start_impl(id, branch, agent, mode, workspace_id, None);
+        if !focus {
+            self.restore_task_start_selection(&previous);
+        }
+        result
     }
 
     /// Start a scheduled worker with the adapter's reviewed headless command.
@@ -81,6 +384,7 @@ impl App {
         )
     }
 
+    /// Start a task through the production PTY submitter.
     fn task_start_impl(
         &mut self,
         id: &str,
@@ -90,6 +394,31 @@ impl App {
         workspace_id: Option<String>,
         automation_access: Option<crate::automation::AutomationAccess>,
     ) -> Result<TaskStartResult, (String, String)> {
+        self.task_start_impl_with_submit(
+            id,
+            branch,
+            agent,
+            mode,
+            workspace_id,
+            automation_access,
+            submit_agent_launch,
+        )
+    }
+
+    /// Prepare and commit one task start, using an injectable final submitter so
+    /// failure rollback can be exercised without racing a real PTY.
+    #[allow(clippy::too_many_arguments)]
+    fn task_start_impl_with_submit(
+        &mut self,
+        id: &str,
+        branch: Option<String>,
+        agent: Option<String>,
+        mode: TaskWorkerMode,
+        workspace_id: Option<String>,
+        automation_access: Option<crate::automation::AutomationAccess>,
+        submit: impl FnOnce(&crate::terminal::pty::Pane, &str) -> Result<(), String>,
+    ) -> Result<TaskStartResult, (String, String)> {
+        let workspace_id = self.resolve_task_workspace(id, workspace_id.as_deref())?;
         let task = self
             .orch
             .task(id)
@@ -140,46 +469,108 @@ impl App {
             }
         }
 
-        // Validate the exact shell input before creating a tab, worktree,
-        // pane, claim, or lease. This also protects task text restored from an
-        // older ledger that predates current input validation.
-        let launch_line = agent
+        // Validate the launch data before creating a tab, worktree, pane,
+        // claim, or lease. This also protects task text restored from an older
+        // ledger that predates current input validation.
+        let launch = agent
             .as_deref()
             .map(|command| match automation_access {
-                Some(access) => automation_agent_launch_line(command, &task, access),
-                None => agent_launch_line(command, &task, mode),
+                Some(access) => automation_agent_launch_line(command, &task, access)
+                    .map(TaskAgentLaunch::Automation),
+                None => manual_agent_launch(command, &task, mode),
             })
             .transpose()
             .map_err(|message| ("invalid_prompt".to_string(), message))?;
 
-        let result = match mode {
+        let previous = self.task_start_selection();
+        let prepared = match match mode {
             TaskWorkerMode::Worktree => {
-                self.start_task_worktree(&task, branch, workspace_id.as_deref())?
+                self.start_task_worktree(&task, branch, Some(&workspace_id))
             }
-            TaskWorkerMode::Workspace => {
-                self.start_task_workspace(&task, workspace_id.as_deref())?
+            TaskWorkerMode::Workspace => self.start_task_workspace(&task, Some(&workspace_id)),
+        } {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.restore_task_start_selection(&previous);
+                return Err(error);
             }
         };
+        let result = &prepared.result;
         let pane = result.pane;
+
+        // A manual task stages its briefing outside the PTY, then sends only a
+        // short private-runner command through the new pane's shell. Queue that
+        // command and Enter as one admitted action before claiming the task.
+        if let Some(launch) = launch.as_ref() {
+            let failure = match self.panes.get(&pane) {
+                Some(worker) => match launch {
+                    TaskAgentLaunch::Manual { agent, briefing } => {
+                        match crate::orch::worker::stage(pane, &task.id, agent, briefing) {
+                            Ok(()) => {
+                                let line = manual_agent_runner_line(&worker.command);
+                                let failure = submit(worker, &line).err();
+                                if failure.is_some() {
+                                    crate::orch::worker::discard(pane);
+                                }
+                                failure.map(|message| ("send_failed".to_string(), message))
+                            }
+                            Err(error) => Some(("send_failed".to_string(), error.to_string())),
+                        }
+                    }
+                    TaskAgentLaunch::Automation(launch) => {
+                        submit(worker, &launch.line(&worker.command))
+                            .err()
+                            .map(|message| ("send_failed".to_string(), message))
+                    }
+                },
+                None => Some((
+                    "spawn_failed".to_string(),
+                    "task worker pane was not created".to_string(),
+                )),
+            };
+            if let Some((code, message)) = failure {
+                return Err(
+                    self.fail_prepared_task_start(id, prepared, &previous, false, code, message)
+                );
+            }
+        }
 
         // Claim + lease + record the binding for the worker.
         // A started worker is *running* — claimed is reserved for the CLI's
         // claim-without-start, so the board never shows live work as waiting.
-        self.orch
-            .claim(id, pane.0)
-            .map_err(|r| (r.code.to_string(), r.message))?;
+        if let Err(reject) = self.orch.claim(id, pane.0) {
+            return Err(self.fail_prepared_task_start(
+                id,
+                prepared,
+                &previous,
+                false,
+                reject.code.to_string(),
+                reject.message,
+            ));
+        }
         if !task.paths.is_empty() {
             if let Err(reject) = self.orch.bind_task_paths(id, pane.0, &task.paths) {
-                // The preflight above makes this unreachable during ordinary
-                // single-writer operation, but keep a failed acquisition from
-                // exposing a running task without its promised lease.
-                let _ = self.orch.release_task(id);
-                self.orch.release_task_leases(id);
-                self.orch.save();
-                return Err((reject.code.to_string(), reject.message));
+                return Err(self.fail_prepared_task_start(
+                    id,
+                    prepared,
+                    &previous,
+                    true,
+                    reject.code.to_string(),
+                    reject.message,
+                ));
             }
         }
-        let _ = self.orch.set_status(id, crate::orch::TaskStatus::Running);
+        if let Err(reject) = self.orch.set_status(id, crate::orch::TaskStatus::Running) {
+            return Err(self.fail_prepared_task_start(
+                id,
+                prepared,
+                &previous,
+                true,
+                reject.code.to_string(),
+                reject.message,
+            ));
+        }
+        let result = prepared.result;
         match mode {
             TaskWorkerMode::Worktree => {
                 self.orch
@@ -194,11 +585,10 @@ impl App {
                 },
             ),
         }
-        if let Some(line) = launch_line {
-            if let Some(p) = self.panes.get(&pane) {
-                p.send(line.as_bytes());
-                p.send(b"\r");
-            }
+        // A scheduled run is headless. Its native session must not come back
+        // as an interactive conversation when the server restarts.
+        if matches!(launch, Some(TaskAgentLaunch::Automation(_))) {
+            self.automation_worker_panes.insert(pane);
         }
         self.orch.save();
         self.emit_event(
@@ -217,12 +607,13 @@ impl App {
         Ok(result)
     }
 
+    /// Prepare a worktree worker and record exactly what a failed submit owns.
     fn start_task_worktree(
         &mut self,
         task: &crate::orch::Task,
         branch: Option<String>,
         requested_workspace: Option<&str>,
-    ) -> Result<TaskStartResult, (String, String)> {
+    ) -> Result<PreparedTaskStart, (String, String)> {
         if let Some(id) = requested_workspace {
             self.active_ws = self
                 .workspaces
@@ -235,17 +626,18 @@ impl App {
                     )
                 })?;
         }
-        let branch = branch
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .or_else(|| task.branch.clone())
-            .unwrap_or_else(|| format!("luvus/{}", task.id));
+        let branch = task_branch_name(task, branch);
+        let ready = self
+            .ready_created_worktree()
+            .is_some_and(|ready| ready.matches(&self.ws().cwd, &branch));
         let persisted = task
             .worktree
             .as_ref()
             .map(std::path::PathBuf::from)
             .filter(|path| path.exists());
-        let existing = if let Some(path) = persisted {
+        let existing = if ready {
+            None
+        } else if let Some(path) = persisted {
             if requested_workspace.is_some() {
                 let worktrees = crate::git::local::worktrees(&self.ws().cwd)
                     .map_err(|error| ("git_error".to_string(), error))?;
@@ -280,23 +672,28 @@ impl App {
                         .map(|worktree| worktree.path)
                 })
         };
-        let path = if let Some(path) = existing {
+        let (path, rollback) = if let Some(path) = existing {
             let live = self
                 .panes
                 .iter()
                 .find(|(_, pane)| crate::platform::same_path(&pane.cwd, &path))
                 .map(|(&pane, _)| pane);
-            match live {
-                Some(pane) => self.focus_pane_global(pane),
+            let rollback = match live {
+                Some(pane) => {
+                    self.focus_pane_global(pane);
+                    TaskStartRollback::Reused
+                }
                 None if !self.create_workspace_at(path.clone()) => {
                     return Err((
                         "spawn_failed".to_string(),
                         "the worker pane didn't start".to_string(),
                     ));
                 }
-                None => {}
-            }
-            path
+                None => TaskStartRollback::Workspace {
+                    workspace_id: self.ws().id.clone(),
+                },
+            };
+            (path, rollback)
         } else {
             let repo = self.ws().cwd.clone();
             if !crate::git::local::is_repo(&repo) {
@@ -305,36 +702,68 @@ impl App {
                     "task start needs a git repo in worktree mode — use --mode workspace for the current checkout".to_string(),
                 ));
             }
+            let branch_created = self
+                .ready_created_worktree()
+                .filter(|ready| ready.matches(&repo, &branch))
+                .map(|ready| ready.branch_created)
+                .unwrap_or_else(|| !crate::git::local::branch_exists(&repo, &branch));
+            let worktree_created = self
+                .ready_created_worktree()
+                .filter(|ready| ready.matches(&repo, &branch))
+                .is_none_or(|ready| ready.worktree_created);
             let path = self
                 .create_worktree(&repo, &branch)
                 .map_err(|error| ("git_error".to_string(), error))?;
             if !crate::platform::same_path(&self.ws().cwd, &path) {
+                let mut cleanup = crate::git::local::worktree_remove_force(&repo, &path);
+                if cleanup.is_ok() && branch_created {
+                    cleanup = crate::git::local::branch_delete_force(&repo, &branch);
+                }
+                let detail = cleanup
+                    .err()
+                    .map(|error| format!("; cleanup failed: {error}"))
+                    .unwrap_or_default();
                 return Err((
                     "spawn_failed".to_string(),
-                    "worktree created but the worker pane didn't start".to_string(),
+                    format!("worktree created but the worker pane didn't start{detail}"),
                 ));
             }
-            path
+            let workspace_id = self.ws().id.clone();
+            (
+                path.clone(),
+                TaskStartRollback::Worktree {
+                    workspace_id,
+                    repo,
+                    path,
+                    branch: branch.clone(),
+                    worktree_created,
+                    branch_created,
+                },
+            )
         };
         let pane = self.layout().focus;
         let workspace_id = self.ws().id.clone();
         let tab_id = self.ws().tabs[self.ws().active_tab].id.clone();
-        Ok(TaskStartResult {
-            pane,
-            cwd: path.clone(),
-            mode: TaskWorkerMode::Worktree,
-            workspace_id,
-            tab_id,
-            worktree: Some(path.display().to_string()),
-            branch: Some(branch),
+        Ok(PreparedTaskStart {
+            result: TaskStartResult {
+                pane,
+                cwd: path.clone(),
+                mode: TaskWorkerMode::Worktree,
+                workspace_id,
+                tab_id,
+                worktree: Some(path.display().to_string()),
+                branch: Some(branch),
+            },
+            rollback,
         })
     }
 
+    /// Prepare a shared-workspace worker without claiming the task yet.
     fn start_task_workspace(
         &mut self,
         task: &crate::orch::Task,
         requested_workspace: Option<&str>,
-    ) -> Result<TaskStartResult, (String, String)> {
+    ) -> Result<PreparedTaskStart, (String, String)> {
         if let Some(binding) = task.workspace_worker.as_ref() {
             let binding_matches_request = requested_workspace
                 .map(|requested| requested == binding.workspace_id)
@@ -357,20 +786,24 @@ impl App {
                         .find(|pane| self.panes.contains_key(pane));
                     if let Some(pane) = pane {
                         self.focus_pane_global(pane);
-                        return Ok(TaskStartResult {
-                            pane,
-                            cwd: self.workspaces[workspace].cwd.clone(),
-                            mode: TaskWorkerMode::Workspace,
-                            workspace_id: self.workspaces[workspace].id.clone(),
-                            tab_id: self.workspaces[workspace].tabs[tab].id.clone(),
-                            worktree: None,
-                            branch: None,
+                        return Ok(PreparedTaskStart {
+                            result: TaskStartResult {
+                                pane,
+                                cwd: self.workspaces[workspace].cwd.clone(),
+                                mode: TaskWorkerMode::Workspace,
+                                workspace_id: self.workspaces[workspace].id.clone(),
+                                tab_id: self.workspaces[workspace].tabs[tab].id.clone(),
+                                worktree: None,
+                                branch: None,
+                            },
+                            rollback: TaskStartRollback::Reused,
                         });
                     }
                 }
             }
         }
 
+        let mut opened_workspace_id = None;
         let target = if let Some(id) = requested_workspace {
             self.workspaces
                 .iter()
@@ -402,7 +835,8 @@ impl App {
                         format!("workspace directory is unavailable: {}", root.display()),
                     ));
                 }
-                self.workspaces
+                let target = self
+                    .workspaces
                     .iter()
                     .position(|workspace| crate::platform::same_path(&workspace.cwd, &root))
                     .ok_or_else(|| {
@@ -410,7 +844,9 @@ impl App {
                             "workspace_not_found".to_string(),
                             "the worker workspace could not be reopened".to_string(),
                         )
-                    })?
+                    })?;
+                opened_workspace_id = Some(self.workspaces[target].id.clone());
+                target
             }
         } else {
             self.active_ws
@@ -431,12 +867,24 @@ impl App {
                 format!("workspace directory is unavailable: {}", root.display()),
             ));
         }
-        let pane = self.spawn_into(root.clone()).ok_or_else(|| {
-            (
-                "spawn_failed".to_string(),
-                "the workspace worker pane didn't start".to_string(),
-            )
-        })?;
+        let pane = match self.spawn_into(root.clone()) {
+            Some(pane) => pane,
+            None => {
+                if let Some(workspace_id) = opened_workspace_id.as_deref() {
+                    if let Some(index) = self
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.id == workspace_id)
+                    {
+                        self.close_workspace_after_rehome(index);
+                    }
+                }
+                return Err((
+                    "spawn_failed".to_string(),
+                    "the workspace worker pane didn't start".to_string(),
+                ));
+            }
+        };
         let mut tab = Tab::panes(TileLayout::new(pane));
         tab.name = Some(task_tab_name(task));
         let tab_id = tab.id.clone();
@@ -446,15 +894,154 @@ impl App {
         workspace.active_tab = workspace.tabs.len() - 1;
         let workspace_id = workspace.id.clone();
         self.session_dirty = true;
-        Ok(TaskStartResult {
-            pane,
-            cwd: root,
-            mode: TaskWorkerMode::Workspace,
-            workspace_id,
-            tab_id,
-            worktree: None,
-            branch: None,
+        let rollback = opened_workspace_id
+            .map(|workspace_id| TaskStartRollback::Workspace { workspace_id })
+            .unwrap_or(TaskStartRollback::Tab);
+        Ok(PreparedTaskStart {
+            result: TaskStartResult {
+                pane,
+                cwd: root,
+                mode: TaskWorkerMode::Workspace,
+                workspace_id,
+                tab_id,
+                worktree: None,
+                branch: None,
+            },
+            rollback,
         })
+    }
+
+    /// Snapshot the stable selection that a failed worker preparation must restore.
+    fn task_start_selection(&self) -> Option<TaskStartSelection> {
+        let workspace = self.workspaces.get(self.active_ws)?;
+        let tab = workspace.tabs.get(workspace.active_tab)?;
+        let focus = tab.layout.focus;
+        Some(TaskStartSelection {
+            workspace_id: workspace.id.clone(),
+            tab_id: tab.id.clone(),
+            pane: self.panes.contains_key(&focus).then_some(focus),
+            zoomed: self.zoomed,
+        })
+    }
+
+    /// Restore selection by stable IDs after task preparation changes topology.
+    fn restore_task_start_selection(&mut self, selection: &Option<TaskStartSelection>) {
+        let Some(selection) = selection else {
+            return;
+        };
+        let Some(workspace) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == selection.workspace_id)
+        else {
+            return;
+        };
+        self.active_ws = workspace;
+        if let Some(tab) = self.workspaces[workspace]
+            .tabs
+            .iter()
+            .position(|tab| tab.id == selection.tab_id)
+        {
+            self.workspaces[workspace].active_tab = tab;
+            if let Some(pane) = selection.pane.filter(|pane| {
+                self.panes.contains_key(pane)
+                    && self.workspaces[workspace].tabs[tab].layout.contains(*pane)
+            }) {
+                self.workspaces[workspace].tabs[tab].layout.focus = pane;
+            }
+            self.zoomed = selection.zoomed;
+        }
+    }
+
+    /// Remove only resources created for an uncommitted task start, then return
+    /// the caller to its original workspace and tab.
+    fn rollback_task_start(
+        &mut self,
+        rollback: TaskStartRollback,
+        pane: PaneId,
+        selection: &Option<TaskStartSelection>,
+    ) -> Result<(), String> {
+        let mut cleanup_error = None;
+        match rollback {
+            TaskStartRollback::Reused => {}
+            TaskStartRollback::Tab => self.close_pane(pane),
+            TaskStartRollback::Workspace { workspace_id } => {
+                if let Some(index) = self
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == workspace_id)
+                {
+                    self.close_workspace_after_rehome(index);
+                }
+            }
+            TaskStartRollback::Worktree {
+                workspace_id,
+                repo,
+                path,
+                branch,
+                worktree_created,
+                branch_created,
+            } => {
+                if let Some(index) = self
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == workspace_id)
+                {
+                    self.close_workspace_after_rehome(index);
+                }
+                if worktree_created {
+                    match crate::git::local::worktree_remove_force(&repo, &path) {
+                        Ok(()) if branch_created => {
+                            if let Err(error) =
+                                crate::git::local::branch_delete_force(&repo, &branch)
+                            {
+                                cleanup_error = Some(error);
+                            }
+                        }
+                        Ok(()) => {}
+                        Err(error) => cleanup_error = Some(error),
+                    }
+                }
+            }
+        }
+        self.restore_task_start_selection(selection);
+        cleanup_error.map_or(Ok(()), Err)
+    }
+
+    /// Undo both ORCH ownership and resources after a prepared start fails.
+    fn fail_prepared_task_start(
+        &mut self,
+        task_id: &str,
+        prepared: PreparedTaskStart,
+        selection: &Option<TaskStartSelection>,
+        claimed: bool,
+        code: String,
+        message: String,
+    ) -> (String, String) {
+        let pane = prepared.result.pane;
+        crate::orch::worker::discard(pane);
+        let mut cleanup_errors = Vec::new();
+        if claimed {
+            if let Err(error) = self.orch.release_task(task_id) {
+                cleanup_errors.push(error.message);
+            }
+            self.orch.release_task_leases(task_id);
+            self.orch.save();
+        }
+        if let Err(error) = self.rollback_task_start(prepared.rollback, pane, selection) {
+            cleanup_errors.push(error);
+        }
+        if cleanup_errors.is_empty() {
+            (code, message)
+        } else {
+            (
+                code,
+                format!(
+                    "{message}; task-start cleanup failed: {}",
+                    cleanup_errors.join("; ")
+                ),
+            )
+        }
     }
 
     /// Reconcile the ledger's pane bindings with the live panes. Called at
@@ -840,6 +1427,14 @@ impl App {
             .task(id)
             .cloned()
             .ok_or_else(|| ("not_found".to_string(), format!("no such task: {id}")))?;
+        if let Some(active) = self.task_gates_inflight.get(id) {
+            let message = if active.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                format!("quality gate is stopping for {id}")
+            } else {
+                format!("quality gate is already running for {id}")
+            };
+            return Err(("gate_running".to_string(), message));
+        }
         if matches!(
             task.status,
             crate::orch::TaskStatus::Merging | crate::orch::TaskStatus::Merged
@@ -864,7 +1459,7 @@ impl App {
             }
         }
         let Some(gate) = task.gate.clone().filter(|g| !g.trim().is_empty()) else {
-            self.finalize_task_done(id); // no gate → done immediately
+            self.finalize_task_done(id, TaskCompletionSource::Command); // no gate → done immediately
             return Ok(false);
         };
         // Run the gate where the work is: the task's worktree, else its worker
@@ -889,15 +1484,60 @@ impl App {
             "task.gate_running",
             serde_json::json!({ "id": id, "gate": gate }),
         );
-        spawn_gate(id.to_string(), cwd, gate, self.app_tx.clone());
+        self.task_gate_generation = self.task_gate_generation.wrapping_add(1);
+        let run = TaskGateRun {
+            generation: self.task_gate_generation,
+            attempt: task.attempt,
+        };
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.task_gates_inflight.insert(
+            id.to_string(),
+            ActiveTaskGate {
+                run,
+                cancelled: cancelled.clone(),
+            },
+        );
+        spawn_gate(
+            id.to_string(),
+            run,
+            cancelled,
+            cwd,
+            gate,
+            self.app_tx.clone(),
+        );
         Ok(true)
     }
 
     /// Apply a finished gate (ORCH-5): exit 0 → Done (+ dependents announced);
     /// non-zero → held at `Review` with the tail of the output captured.
-    pub fn task_gate_finished(&mut self, id: &str, code: Option<i32>, out: String) {
+    pub(crate) fn task_gate_finished(
+        &mut self,
+        id: &str,
+        run: TaskGateRun,
+        code: Option<i32>,
+        out: String,
+    ) {
+        if self.task_gates_inflight.get(id).map(|active| active.run) != Some(run) {
+            return;
+        }
+        let Some(active) = self.task_gates_inflight.remove(id) else {
+            return;
+        };
+        if active.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let is_current = self.orch.task(id).is_some_and(|task| {
+            task.attempt == run.attempt
+                && matches!(
+                    task.status,
+                    crate::orch::TaskStatus::Running | crate::orch::TaskStatus::Blocked
+                )
+        });
+        if !is_current {
+            return;
+        }
         if code == Some(0) {
-            self.finalize_task_done(id);
+            self.finalize_task_done(id, TaskCompletionSource::Gate);
             self.emit_event("task.gate_passed", serde_json::json!({ "id": id }));
         } else {
             let _ = self.orch.set_status(id, crate::orch::TaskStatus::Review);
@@ -919,7 +1559,17 @@ impl App {
 
     /// Mark a task Done, release its leases, and announce any dependents that just
     /// became ready (ORCH-4). Shared by the no-gate path and a passing gate.
-    fn finalize_task_done(&mut self, id: &str) {
+    fn finalize_task_done(&mut self, id: &str, source: TaskCompletionSource) {
+        let source = if self
+            .orch
+            .task(id)
+            .is_some_and(|task| task.automation.is_some())
+        {
+            TaskCompletionSource::Automation
+        } else {
+            source
+        };
+        let _ = self.orch.set_completion_source(id, source);
         let _ = self.orch.set_status(id, crate::orch::TaskStatus::Done);
         self.orch.release_task_leases(id);
         let ready = self.orch.newly_ready(id);
@@ -971,6 +1621,16 @@ impl App {
             self.orch_scroll = 0;
             return;
         }
+        // Toggle, run, delete, start, done, retry, merge, and release act
+        // on the selected row while the board stays open: once per press.
+        if super::is_key_repeat(&key)
+            && matches!(
+                key.code,
+                KeyCode::Delete | KeyCode::Char('e' | 'r' | 'D' | 's' | 'd' | 'm' | 'x')
+            )
+        {
+            return;
+        }
         if self.orch_view == crate::app::OrchView::Automations {
             let last = self.automation.automations.len().saturating_sub(1);
             match key.code {
@@ -1005,6 +1665,7 @@ impl App {
             KeyCode::Char('a') | KeyCode::Char('n') => self.open_orch_form(),
             KeyCode::Char('s') => self.orch_action_start(),
             KeyCode::Char('d') => self.orch_action_done(),
+            KeyCode::Char('r') => self.orch_action_retry(),
             KeyCode::Char('m') => self.orch_action_merge(),
             KeyCode::Char('x') => self.orch_action_release(),
             KeyCode::Char('o') => self.orch_action_detail(),
@@ -1023,10 +1684,35 @@ impl App {
             crate::app::OrchView::Tasks => crate::app::OrchFormKind::Task,
             crate::app::OrchView::Automations => crate::app::OrchFormKind::Automation,
         };
+        self.open_orch_form_kind(kind);
+    }
+
+    pub(crate) fn open_orch_form_kind(&mut self, kind: crate::app::OrchFormKind) {
         let mut form = crate::app::OrchForm::for_kind(kind);
         form.mode = self.orch_flow_mode;
         form.active_agents = self.active_agent_automation_choices();
         self.orch_form = Some(form);
+    }
+
+    pub(crate) fn close_orch_form(&mut self) {
+        let commander_kind = self
+            .orch_form
+            .as_ref()
+            .and_then(|form| form.commander_origin.then_some(form.kind));
+        self.orch_form = None;
+        if let Some(kind) = commander_kind {
+            if let Some(commander) = self.commander.as_mut() {
+                commander.focused = true;
+                commander.receipt = Some(format!(
+                    "{} form canceled",
+                    if kind == crate::app::OrchFormKind::Task {
+                        "Task"
+                    } else {
+                        "Automation"
+                    }
+                ));
+            }
+        }
     }
 
     fn active_agent_automation_choices(&self) -> Vec<crate::app::OrchActiveAgent> {
@@ -1066,10 +1752,10 @@ impl App {
             && key
                 .modifiers
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-            && self.orch_form.as_ref().is_some_and(|form| {
-                form.kind == crate::app::OrchFormKind::Automation
-                    && form.field == crate::app::OrchFormField::Prompt
-            })
+            && self
+                .orch_form
+                .as_ref()
+                .is_some_and(|form| form.field == crate::app::OrchFormField::Prompt)
         {
             if let Some(form) = self.orch_form.as_mut() {
                 form.push_char('\n');
@@ -1079,7 +1765,7 @@ impl App {
         // Esc/Enter act on the whole form, so handle them before borrowing it.
         match key.code {
             KeyCode::Esc => {
-                self.orch_form = None;
+                self.close_orch_form();
                 return;
             }
             KeyCode::Enter => {
@@ -1091,6 +1777,26 @@ impl App {
         let Some(form) = self.orch_form.as_mut() else {
             return;
         };
+        // Choice fields cycle once per press; text fields keep repeating.
+        let choice_field = matches!(
+            form.field,
+            crate::app::OrchFormField::Target
+                | crate::app::OrchFormField::ActiveAgent
+                | crate::app::OrchFormField::Start
+                | crate::app::OrchFormField::Agent
+                | crate::app::OrchFormField::RunIn
+                | crate::app::OrchFormField::Access
+        );
+        if super::is_key_repeat(&key)
+            && (matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+                || (choice_field
+                    && matches!(
+                        key.code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    )))
+        {
+            return;
+        }
         match key.code {
             KeyCode::Tab | KeyCode::BackTab => form.toggle_kind(),
             KeyCode::Down => form.cycle_field(false),
@@ -1129,7 +1835,7 @@ impl App {
 
     /// Create the task from the form (title required; paths/deps whitespace-split).
     /// On error the form stays open showing why.
-    fn submit_orch_form(&mut self) {
+    pub(crate) fn submit_orch_form(&mut self) {
         let (
             kind,
             title,
@@ -1145,6 +1851,8 @@ impl App {
             paths,
             deps,
             gate,
+            workspace_id,
+            commander_origin,
         ) = {
             let Some(f) = self.orch_form.as_ref() else {
                 return;
@@ -1173,6 +1881,8 @@ impl App {
                     let g = f.gate.trim();
                     (!g.is_empty()).then(|| g.to_string())
                 },
+                f.workspace_id.clone(),
+                f.commander_origin,
             )
         };
         let result = match kind {
@@ -1185,6 +1895,7 @@ impl App {
                 paths,
                 deps,
                 gate,
+                workspace_id.clone(),
             ),
             crate::app::OrchFormKind::Automation => self.submit_scheduled_orch_task(
                 title,
@@ -1199,12 +1910,43 @@ impl App {
                 timezone,
                 paths,
                 gate,
+                workspace_id,
             ),
         };
-        if let Err(message) = result {
-            if let Some(form) = self.orch_form.as_mut() {
-                form.error = Some(message);
+        match result {
+            Ok(()) if commander_origin => {
+                let id = match kind {
+                    crate::app::OrchFormKind::Task => self
+                        .orch
+                        .tasks
+                        .get(self.orch_cursor)
+                        .map(|task| task.id.as_str()),
+                    crate::app::OrchFormKind::Automation => self
+                        .automation
+                        .automations
+                        .get(self.orch_automation_cursor)
+                        .map(|item| item.id.as_str()),
+                };
+                if let Some(commander) = self.commander.as_mut() {
+                    commander.focused = true;
+                    commander.receipt = id.map(|id| {
+                        format!(
+                            "{} {id} created",
+                            if kind == crate::app::OrchFormKind::Task {
+                                "Task"
+                            } else {
+                                "Automation"
+                            }
+                        )
+                    });
+                }
             }
+            Err(message) => {
+                if let Some(form) = self.orch_form.as_mut() {
+                    form.error = Some(message);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1219,10 +1961,12 @@ impl App {
         paths: Vec<String>,
         deps: Vec<String>,
         gate: Option<String>,
+        workspace_id: Option<String>,
     ) -> Result<(), String> {
         let descriptor = if start_now {
             Some(
                 crate::agent::registry::find(&agent)
+                    .filter(|descriptor| crate::agent::registry::supports_local_task(descriptor))
                     .ok_or_else(|| format!("unsupported agent: {agent}"))?,
             )
         } else {
@@ -1231,14 +1975,21 @@ impl App {
         if start_now && prompt.is_empty() {
             return Err("Prompt is required when Start is Now".into());
         }
+        let workspace = self.orch_form_workspace_index(workspace_id.as_deref())?;
+        let project = self
+            .task_project_at(workspace)
+            .ok_or_else(|| "No workspace is available for this task".to_string())?;
         let before = self.orch.clone();
         let task = self
             .orch
-            .add_task(title, paths, deps, gate)
-            .map_err(|error| error.message)?;
-        let task = self
-            .orch
-            .set_prompt(&task.id, (!prompt.is_empty()).then_some(prompt))
+            .add_task_with_prompt_in_project(
+                title,
+                (!prompt.is_empty()).then_some(prompt),
+                paths,
+                deps,
+                gate,
+                Some(project),
+            )
             .map_err(|error| error.message)?;
         if let Err(error) = self.orch.try_save() {
             self.orch = before;
@@ -1250,10 +2001,7 @@ impl App {
         self.orch_view = crate::app::OrchView::Tasks;
         self.orch_cursor = self.orch.tasks.len().saturating_sub(1);
         if let Some(descriptor) = descriptor {
-            match self.task_start(&id, None, Some(descriptor.id.to_string()), mode, None) {
-                Ok(_) => self.show_toast(format!("{id}: worker started")),
-                Err((_, message)) => self.show_toast(message),
-            }
+            self.start_task_from_ui(id, Some(descriptor.id.to_string()), mode, None, false);
         } else {
             self.show_toast(format!("added {id}"));
         }
@@ -1275,6 +2023,7 @@ impl App {
         timezone: String,
         paths: Vec<String>,
         gate: Option<String>,
+        bound_workspace_id: Option<String>,
     ) -> Result<(), String> {
         if prompt.is_empty() {
             return Err("Prompt is required for a scheduled agent".into());
@@ -1295,9 +2044,11 @@ impl App {
                         access.label().to_ascii_lowercase()
                     ));
                 }
+                let workspace_index =
+                    self.orch_form_workspace_index(bound_workspace_id.as_deref())?;
                 let workspace_id = self
                     .workspaces
-                    .get(self.active_ws)
+                    .get(workspace_index)
                     .map(|workspace| workspace.id.clone())
                     .ok_or_else(|| "an active workspace is required".to_string())?;
                 (
@@ -1311,6 +2062,12 @@ impl App {
             crate::app::OrchAutomationTarget::ActiveAgent => {
                 let target = active_agent
                     .ok_or_else(|| "No live agent is available for this automation".to_string())?;
+                if bound_workspace_id
+                    .as_deref()
+                    .is_some_and(|id| id != target.workspace_id)
+                {
+                    return Err("Selected agent is outside the bound workspace".into());
+                }
                 (
                     crate::automation::AutomationTarget::ActiveAgent {
                         pane_id: target.pane.0,
@@ -1379,6 +2136,21 @@ impl App {
         Ok(())
     }
 
+    fn orch_form_workspace_index(&self, id: Option<&str>) -> Result<usize, String> {
+        match id {
+            Some(id) => self
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == id)
+                .ok_or_else(|| "Selected workspace is no longer available".to_string()),
+            None => self
+                .workspaces
+                .get(self.active_ws)
+                .map(|_| self.active_ws)
+                .ok_or_else(|| "No active workspace is available".to_string()),
+        }
+    }
+
     /// The task under the board cursor, if any.
     fn orch_selected_id(&self) -> Option<String> {
         self.orch.tasks.get(self.orch_cursor).map(|t| t.id.clone())
@@ -1442,7 +2214,7 @@ impl App {
                 }
             }
             crate::app::OrchHit::FormCreate => self.submit_orch_form(),
-            crate::app::OrchHit::FormCancel => self.orch_form = None,
+            crate::app::OrchHit::FormCancel => self.close_orch_form(),
             crate::app::OrchHit::FormModal => {}
             crate::app::OrchHit::StartChoice(cursor) => {
                 if let Some(start) = self.orch_start.as_mut() {
@@ -1654,6 +2426,12 @@ impl App {
             TaskStatus::Done => {}
             TaskStatus::Merging | TaskStatus::Merged => {}
         }
+        if matches!(
+            task.status,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Review | TaskStatus::Blocked
+        ) {
+            items.push(Item::Retry);
+        }
         items.extend([Item::Divider, Item::CopyId]);
         if task.worktree.is_some() {
             items.push(Item::CopyWorktree);
@@ -1701,16 +2479,15 @@ impl App {
             Item::Jump => self.orch_action_jump(),
             Item::Details => self.orch_action_detail(),
             Item::Done => self.orch_action_done(),
+            Item::Retry => self.orch_action_retry(),
             Item::Merge => self.orch_action_merge(),
             Item::Release => self.orch_action_release(),
             Item::CopyId => {
                 self.pending_clipboard = Some(id);
-                self.show_toast(self.catalog.copied);
             }
             Item::CopyWorktree => {
                 if let Some(path) = self.orch.task(&id).and_then(|task| task.worktree.clone()) {
                     self.pending_clipboard = Some(path);
-                    self.show_toast(self.catalog.copied);
                 }
             }
             Item::Delete => self.orch_action_delete(),
@@ -1776,6 +2553,10 @@ impl App {
             .as_ref()
             .is_some_and(|start| start.step == crate::app::OrchStartStep::Mode)
         {
+            // Two modes: each press flips once; a held key must not oscillate.
+            if super::is_key_repeat(&key) {
+                return;
+            }
             match key.code {
                 KeyCode::Esc => self.orch_start = None,
                 KeyCode::Char('j')
@@ -1829,14 +2610,60 @@ impl App {
         }
     }
 
+    fn start_task_from_ui(
+        &mut self,
+        id: String,
+        agent: Option<String>,
+        mode: TaskWorkerMode,
+        workspace_id: Option<String>,
+        stay_on_board: bool,
+    ) {
+        let previous = stay_on_board.then(|| self.task_start_selection()).flatten();
+        match self.task_start(&id, None, agent.clone(), mode, workspace_id.clone()) {
+            Ok(_) => {
+                if stay_on_board {
+                    self.restore_task_start_selection(&previous);
+                }
+                let suffix = if stay_on_board {
+                    " — ⏎ to jump in"
+                } else {
+                    ""
+                };
+                self.show_toast(format!("{id}: worker started{suffix}"));
+            }
+            Err(error) if is_worktree_create_pending(&error) => {
+                self.show_toast(format!("{id}: creating worktree…"));
+                let scheduled = self.schedule_pending_worktree(move |app, result| {
+                    match result {
+                        Ok(()) => {
+                            app.start_task_from_ui(id, agent, mode, workspace_id, stay_on_board);
+                            app.discard_ready_worktree();
+                        }
+                        Err(message) => app.show_toast(message),
+                    }
+                    true
+                });
+                if let Err(message) = scheduled {
+                    self.show_toast(message);
+                }
+            }
+            Err((_, message)) => self.show_toast(message),
+        }
+    }
+
     /// Start a worker from the board and **stay on the board**: the worker
     /// spawns in the background, a toast confirms it, and `⏎` jumps into it
     /// when wanted — starting five workers is five keypresses, not five
     /// context switches.
     fn start_worker_from_board(&mut self, id: &str, agent: Option<String>, mode: TaskWorkerMode) {
         let prev_ws = self.active_ws;
-        let prev_tab = self.workspaces[prev_ws].active_tab;
-        let workspace_id = if mode == TaskWorkerMode::Workspace {
+        let legacy_projectless = self
+            .orch
+            .task(id)
+            .is_some_and(|task| task.project.is_none());
+        let workspace_id = if legacy_projectless {
+            Some(self.workspaces[prev_ws].id.clone())
+        } else if mode == TaskWorkerMode::Workspace {
             match self
                 .orch
                 .task(id)
@@ -1850,14 +2677,7 @@ impl App {
         } else {
             None
         };
-        match self.task_start(id, None, agent, mode, workspace_id) {
-            Ok(_) => {
-                self.active_ws = prev_ws;
-                self.workspaces[prev_ws].active_tab = prev_tab;
-                self.show_toast(format!("{id}: worker started — ⏎ to jump in"));
-            }
-            Err((_, msg)) => self.show_toast(msg),
-        }
+        self.start_task_from_ui(id.to_string(), agent, mode, workspace_id, true);
     }
 
     /// Board `o`: open the detail overlay for the selected task (branch,
@@ -1910,7 +2730,7 @@ impl App {
         let Some(id) = self.orch_selected_id() else {
             return;
         };
-        match self.orch.delete_task(&id) {
+        match self.delete_task_and_gate(&id) {
             Ok(_) => {
                 self.orch.save();
                 self.emit_event("task.deleted", serde_json::json!({ "id": id }));
@@ -1934,6 +2754,22 @@ impl App {
         }
     }
 
+    fn orch_action_retry(&mut self) {
+        let Some(id) = self.orch_selected_id() else {
+            return;
+        };
+        match self.retry_task(&id) {
+            Ok(TaskRetryResult::Task(task)) => {
+                self.show_toast(format!("{id}: attempt {} queued", task.attempt));
+                self.orch_action_start();
+            }
+            Ok(TaskRetryResult::AutomationRun(run)) => {
+                self.show_toast(format!("{id}: retry queued as {}", run.id));
+            }
+            Err((_, message)) => self.show_toast(message),
+        }
+    }
+
     fn orch_action_merge(&mut self) {
         let Some(id) = self.orch_selected_id() else {
             return;
@@ -1948,7 +2784,7 @@ impl App {
         let Some(id) = self.orch_selected_id() else {
             return;
         };
-        match self.orch.release_task(&id) {
+        match self.release_task_to_queue(&id) {
             Ok(_) => {
                 self.orch.release_task_leases(&id);
                 self.orch.save();
@@ -1999,6 +2835,20 @@ impl App {
     }
 }
 
+fn task_branch_name(task: &crate::orch::Task, requested: Option<String>) -> String {
+    requested
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| task.branch.clone())
+        .unwrap_or_else(|| {
+            if task.attempt > 1 {
+                format!("luvus/{}-retry-{}", task.id, task.attempt)
+            } else {
+                format!("luvus/{}", task.id)
+            }
+        })
+}
+
 /// Agents offered by the board's start-worker picker: (label, canonical id).
 /// `None` = plain shell, no agent. The built-in registry owns the executable
 /// and any task-prompt arguments, so adding an agent cannot leave this picker
@@ -2007,8 +2857,7 @@ pub fn agent_choices() -> &'static [(&'static str, Option<&'static str>)] {
     static CHOICES: std::sync::OnceLock<Vec<(&'static str, Option<&'static str>)>> =
         std::sync::OnceLock::new();
     CHOICES.get_or_init(|| {
-        crate::agent::registry::descriptors()
-            .iter()
+        crate::agent::registry::local_task_descriptors()
             .map(|descriptor| (descriptor.id, Some(descriptor.id)))
             .chain(std::iter::once(("shell", None)))
             .collect()
@@ -2021,8 +2870,7 @@ pub fn agent_choices() -> &'static [(&'static str, Option<&'static str>)] {
 pub fn task_agent_choices() -> &'static [&'static str] {
     static CHOICES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     CHOICES.get_or_init(|| {
-        crate::agent::registry::descriptors()
-            .iter()
+        crate::agent::registry::local_task_descriptors()
             .map(|descriptor| descriptor.id)
             .collect()
     })
@@ -2065,15 +2913,28 @@ pub fn automation_agent_choices_for(
     })
 }
 
+/// Whether one built-in automation agent has a reviewed launch profile for the
+/// requested access level. The creation form uses this for presentation only;
+/// submission repeats the same descriptor-owned validation before mutation.
+pub fn automation_agent_supports(agent: &str, access: crate::automation::AutomationAccess) -> bool {
+    crate::agent::registry::find(agent)
+        .and_then(|descriptor| descriptor.automation)
+        .is_some_and(|operations| operations.supports(access))
+}
+
 fn task_tab_name(task: &crate::orch::Task) -> String {
     let value = format!("{} · {}", task.id, task.title.trim());
     value.chars().take(crate::app::TAB_NAME_MAX).collect()
 }
 
-/// The briefing a worker agent starts with: what the task is, its boundaries,
-/// its gate, and the contract for reporting back over the socket. One line —
-/// it's typed into the worker's shell as a quoted argument.
-fn task_briefing(task: &crate::orch::Task, mode: TaskWorkerMode) -> String {
+/// Queue the launch text and its Enter as one ordered PTY action.
+fn submit_agent_launch(pane: &crate::terminal::pty::Pane, line: &str) -> Result<(), String> {
+    pane.try_submit_text(line)
+}
+
+/// The structured briefing a worker agent starts with: what the task is, its
+/// boundaries, its gate, and the contract for reporting back over the socket.
+pub(crate) fn task_briefing(task: &crate::orch::Task, mode: TaskWorkerMode) -> String {
     let id = &task.id;
     let location = match mode {
         TaskWorkerMode::Worktree => "This directory is your isolated git worktree.",
@@ -2090,7 +2951,7 @@ fn task_briefing(task: &crate::orch::Task, mode: TaskWorkerMode) -> String {
         .as_deref()
         .filter(|prompt| !prompt.trim().is_empty())
     {
-        b.push(' ');
+        b.push('\n');
         b.push_str(prompt.trim());
     }
     if !task.paths.is_empty() {
@@ -2102,8 +2963,9 @@ fn task_briefing(task: &crate::orch::Task, mode: TaskWorkerMode) -> String {
     if let Some(g) = task.gate.as_deref().filter(|g| !g.trim().is_empty()) {
         b.push_str(&format!(" The quality gate is `{g}` — it must pass."));
     }
-    if let Some(note) = task.notes.last() {
-        b.push_str(&format!(" Note from earlier work: {note}."));
+    if let Some(note) = task.notes.last().filter(|note| !note.trim().is_empty()) {
+        b.push_str("\n\nNote from earlier work:\n");
+        b.push_str(note.trim());
     }
     match mode {
         TaskWorkerMode::Worktree => b.push_str(&format!(
@@ -2123,23 +2985,152 @@ fn task_briefing(task: &crate::orch::Task, mode: TaskWorkerMode) -> String {
     b
 }
 
-/// The full line typed into a fresh worker shell to launch `agent` with the
-/// task briefing, with the task id available to Unix workers.
-fn agent_launch_line(
+/// Validate and stage the data for one manual launch before creating resources.
+fn manual_agent_launch(
     agent: &str,
     task: &crate::orch::Task,
     mode: TaskWorkerMode,
-) -> Result<String, String> {
+) -> Result<TaskAgentLaunch, String> {
     let briefing = task_briefing(task, mode);
-    if crate::orch::contains_terminal_control(&briefing) {
+    if crate::orch::contains_multiline_control(&briefing) {
         return Err("task briefing must not contain terminal control characters".to_string());
     }
-    let brief = shell_quote(&briefing);
-    let command = agent_task_command(agent);
-    if cfg!(windows) {
-        Ok(format!("{command} {brief}"))
-    } else {
-        Ok(format!("LUVUS_TASK_ID={} {command} {brief}", task.id))
+    let agent = agent.trim();
+    if agent.is_empty() {
+        return Err("agent command cannot be empty".to_string());
+    }
+    if crate::orch::contains_terminal_control(agent) {
+        return Err("agent command must not contain terminal control characters".to_string());
+    }
+    crate::orch::worker::validate_agent_command(agent)?;
+    Ok(TaskAgentLaunch::Manual {
+        agent: agent.to_string(),
+        briefing,
+    })
+}
+
+/// The shell family that reads a worker launch line in a new task pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerShell {
+    Posix,
+    PowerShell,
+    Cmd,
+}
+
+impl WorkerShell {
+    /// Unix panes always use POSIX syntax. Windows panes follow the configured
+    /// shell; anything unrecognised keeps the POSIX form.
+    fn of(shell: &str) -> Self {
+        if cfg!(windows) {
+            Self::classify(shell)
+        } else {
+            Self::Posix
+        }
+    }
+
+    /// Platform-neutral: split on both separators so a Windows shell path is
+    /// recognised wherever this runs, including Unix CI.
+    fn classify(shell: &str) -> Self {
+        let base = shell
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(shell)
+            .to_ascii_lowercase();
+        match base.trim_end_matches(".exe") {
+            "pwsh" | "powershell" => Self::PowerShell,
+            "cmd" => Self::Cmd,
+            _ => Self::Posix,
+        }
+    }
+
+    /// Quote `s` as one literal argument for this shell.
+    fn quote(self, s: &str) -> String {
+        match self {
+            Self::Posix => format!("'{}'", s.replace('\'', "'\\''")),
+            // PowerShell single-quoted strings expand nothing; every quote
+            // character it recognises (including typographic ones) is
+            // escaped by doubling it.
+            Self::PowerShell => {
+                let mut quoted = String::with_capacity(s.len() + 2);
+                quoted.push('\'');
+                for c in s.chars() {
+                    if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                        quoted.push(c);
+                    }
+                    quoted.push(c);
+                }
+                quoted.push('\'');
+                quoted
+            }
+            // cmd has no escape for `"` inside quotes; Windows paths cannot
+            // contain one, so soften any stray quote rather than break out.
+            Self::Cmd => format!("\"{}\"", s.replace('"', "'")),
+        }
+    }
+
+    /// Leave plain identifier tokens bare and quote anything else.
+    fn arg(self, s: &str) -> String {
+        let plain = !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        if plain {
+            s.to_string()
+        } else {
+            self.quote(s)
+        }
+    }
+
+    /// Invoke a quoted program. PowerShell parses a leading quoted string as
+    /// an expression, so it needs the call operator.
+    fn invoke(self, program: &str) -> String {
+        match self {
+            Self::PowerShell => format!("& {program}"),
+            Self::Posix | Self::Cmd => program.to_string(),
+        }
+    }
+}
+
+/// The shell receives only a bounded private-runner command. The runner reloads
+/// the claimed task and passes its full briefing directly to the agent process.
+fn manual_agent_runner_line(shell: &str) -> String {
+    let shell = WorkerShell::of(shell);
+    let program = match shell {
+        WorkerShell::PowerShell => "\"$env:LUVUS_BIN_PATH\"",
+        WorkerShell::Cmd => "\"%LUVUS_BIN_PATH%\"",
+        WorkerShell::Posix => "\"$LUVUS_BIN_PATH\"",
+    };
+    format!("{} __task-worker", shell.invoke(program))
+}
+
+/// Validated data for a scheduled worker. The launch line is rendered only
+/// once the worker pane exists, because its syntax depends on that pane's
+/// shell.
+#[derive(Debug)]
+struct AutomationWorkerLaunch {
+    executable: String,
+    task_id: String,
+    automation_id: String,
+    run_id: String,
+}
+
+impl AutomationWorkerLaunch {
+    fn line(&self, shell: &str) -> String {
+        self.line_for(WorkerShell::of(shell), !cfg!(windows))
+    }
+
+    fn line_for(&self, shell: WorkerShell, task_id_prefix: bool) -> String {
+        let command = format!(
+            "{} __automation-worker {} {} {}",
+            shell.invoke(&shell.quote(&self.executable)),
+            shell.arg(&self.task_id),
+            shell.arg(&self.automation_id),
+            shell.arg(&self.run_id),
+        );
+        if task_id_prefix && shell == WorkerShell::Posix {
+            format!("LUVUS_TASK_ID={} {command}", shell.arg(&self.task_id))
+        } else {
+            command
+        }
     }
 }
 
@@ -2147,7 +3138,7 @@ fn automation_agent_launch_line(
     agent: &str,
     task: &crate::orch::Task,
     access: crate::automation::AutomationAccess,
-) -> Result<String, String> {
+) -> Result<AutomationWorkerLaunch, String> {
     let descriptor =
         crate::agent::registry::find(agent).ok_or_else(|| format!("unsupported agent: {agent}"))?;
     // Validate the adapter/access pair before anything is created. The private
@@ -2163,27 +3154,12 @@ fn automation_agent_launch_line(
     // sessions cannot accidentally route through a different Luvus install.
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not resolve the Luvus automation runner: {error}"))?;
-    let executable = shell_quote(&executable.to_string_lossy());
-    let command = format!(
-        "{executable} __automation-worker {} {} {}",
-        task.id, provenance.automation_id, provenance.run_id
-    );
-    if cfg!(windows) {
-        Ok(command)
-    } else {
-        Ok(format!("LUVUS_TASK_ID={} {command}", task.id))
-    }
-}
-
-fn agent_task_command(agent: &str) -> String {
-    crate::agent::registry::find(agent)
-        .map(|descriptor| {
-            std::iter::once(descriptor.launch_command)
-                .chain(descriptor.task_prompt_args.iter().copied())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_else(|| agent.to_string())
+    Ok(AutomationWorkerLaunch {
+        executable: executable.to_string_lossy().into_owned(),
+        task_id: task.id.clone(),
+        automation_id: provenance.automation_id.clone(),
+        run_id: provenance.run_id.clone(),
+    })
 }
 
 fn agent_automation_command(
@@ -2206,17 +3182,6 @@ fn agent_automation_command(
         .chain(launch.args.iter().copied())
         .collect::<Vec<_>>()
         .join(" "))
-}
-
-/// Quote `s` as one shell argument: POSIX single-quoting on Unix; on Windows
-/// (cmd/PowerShell have no safe common quoting) double quotes with inner
-/// double quotes softened to single quotes.
-fn shell_quote(s: &str) -> String {
-    if cfg!(windows) {
-        format!("\"{}\"", s.replace('"', "'"))
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    }
 }
 
 struct TaskMergeJob {
@@ -2278,27 +3243,72 @@ fn spawn_task_merge(job: TaskMergeJob) -> Result<(), String> {
 /// responsive while a `cargo test` / `npm test` gate runs.
 fn spawn_gate(
     task: String,
+    run: TaskGateRun,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cwd: std::path::PathBuf,
     gate: String,
     app_tx: std::sync::mpsc::Sender<crate::event::AppEvent>,
 ) {
     std::thread::spawn(move || {
-        let (code, out) = run_gate_command(&cwd, &gate);
-        let _ = app_tx.send(crate::event::AppEvent::TaskGateFinished { task, code, out });
+        let (code, out) = run_gate_command(&cwd, &gate, &cancelled);
+        let _ = app_tx.send(crate::event::AppEvent::TaskGateFinished {
+            task,
+            generation: run.generation,
+            attempt: run.attempt,
+            code,
+            out,
+        });
     });
 }
 
 /// Run `gate` through the platform shell in `cwd`; returns its exit code and the
 /// combined stdout+stderr.
-fn run_gate_command(cwd: &std::path::Path, gate: &str) -> (Option<i32>, String) {
+fn run_gate_command(
+    cwd: &std::path::Path,
+    gate: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> (Option<i32>, String) {
+    use std::io::Read;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    const OUTPUT_CAP: usize = 64 * 1024;
+
+    fn read_tail_capped<R: Read>(reader: &mut R) -> String {
+        let mut kept = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let overflow = kept.len().saturating_add(read).saturating_sub(OUTPUT_CAP);
+                    if overflow > 0 {
+                        kept.drain(..overflow);
+                    }
+                    kept.extend_from_slice(&chunk[..read]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&kept).into_owned()
+    }
+
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(gate);
         c
     } else {
         let mut c = Command::new("sh");
-        c.arg("-c").arg(gate);
+        // Keep the shell alive briefly while its EXIT trap runs so the parent
+        // can observe direct background children before Unix reparents them.
+        // The gate remains in an environment value so its own positional
+        // parameters retain the same meaning as a plain `sh -c` invocation.
+        c.env("LUVUS_GATE_COMMAND", gate).args([
+            "-c",
+            "trap 'sleep 0.05' EXIT; eval \"unset LUVUS_GATE_COMMAND; $LUVUS_GATE_COMMAND\"",
+        ]);
         c
     };
     cmd.current_dir(cwd)
@@ -2306,13 +3316,82 @@ fn run_gate_command(cwd: &std::path::Path, gate: &str) -> (Option<i32>, String) 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::platform::no_window(&mut cmd);
-    match cmd.output() {
-        Ok(o) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
-            s.push_str(&String::from_utf8_lossy(&o.stderr));
-            (o.status.code(), s)
+    crate::platform::suspend_for_child_tree(&mut cmd);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => return (None, format!("failed to run gate: {error}")),
+    };
+    let mut tree_guard = match crate::platform::ChildTreeGuard::attach(&mut child) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return (None, format!("failed to contain gate process: {error}"));
         }
-        Err(e) => (None, format!("failed to run gate: {e}")),
+    };
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let stdout =
+        std::thread::spawn(move || stdout.as_mut().map(read_tail_capped).unwrap_or_default());
+    let stderr =
+        std::thread::spawn(move || stderr.as_mut().map(read_tail_capped).unwrap_or_default());
+
+    let (status, was_cancelled) = loop {
+        tree_guard.refresh_descendants();
+        if cancelled.load(Ordering::Acquire) {
+            tree_guard.terminate();
+            let _ = child.kill();
+            break (child.wait(), true);
+        }
+        #[cfg(unix)]
+        match crate::platform::child_exited_unreaped(&child) {
+            Ok(true) => {
+                // Keep the exited shell waitable until its original process
+                // group is gone. Reaping first would allow the group ID to be
+                // reused before cleanup can safely signal it.
+                if let Err(error) = tree_guard.terminate_unreaped_root(&child) {
+                    break (Err(error), false);
+                }
+                break (child.wait(), false);
+            }
+            Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => break (Err(error), false),
+        }
+        #[cfg(not(unix))]
+        match child.try_wait() {
+            Ok(Some(status)) => break (Ok(status), false),
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => break (Err(error), false),
+        }
+    };
+
+    // A shell may exit after leaving descendants behind. End the contained
+    // group before joining the pipe readers so a background child cannot keep
+    // this gate registered forever.
+    tree_guard.terminate();
+    let mut out = stdout.join().unwrap_or_default();
+    out.push_str(&stderr.join().unwrap_or_default());
+    if was_cancelled {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("gate cancelled");
+        return (None, out);
+    }
+    match status {
+        Ok(status) => (status.code(), out),
+        Err(error) => {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!("failed to wait for gate: {error}"));
+            (None, out)
+        }
     }
 }
 
@@ -2489,8 +3568,16 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         app.create_workspace_at(repo.clone()); // the repo becomes the active workspace
+        let project = app.task_project_at(app.active_ws).unwrap();
         app.orch
-            .add_task("auth".into(), vec!["src/auth/**".into()], vec![], None)
+            .add_task_with_prompt_in_project(
+                "auth".into(),
+                None,
+                vec!["src/auth/**".into()],
+                vec![],
+                None,
+                Some(project),
+            )
             .unwrap();
 
         let started = app
@@ -2524,6 +3611,66 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn task_start_without_focus_preserves_the_view_while_opening_a_worktree() {
+        let _env = crate::persist::test_env("orch-start-no-focus");
+        let base = crate::persist::config_dir().join("no-focus-repo");
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert!(app.create_workspace_at(base));
+        let original_workspace = app.ws().id.clone();
+        let original_tab = app.ws().tabs[app.ws().active_tab].id.clone();
+        let original_pane = app.layout().focus;
+        app.zoomed = true;
+        app.orch
+            .add_task("background".into(), vec![], vec![], None)
+            .unwrap();
+
+        let started = app
+            .task_start_with_focus(
+                "t1",
+                None,
+                None,
+                TaskWorkerMode::Worktree,
+                Some(original_workspace.clone()),
+                false,
+            )
+            .unwrap();
+
+        assert_ne!(started.workspace_id, original_workspace);
+        assert_eq!(app.ws().id, original_workspace);
+        assert_eq!(app.ws().tabs[app.ws().active_tab].id, original_tab);
+        assert_eq!(app.layout().focus, original_pane);
+        assert!(app.zoomed);
+        assert!(app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == started.workspace_id));
+        assert_eq!(app.orch.task("t1").unwrap().assignee, Some(started.pane.0));
     }
 
     #[test]
@@ -2562,6 +3709,161 @@ mod tests {
         );
         let task = app.orch.task("t2").unwrap();
         assert_eq!(task.status, crate::orch::TaskStatus::Queued);
+        assert_eq!(task.assignee, None);
+    }
+
+    #[test]
+    fn failed_agent_submit_rolls_back_new_worktree_and_selection() {
+        let _env = crate::persist::test_env("orch-start-submit-rollback");
+        let base = crate::persist::config_dir().join("submit-rollback-repo");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert!(app.create_workspace_at(base.clone()));
+        let original_workspace = app.ws().id.clone();
+        let original_tab = app.ws().tabs[app.ws().active_tab].id.clone();
+        let original_pane = app.layout().focus;
+        let workspace_count = app.workspaces.len();
+        let pane_count = app.panes.len();
+        let project = app.task_project_at(app.active_ws).unwrap();
+        app.orch
+            .add_task_with_prompt_in_project(
+                "rollback".into(),
+                None,
+                vec![],
+                vec![],
+                None,
+                Some(project),
+            )
+            .unwrap();
+
+        let error = app
+            .task_start_impl_with_submit(
+                "t1",
+                None,
+                Some("codex".into()),
+                TaskWorkerMode::Worktree,
+                None,
+                None,
+                |_pane, _line| Err("injected submit failure".into()),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.0, "send_failed");
+        assert_eq!(error.1, "injected submit failure");
+        assert_eq!(app.workspaces.len(), workspace_count);
+        assert_eq!(app.panes.len(), pane_count);
+        assert_eq!(app.ws().id, original_workspace);
+        assert_eq!(app.ws().tabs[app.ws().active_tab].id, original_tab);
+        assert_eq!(app.layout().focus, original_pane);
+        assert!(!crate::git::local::branch_exists(&base, "luvus/t1"));
+        assert!(crate::git::local::worktrees(&base)
+            .unwrap()
+            .iter()
+            .all(|worktree| worktree.branch.as_deref() != Some("luvus/t1")));
+        let task = app.orch.task("t1").unwrap();
+        assert_eq!(task.status, TaskStatus::Queued);
+        assert_eq!(task.assignee, None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn failed_agent_submit_does_not_close_a_reused_worker() {
+        let _env = crate::persist::test_env("orch-start-reused-rollback");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let workspace_id = app.ws().id.clone();
+        let tab_id = app.ws().tabs[app.ws().active_tab].id.clone();
+        let root = app.ws().cwd.display().to_string();
+        app.orch
+            .add_task("reuse".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch.bind_workspace(
+            "t1",
+            WorkspaceWorkerBinding {
+                workspace_id,
+                tab_id,
+                root,
+            },
+        );
+
+        let error = app
+            .task_start_impl_with_submit(
+                "t1",
+                None,
+                Some("codex".into()),
+                TaskWorkerMode::Workspace,
+                None,
+                None,
+                |_pane, _line| Err("injected submit failure".into()),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.0, "send_failed");
+        assert!(app.panes.contains_key(&pane));
+        assert_eq!(app.layout().focus, pane);
+        assert_eq!(app.orch.task("t1").unwrap().status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn post_submit_failure_releases_claim_and_prepared_resources() {
+        let _env = crate::persist::test_env("orch-start-finalize-rollback");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let original_pane = app.layout().focus;
+        let original_tabs = app.ws().tabs.len();
+        app.orch
+            .add_task("finalize rollback".into(), vec![], vec![], None)
+            .unwrap();
+        let task = app.orch.task("t1").unwrap().clone();
+        let selection = app.task_start_selection();
+        let prepared = app.start_task_workspace(&task, None).unwrap();
+        let worker = prepared.result.pane;
+        crate::orch::worker::stage(worker, "t1", "codex", "briefing").unwrap();
+        app.orch.claim("t1", worker.0).unwrap();
+        app.orch.set_status("t1", TaskStatus::Running).unwrap();
+
+        let error = app.fail_prepared_task_start(
+            "t1",
+            prepared,
+            &selection,
+            true,
+            "injected_finalize_failure".into(),
+            "injected finalize failure".into(),
+        );
+
+        assert_eq!(error.0, "injected_finalize_failure");
+        assert_eq!(error.1, "injected finalize failure");
+        assert_eq!(app.ws().tabs.len(), original_tabs);
+        assert_eq!(app.layout().focus, original_pane);
+        assert!(!app.panes.contains_key(&worker));
+        assert!(!crate::orch::worker::staged_for_test(worker));
+        let task = app.orch.task("t1").unwrap();
+        assert_eq!(task.status, TaskStatus::Queued);
         assert_eq!(task.assignee, None);
     }
 
@@ -2645,7 +3947,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_restart_honors_an_explicit_different_workspace() {
+    fn workspace_restart_rejects_an_explicit_different_project() {
         let _env = crate::persist::test_env("orch-workspace-retarget");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -2672,7 +3974,7 @@ mod tests {
             .unwrap();
         app.orch.release_task("t1").unwrap();
 
-        let restarted = app
+        let error = app
             .task_start(
                 "t1",
                 None,
@@ -2680,11 +3982,9 @@ mod tests {
                 TaskWorkerMode::Workspace,
                 Some(second_workspace.clone()),
             )
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(restarted.workspace_id, second_workspace);
-        assert_ne!(restarted.tab_id, first.tab_id);
-        assert_ne!(restarted.pane, first.pane);
+        assert_eq!(error.0, "workspace_mismatch");
         let binding = app
             .orch
             .task("t1")
@@ -2692,8 +3992,9 @@ mod tests {
             .workspace_worker
             .as_ref()
             .unwrap();
-        assert_eq!(binding.workspace_id, restarted.workspace_id);
-        assert_eq!(binding.tab_id, restarted.tab_id);
+        assert_eq!(binding.workspace_id, first_workspace);
+        assert_eq!(binding.tab_id, first.tab_id);
+        assert_eq!(app.orch.task("t1").unwrap().assignee, None);
         assert!(app
             .workspaces
             .iter()
@@ -2919,8 +4220,16 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         app.create_workspace_at(repo.clone());
+        let project = app.task_project_at(app.active_ws).unwrap();
         app.orch
-            .add_task("auth".into(), vec![], vec![], None)
+            .add_task_with_prompt_in_project(
+                "auth".into(),
+                None,
+                vec![],
+                vec![],
+                None,
+                Some(project),
+            )
             .unwrap();
 
         let path = app
@@ -3228,9 +4537,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_launch_line_is_one_quoted_line_with_the_contract() {
+    fn manual_agent_launch_keeps_the_briefing_out_of_the_shell_line() {
         let mut s = crate::orch::OrchState::default();
-        let t = s
+        let mut t = s
             .add_task(
                 "fix the auth's bug".into(),
                 vec!["src/auth/**".into()],
@@ -3238,20 +4547,128 @@ mod tests {
                 Some("cargo test auth".into()),
             )
             .unwrap();
-        let line = agent_launch_line("claude", &t, TaskWorkerMode::Worktree).unwrap();
-        assert!(!line.contains('\n'), "typed into a shell — one line");
-        assert!(line.contains("claude"));
-        assert!(line.contains("luvus task done t1"));
+        t.prompt = Some("Review the contract.\nInclude rollback risks.".into());
+        t.notes
+            .push("First investigation line.\nSecond investigation line.".into());
+        let briefing = task_briefing(&t, TaskWorkerMode::Worktree);
+        assert!(briefing.contains("Review the contract.\nInclude rollback risks."));
+        assert!(briefing.contains(
+            "Note from earlier work:\nFirst investigation line.\nSecond investigation line."
+        ));
+        assert!(briefing.contains("fix the auth's bug"));
+        assert!(briefing.contains("luvus task done t1"));
+        assert!(briefing.contains("LUVUS_BIN_PATH"));
+        assert!(briefing.contains("cargo test auth"));
+        assert!(briefing.contains("--context-used <0..1>"));
+        assert!(briefing.contains("not 60% task progress"));
+        assert!(!briefing.contains("--context <0..1>"));
+
+        let TaskAgentLaunch::Manual { agent, briefing } =
+            manual_agent_launch("claude", &t, TaskWorkerMode::Worktree).unwrap()
+        else {
+            panic!("manual launch must use the private runner")
+        };
+        let line = manual_agent_runner_line("zsh");
+        assert!(!line.contains('\n'), "the shell receives one short line");
+        assert!(line.contains("__task-worker"));
         assert!(line.contains("LUVUS_BIN_PATH"));
-        assert!(line.contains("cargo test auth"));
-        assert!(line.contains("--context-used <0..1>"));
-        assert!(line.contains("not 60% task progress"));
-        assert!(!line.contains("--context <0..1>"));
-        if !cfg!(windows) {
-            assert!(line.starts_with("LUVUS_TASK_ID=t1 "));
-            // The apostrophe in the title survives POSIX single-quoting.
-            assert!(line.contains(r"auth'\''s"));
+        assert!(line.len() < 1024, "runner line remains below TTY limits");
+        assert!(!line.contains("Review the contract"));
+        assert_eq!(agent, "claude");
+        assert!(briefing.contains("Review the contract.\nInclude rollback risks."));
+    }
+
+    #[test]
+    fn task_agent_launch_queues_text_and_enter_as_one_submit() {
+        let _env = crate::persist::test_env("orch-agent-submit");
+        let (app_tx, _app_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, app_tx).unwrap();
+        let pane = app.layout().focus;
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .replace_input_sender_for_test(input_tx);
+
+        let line = "claude 'review the contract'";
+        submit_agent_launch(app.panes.get(&pane).unwrap(), line).unwrap();
+        match input_rx.recv().unwrap() {
+            crate::terminal::pty::InputAction::Submit { paste, settle } => {
+                assert!(
+                    paste
+                        .windows(line.len())
+                        .any(|window| window == line.as_bytes()),
+                    "the complete launch line is kept in the atomic submit"
+                );
+                assert!(!settle.is_zero(), "Enter is settled after the command text");
+            }
+            crate::terminal::pty::InputAction::Bytes(_) => {
+                panic!("task launch must not split command text and Enter")
+            }
         }
+        assert!(input_rx.try_recv().is_err(), "only one action is queued");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_prompted_task_start_queues_only_a_short_deferred_shell_command() {
+        let _env = crate::persist::test_env("orch-prompted-start");
+        let (app_tx, _app_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, app_tx).unwrap();
+        let workspace_id = app.ws().id.clone();
+        let prompt = format!("ORCH-LONG-PROMPT\n{}", "x".repeat(8 * 1024));
+        app.orch
+            .add_task_with_prompt("Prompt delivery".into(), Some(prompt), vec![], vec![], None)
+            .unwrap();
+
+        let submitted = std::cell::RefCell::new(String::new());
+        // Exercise the real deferred PTY while recording the production launch
+        // line. The test process cannot re-enter `main` as `__task-worker`, so a
+        // short echo is substituted only for this shell-execution assertion.
+        let started = app
+            .task_start_impl_with_submit(
+                "t1",
+                None,
+                Some("echo".into()),
+                TaskWorkerMode::Workspace,
+                Some(workspace_id),
+                None,
+                |pane, line| {
+                    submitted.replace(line.to_string());
+                    pane.try_submit_text("echo ORCH-RUNNER-WAS-SUBMITTED")
+                },
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let text = app
+                .panes
+                .get(&started.pane)
+                .unwrap()
+                .engine
+                .lock()
+                .unwrap()
+                .detection_text(200);
+            let unwrapped = text.replace('\n', "");
+            if unwrapped.contains("ORCH-RUNNER-WAS-SUBMITTED") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the prompted task command was not submitted to its shell; terminal text:\n{text}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let submitted = submitted.into_inner();
+        assert!(submitted.contains("__task-worker"));
+        assert!(submitted.len() < 1024, "{submitted}");
+        assert!(!submitted.contains("ORCH-LONG-PROMPT"));
+        assert!(!submitted.contains(&"x".repeat(4096)));
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Running
+        );
+        app.close_pane(started.pane);
     }
 
     #[test]
@@ -3262,9 +4679,9 @@ mod tests {
         app.orch
             .add_task("safe title".into(), vec![], vec![], None)
             .unwrap();
-        app.orch
-            .set_prompt("t1", Some("review this\rwhoami".into()))
-            .unwrap();
+        // Simulate a ledger written by an older version before task text was
+        // validated on mutation. Launch still fails closed at the PTY boundary.
+        app.orch.tasks[0].prompt = Some("review this\rwhoami".into());
         let panes_before = app.panes.len();
 
         let error = app
@@ -3291,17 +4708,21 @@ mod tests {
             ("aider", "aider --message"),
             ("amp", "amp --execute"),
             ("antigravity", "agy -p"),
+            ("arc-studio", "arc-studio"),
             ("claude", "claude"),
             ("codex", "codex"),
             ("copilot", "copilot --interactive"),
             ("cursor", "cursor-agent"),
+            ("devin", "devin --"),
             ("droid", "droid"),
             ("fx", "fx ask --prompt-permissions"),
             ("gemini", "gemini --prompt-interactive"),
             ("grok", "grok"),
             ("hermes", "hermes --oneshot"),
             ("kimi", "kimi --prompt"),
+            ("kilo", "kilo --prompt"),
             ("kiro", "kiro-cli"),
+            ("letta", "letta -p"),
             ("muse", "muse"),
             ("omp", "omp"),
             ("opencode", "opencode --prompt"),
@@ -3310,7 +4731,12 @@ mod tests {
         ];
         assert_eq!(expected.len(), crate::agent::registry::descriptors().len());
         for (agent, command) in expected {
-            assert_eq!(agent_task_command(agent), command, "{agent}");
+            let descriptor = crate::agent::registry::find(agent).unwrap();
+            let actual = std::iter::once(descriptor.launch_command)
+                .chain(descriptor.task_prompt_args.iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(actual, command, "{agent}");
         }
     }
 
@@ -3326,6 +4752,27 @@ mod tests {
             agent_automation_command("fx", AutomationAccess::Workspace).unwrap(),
             "fx ask --auto"
         );
+        assert_eq!(
+            agent_automation_command("kilo", AutomationAccess::FullAccess).unwrap(),
+            "kilo run --auto"
+        );
+        assert!(agent_automation_command("kilo", AutomationAccess::ReadOnly).is_err());
+        assert!(agent_automation_command("kilo", AutomationAccess::Workspace).is_err());
+        assert_eq!(
+            agent_automation_command("opencode2", AutomationAccess::FullAccess).unwrap(),
+            "opencode run --auto"
+        );
+        assert!(agent_automation_command("opencode2", AutomationAccess::ReadOnly).is_err());
+        assert!(agent_automation_command("opencode2", AutomationAccess::Workspace).is_err());
+        assert_eq!(
+            agent_automation_command("devin", AutomationAccess::ReadOnly).unwrap(),
+            "devin --respect-workspace-trust false --permission-mode auto -p"
+        );
+        assert_eq!(
+            agent_automation_command("devin", AutomationAccess::FullAccess).unwrap(),
+            "devin --respect-workspace-trust false --permission-mode dangerous -p"
+        );
+        assert!(agent_automation_command("devin", AutomationAccess::Workspace).is_err());
         assert!(agent_automation_command("aider", AutomationAccess::Workspace).is_err());
         assert!(agent_automation_command("antigravity", AutomationAccess::Workspace).is_err());
 
@@ -3348,13 +4795,130 @@ mod tests {
             )
             .unwrap();
         let task = state.task(&task.id).unwrap();
-        let line =
+        let launch =
             automation_agent_launch_line("codex", task, AutomationAccess::Workspace).unwrap();
+        let line = launch.line("pwsh");
         assert!(line.contains("__automation-worker t1 automation_1 run_1"));
         assert!(!line.contains("LUVUS_BIN_PATH"));
         assert!(!line.contains("review safely"));
         assert!(!line.contains("luvus task done"));
         assert!(!line.contains("codex exec"));
+    }
+
+    fn worker_launch(executable: &str) -> AutomationWorkerLaunch {
+        AutomationWorkerLaunch {
+            executable: executable.into(),
+            task_id: "t1".into(),
+            automation_id: "automation_1".into(),
+            run_id: "run_1".into(),
+        }
+    }
+
+    #[test]
+    fn worker_shell_classifies_configured_windows_shells() {
+        for shell in [
+            "pwsh",
+            "pwsh.exe",
+            "PWSH.EXE",
+            "powershell",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+        ] {
+            assert_eq!(
+                WorkerShell::classify(shell),
+                WorkerShell::PowerShell,
+                "{shell}"
+            );
+        }
+        for shell in ["cmd", "cmd.exe", r"C:\Windows\System32\cmd.exe"] {
+            assert_eq!(WorkerShell::classify(shell), WorkerShell::Cmd, "{shell}");
+        }
+        for shell in ["bash", "/bin/zsh", "fish", "nu", ""] {
+            assert_eq!(WorkerShell::classify(shell), WorkerShell::Posix, "{shell}");
+        }
+        if !cfg!(windows) {
+            assert_eq!(WorkerShell::of("pwsh"), WorkerShell::Posix);
+        }
+    }
+
+    #[test]
+    fn automation_worker_line_uses_the_powershell_call_operator() {
+        let launch = worker_launch(r"C:\Program Files\Luvus\luvus.exe");
+        assert_eq!(
+            launch.line_for(WorkerShell::PowerShell, false),
+            r"& 'C:\Program Files\Luvus\luvus.exe' __automation-worker t1 automation_1 run_1"
+        );
+        // A single-quoted PowerShell string expands nothing, and doubling is
+        // its only escape, so `$`, backticks, and quotes stay literal.
+        let launch = worker_launch(r"C:\Users\O'Neil $x `y\luvus.exe");
+        assert_eq!(
+            launch.line_for(WorkerShell::PowerShell, false),
+            r"& 'C:\Users\O''Neil $x `y\luvus.exe' __automation-worker t1 automation_1 run_1"
+        );
+        let mut odd = worker_launch(r"C:\luvus.exe");
+        odd.run_id = "run 1;rm".into();
+        odd.automation_id = "it\u{2019}s".into();
+        assert_eq!(
+            odd.line_for(WorkerShell::PowerShell, false),
+            "& 'C:\\luvus.exe' __automation-worker t1 'it\u{2019}\u{2019}s' 'run 1;rm'"
+        );
+    }
+
+    #[test]
+    fn automation_worker_line_for_cmd_quotes_without_call_operator() {
+        let launch = worker_launch(r"C:\Program Files\Luvus\luvus.exe");
+        assert_eq!(
+            launch.line_for(WorkerShell::Cmd, false),
+            r#""C:\Program Files\Luvus\luvus.exe" __automation-worker t1 automation_1 run_1"#
+        );
+        let mut odd = worker_launch(r"C:\luvus.exe");
+        odd.run_id = "run 1&x".into();
+        assert_eq!(
+            odd.line_for(WorkerShell::Cmd, false),
+            r#""C:\luvus.exe" __automation-worker t1 automation_1 "run 1&x""#
+        );
+    }
+
+    #[test]
+    fn automation_worker_line_for_posix_shells_single_quotes() {
+        let launch = worker_launch("/opt/my luvus/it's/luvus");
+        assert_eq!(
+            launch.line_for(WorkerShell::Posix, true),
+            r"LUVUS_TASK_ID=t1 '/opt/my luvus/it'\''s/luvus' __automation-worker t1 automation_1 run_1"
+        );
+        // Git Bash on Windows keeps the prefix-free form used before.
+        assert_eq!(
+            worker_launch(r"C:\Program Files\Luvus\luvus.exe").line_for(WorkerShell::Posix, false),
+            r"'C:\Program Files\Luvus\luvus.exe' __automation-worker t1 automation_1 run_1"
+        );
+        let mut odd = worker_launch("/bin/luvus");
+        odd.task_id = "t 1".into();
+        assert_eq!(
+            odd.line_for(WorkerShell::Posix, true),
+            "LUVUS_TASK_ID='t 1' '/bin/luvus' __automation-worker 't 1' automation_1 run_1"
+        );
+    }
+
+    #[test]
+    fn manual_runner_line_matches_the_shell_family() {
+        if cfg!(windows) {
+            assert_eq!(
+                manual_agent_runner_line("pwsh"),
+                "& \"$env:LUVUS_BIN_PATH\" __task-worker"
+            );
+            assert_eq!(
+                manual_agent_runner_line("powershell.exe"),
+                "& \"$env:LUVUS_BIN_PATH\" __task-worker"
+            );
+            assert_eq!(
+                manual_agent_runner_line("cmd.exe"),
+                "\"%LUVUS_BIN_PATH%\" __task-worker"
+            );
+        }
+        assert_eq!(
+            manual_agent_runner_line("bash"),
+            "\"$LUVUS_BIN_PATH\" __task-worker"
+        );
     }
 
     #[test]
@@ -3363,8 +4927,7 @@ mod tests {
         let agents = &choices[..choices.len() - 1];
         assert_eq!(
             agents.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            crate::agent::registry::descriptors()
-                .iter()
+            crate::agent::registry::local_task_descriptors()
                 .map(|descriptor| descriptor.id)
                 .collect::<Vec<_>>()
         );
@@ -3374,21 +4937,80 @@ mod tests {
         assert!(choices.contains(&("kiro", Some("kiro"))));
         assert_eq!(
             task_agent_choices(),
-            crate::agent::registry::descriptors()
-                .iter()
+            crate::agent::registry::local_task_descriptors()
                 .map(|descriptor| descriptor.id)
                 .collect::<Vec<_>>()
         );
+        assert!(!task_agent_choices().contains(&"arc-studio"));
     }
 
     #[test]
     fn gate_command_runner_reports_exit_and_output() {
-        let dir = std::env::temp_dir();
-        assert_eq!(run_gate_command(&dir, "exit 0").0, Some(0));
-        assert_eq!(run_gate_command(&dir, "exit 7").0, Some(7));
-        let (code, out) = run_gate_command(&dir, "echo hello");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(run_gate_command(dir, "exit 0", &cancelled).0, Some(0));
+        assert_eq!(run_gate_command(dir, "exit 7", &cancelled).0, Some(7));
+        let (code, out) = run_gate_command(dir, "echo hello", &cancelled);
         assert_eq!(code, Some(0));
         assert!(out.contains("hello"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn gate_command_runner_terminates_a_detached_session() {
+        let executable =
+            WorkerShell::Posix.quote(&std::env::current_exe().unwrap().to_string_lossy());
+        let command = format!(
+            "LUVUS_GATE_DETACH_HELPER=1 {executable} --exact app::board::tests::gate_detached_child_helper & sleep 0.05; exit 0"
+        );
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            let (code, out) = run_gate_command(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+                &command,
+                &cancelled,
+            );
+            assert_eq!(code, Some(0));
+            assert!(out.contains("detached-helper-ready"));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "an escaped descendant kept the gate output pipe open"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn gate_detached_child_helper() {
+        use std::io::Write;
+
+        if std::env::var_os("LUVUS_GATE_DETACH_HELPER").is_none() {
+            return;
+        }
+        assert!(unsafe { libc::setsid() } >= 0);
+        writeln!(std::io::stdout(), "detached-helper-ready").unwrap();
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn gate_command_cancellation_terminates_the_process_tree() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let command = if cfg!(windows) {
+            "ping -n 31 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let started = std::time::Instant::now();
+        let (code, out) = run_gate_command(dir, command, &cancelled);
+        assert_eq!(code, None);
+        assert!(out.contains("gate cancelled"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancellation must not wait for the gate command"
+        );
     }
 
     #[test]
@@ -3417,12 +5039,21 @@ mod tests {
             .unwrap();
         app.orch.claim("t1", focus.0).unwrap();
         assert_eq!(app.complete_task("t1"), Ok(true));
+        let passing_run = app.task_gates_inflight["t1"].run;
+        assert_eq!(
+            app.complete_task("t1"),
+            Err((
+                "gate_running".into(),
+                "quality gate is already running for t1".into()
+            ))
+        );
         assert_eq!(
             app.orch.task("t1").unwrap().status,
             crate::orch::TaskStatus::Running
         );
         // A passing gate finalizes it to Done.
-        app.task_gate_finished("t1", Some(0), String::new());
+        app.task_gate_finished("t1", passing_run, Some(0), String::new());
+        assert!(!app.task_gates_inflight.contains_key("t1"));
         assert_eq!(
             app.orch.task("t1").unwrap().status,
             crate::orch::TaskStatus::Done
@@ -3432,10 +5063,231 @@ mod tests {
         app.orch
             .add_task("y".into(), vec![], vec![], Some("false".into()))
             .unwrap();
-        app.task_gate_finished("t2", Some(1), "boom\n".into());
+        assert_eq!(app.complete_task("t2"), Ok(true));
+        let failing_run = app.task_gates_inflight["t2"].run;
+        app.task_gate_finished("t2", failing_run, Some(1), "boom\n".into());
         let t2 = app.orch.task("t2").unwrap();
         assert_eq!(t2.status, crate::orch::TaskStatus::Review);
         assert!(t2.outputs.iter().any(|o| o.contains("gate failed")));
+    }
+
+    #[test]
+    fn stale_gate_result_cannot_finish_a_retried_attempt() {
+        let _env = crate::persist::test_env("gate-retry-fence");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("retry".into(), vec![], vec![], Some("true".into()))
+            .unwrap();
+
+        assert_eq!(app.complete_task("t1"), Ok(true));
+        let first_run = app.task_gates_inflight["t1"].run;
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Review)
+            .unwrap();
+        let retry = app.retry_task("t1").unwrap();
+        assert!(matches!(retry, TaskRetryResult::Task(_)));
+        assert!(app.task_gates_inflight["t1"]
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            app.complete_task("t1"),
+            Err((
+                "gate_running".into(),
+                "quality gate is stopping for t1".into()
+            ))
+        );
+
+        app.task_gate_finished("t1", first_run, None, "gate cancelled".into());
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Queued
+        );
+
+        assert_eq!(app.complete_task("t1"), Ok(true));
+        let second_run = app.task_gates_inflight["t1"].run;
+        assert_ne!(second_run, first_run);
+        app.task_gate_finished("t1", first_run, Some(0), String::new());
+        assert_eq!(
+            app.task_gates_inflight.get("t1").map(|active| active.run),
+            Some(second_run)
+        );
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Running
+        );
+        app.task_gate_finished("t1", second_run, Some(0), String::new());
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Done
+        );
+    }
+
+    /// Issue #429, cause 2: a second `task done` while the first gate is still
+    /// running must not start another gate for the same task.
+    #[test]
+    fn a_second_done_while_a_gate_runs_is_refused() {
+        let _env = crate::persist::test_env("gate-429-second-done");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("gate race".into(), vec![], vec![], Some("true".into()))
+            .unwrap();
+
+        assert_eq!(app.complete_task("t1"), Ok(true));
+        let first_run = app.task_gates_inflight["t1"].run;
+        assert_eq!(
+            app.complete_task("t1"),
+            Err((
+                "gate_running".into(),
+                "quality gate is already running for t1".into()
+            ))
+        );
+        assert_eq!(
+            app.task_gates_inflight["t1"].run, first_run,
+            "the refused call must not replace the running gate"
+        );
+
+        app.task_gate_finished("t1", first_run, Some(0), String::new());
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Done
+        );
+        assert!(app.task_gates_inflight.is_empty());
+    }
+
+    /// Issue #429, cause 1: a gate result that lands after its task merged must
+    /// leave the task merged. A failing result used to reopen it for review,
+    /// and a passing one must not re-complete it either. Neither may add a
+    /// "gate failed" note to a task that was integrated.
+    #[test]
+    fn a_gate_result_after_merge_leaves_the_task_merged() {
+        for (code, outcome) in [(Some(1), "failing"), (Some(0), "passing")] {
+            let _env = crate::persist::test_env("gate-429-after-merge");
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let mut app = App::new(80, 24, tx).unwrap();
+            app.orch
+                .add_task("gate race".into(), vec![], vec![], Some("true".into()))
+                .unwrap();
+            assert_eq!(app.complete_task("t1"), Ok(true));
+            let run = app.task_gates_inflight["t1"].run;
+            let outputs_before = app.orch.task("t1").unwrap().outputs.len();
+
+            // The task is integrated while this gate is still in flight.
+            app.orch
+                .set_status("t1", crate::orch::TaskStatus::Merged)
+                .unwrap();
+            app.task_gate_finished("t1", run, code, "late gate output".into());
+
+            let task = app.orch.task("t1").unwrap();
+            assert_eq!(
+                task.status,
+                crate::orch::TaskStatus::Merged,
+                "a late {outcome} gate changed a merged task"
+            );
+            assert_eq!(
+                task.outputs.len(),
+                outputs_before,
+                "a late {outcome} gate annotated a merged task"
+            );
+            assert!(
+                app.task_gates_inflight.is_empty(),
+                "the finished gate must not stay registered"
+            );
+        }
+    }
+
+    #[test]
+    fn releasing_a_task_invalidates_its_running_gate() {
+        let _env = crate::persist::test_env("gate-release-fence");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("release".into(), vec![], vec![], Some("true".into()))
+            .unwrap();
+
+        assert_eq!(app.complete_task("t1"), Ok(true));
+        let released_run = app.task_gates_inflight["t1"].run;
+        app.release_task_to_queue("t1").unwrap();
+        assert!(app.task_gates_inflight["t1"]
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            app.complete_task("t1"),
+            Err((
+                "gate_running".into(),
+                "quality gate is stopping for t1".into()
+            ))
+        );
+        app.task_gate_finished("t1", released_run, None, "gate cancelled".into());
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Queued
+        );
+
+        assert_eq!(app.complete_task("t1"), Ok(true));
+        let current_run = app.task_gates_inflight["t1"].run;
+        app.task_gate_finished("t1", released_run, Some(0), String::new());
+        assert_eq!(
+            app.task_gates_inflight.get("t1").map(|active| active.run),
+            Some(current_run)
+        );
+        app.task_gate_finished("t1", current_run, Some(0), String::new());
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Done
+        );
+    }
+
+    #[test]
+    fn deleting_a_blocked_task_cancels_its_running_gate() {
+        let _env = crate::persist::test_env("gate-delete-fence");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("delete".into(), vec![], vec![], Some("true".into()))
+            .unwrap();
+
+        assert_eq!(app.complete_task("t1"), Ok(true));
+        let run = app.task_gates_inflight["t1"].run;
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Blocked)
+            .unwrap();
+
+        app.orch_cursor = 0;
+        app.orch_action_delete();
+
+        assert!(app.orch.task("t1").is_none());
+        assert!(app.task_gates_inflight["t1"]
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire));
+        app.task_gate_finished("t1", run, None, "gate cancelled".into());
+        assert!(!app.task_gates_inflight.contains_key("t1"));
+        assert!(app.orch.task("t1").is_none());
+    }
+
+    #[test]
+    fn matching_gate_result_settles_a_temporarily_blocked_task() {
+        let _env = crate::persist::test_env("gate-blocked-result");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("blocked".into(), vec![], vec![], Some("false".into()))
+            .unwrap();
+
+        assert_eq!(app.complete_task("t1"), Ok(true));
+        let run = app.task_gates_inflight["t1"].run;
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Blocked)
+            .unwrap();
+        app.task_gate_finished("t1", run, Some(7), "failed while blocked".into());
+
+        let task = app.orch.task("t1").unwrap();
+        assert_eq!(task.status, crate::orch::TaskStatus::Review);
+        assert!(task
+            .outputs
+            .iter()
+            .any(|line| line.contains("failed while blocked")));
     }
 
     #[test]
@@ -3489,6 +5341,20 @@ mod tests {
         for c in "src/auth/**".chars() {
             app.handle_orch_form_key(k(c));
         }
+        for _ in 0..4 {
+            app.handle_orch_form_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.orch_form.as_ref().unwrap().field,
+            crate::app::OrchFormField::Prompt
+        );
+        for c in "Implement token validation".chars() {
+            app.handle_orch_form_key(k(c));
+        }
+        app.handle_orch_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        for c in "Cover rollback behavior".chars() {
+            app.handle_orch_form_key(k(c));
+        }
         app.handle_orch_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(
@@ -3498,6 +5364,10 @@ mod tests {
         let t = app.orch.task("t1").expect("task was created from the UI");
         assert_eq!(t.title, "auth");
         assert_eq!(t.paths, vec!["src/auth/**".to_string()]);
+        assert_eq!(
+            t.prompt.as_deref(),
+            Some("Implement token validation\nCover rollback behavior")
+        );
     }
 
     #[test]
@@ -3717,7 +5587,8 @@ mod tests {
         app.handle_orch_form_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         let form = app.orch_form.as_ref().unwrap();
         assert_eq!(form.access, crate::automation::AutomationAccess::ReadOnly);
-        assert!(automation_agent_choices_for(form.access).contains(&form.agent.as_str()));
+        assert_eq!(form.agent, "fx");
+        assert!(!automation_agent_supports(&form.agent, form.access));
 
         app.orch_activate_hit(crate::app::OrchHit::FormField(
             crate::app::OrchFormField::Access,
@@ -3729,12 +5600,71 @@ mod tests {
     }
 
     #[test]
-    fn automation_prompt_shift_enter_inserts_a_newline_without_submitting() {
+    fn automation_agent_picker_keeps_all_launch_capable_agents_visible() {
+        use crate::automation::AutomationAccess;
+
+        assert_eq!(automation_agent_choices().len(), 19);
+        assert!(automation_agent_choices().contains(&"kilo"));
+        assert!(automation_agent_choices().contains(&"devin"));
+        assert!(automation_agent_choices().contains(&"pi"));
+        assert!(!automation_agent_choices().contains(&"antigravity"));
+        assert!(!automation_agent_choices().contains(&"amp"));
+
+        let mut form = crate::app::OrchForm::for_kind(crate::app::OrchFormKind::Automation);
+        form.access = AutomationAccess::ReadOnly;
+        form.agent = "opencode".into();
+        form.field = crate::app::OrchFormField::Agent;
+        form.cycle_choice(false);
+
+        assert_eq!(form.agent, "copilot");
+        assert_eq!(form.access, AutomationAccess::ReadOnly);
+        assert!(automation_agent_supports(&form.agent, form.access));
+        assert!(automation_agent_supports(
+            "opencode2",
+            AutomationAccess::FullAccess
+        ));
+    }
+
+    #[test]
+    fn automation_form_rejects_an_incompatible_visible_agent() {
+        let _env = crate::persist::test_env("orch-automation-access-mismatch");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.open_orch_board();
+        app.orch_form = Some(crate::app::OrchForm {
+            kind: crate::app::OrchFormKind::Automation,
+            title: "OpenCode review".into(),
+            prompt: "Review the workspace.".into(),
+            agent: "opencode".into(),
+            access: crate::automation::AutomationAccess::ReadOnly,
+            start: crate::app::OrchFormStart::Daily,
+            schedule: "08:00".into(),
+            timezone: "Asia/Makassar".into(),
+            mode: TaskWorkerMode::Workspace,
+            ..crate::app::OrchForm::default()
+        });
+
+        app.submit_orch_form();
+
+        let form = app
+            .orch_form
+            .as_ref()
+            .expect("an invalid access choice keeps the form open");
+        assert!(form
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("does not support read only")));
+        assert!(app.automation.automations.is_empty());
+        assert!(app.orch.tasks.is_empty());
+    }
+
+    #[test]
+    fn task_and_automation_prompt_shift_enter_insert_a_newline_without_submitting() {
         let _env = crate::persist::test_env("orch-form-multiline-prompt");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         app.orch_form = Some(crate::app::OrchForm {
-            kind: crate::app::OrchFormKind::Automation,
+            kind: crate::app::OrchFormKind::Task,
             field: crate::app::OrchFormField::Prompt,
             prompt: "Review the changes".into(),
             ..crate::app::OrchForm::default()
@@ -3748,7 +5678,7 @@ mod tests {
         let form = app
             .orch_form
             .as_ref()
-            .expect("Shift+Enter keeps the automation form open");
+            .expect("Shift+Enter keeps the task form open");
         assert_eq!(form.prompt, "Review the changes\nand report risks");
         assert!(app.automation.automations.is_empty());
         assert!(app.orch.tasks.is_empty());
@@ -3759,6 +5689,10 @@ mod tests {
             "Review the changes\nand report risks\n",
             "Alt+Enter is the ESC-CR fallback used when a terminal cannot report Shift+Enter"
         );
+
+        app.orch_form.as_mut().unwrap().kind = crate::app::OrchFormKind::Automation;
+        app.handle_orch_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert!(app.orch_form.as_ref().unwrap().prompt.ends_with("\n\n"));
     }
 
     #[test]
@@ -3888,6 +5822,7 @@ mod tests {
             "08:00".into(),
             "Asia/Makassar".into(),
             Vec::new(),
+            None,
             None,
         )
         .unwrap();
@@ -4157,12 +6092,57 @@ mod tests {
         assert!(queued.contains(&crate::app::OrchMenuItem::Details));
         assert!(queued.contains(&crate::app::OrchMenuItem::Delete));
         assert!(!queued.contains(&crate::app::OrchMenuItem::Done));
+        assert!(!queued.contains(&crate::app::OrchMenuItem::Retry));
+
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Failed)
+            .unwrap();
+        let failed = app.orch_menu_items("t1");
+        assert!(failed.contains(&crate::app::OrchMenuItem::Retry));
 
         app.open_orch_menu("t1", 4, 4);
         app.orch_cursor = 1;
         app.orch_menu_action(crate::app::OrchMenuItem::CopyId);
         assert_eq!(app.pending_clipboard.as_deref(), Some("t1"));
         assert_eq!(app.orch_cursor, 0, "the menu stayed bound to t1");
+    }
+
+    #[test]
+    fn retry_attempts_receive_a_fresh_default_branch() {
+        let mut state = crate::orch::OrchState::default();
+        let first = state
+            .add_task("branch".into(), vec![], vec![], None)
+            .unwrap();
+        assert_eq!(task_branch_name(&first, None), "luvus/t1");
+        state
+            .set_status("t1", crate::orch::TaskStatus::Failed)
+            .unwrap();
+        let retry = state.retry_task("t1").unwrap();
+        assert_eq!(task_branch_name(&retry, None), "luvus/t1-retry-2");
+        assert_eq!(
+            task_branch_name(&retry, Some("feat/custom".into())),
+            "feat/custom"
+        );
+    }
+
+    #[test]
+    fn retry_detaches_but_does_not_close_the_previous_worker_pane() {
+        let _env = crate::persist::test_env("orch-retry-keeps-pane");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.orch
+            .add_task("retry".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch.claim("t1", pane.0).unwrap();
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Failed)
+            .unwrap();
+
+        let result = app.retry_task("t1").unwrap();
+        assert!(matches!(result, TaskRetryResult::Task(_)));
+        assert!(app.panes.contains_key(&pane));
+        assert_eq!(app.orch.task("t1").unwrap().assignee, None);
     }
 
     #[test]
@@ -4374,5 +6354,485 @@ mod tests {
             app.orch.task("t1").unwrap().status,
             crate::orch::TaskStatus::Done
         );
+    }
+
+    /// A temporary Codex store holding one rollout per session in `cwd`.
+    /// Callers hold `persist::test_env`, which serializes environment edits.
+    struct FakeCodexHome {
+        dir: std::path::PathBuf,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl FakeCodexHome {
+        fn new(tag: &str, cwd: &std::path::Path, sessions: &[&str]) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("luvus-worker-codex-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let day = dir.join("sessions/2026/10/08");
+            std::fs::create_dir_all(&day).unwrap();
+            for id in sessions {
+                let meta = serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": id, "cwd": cwd, "source": "exec"},
+                });
+                std::fs::write(
+                    day.join(format!("rollout-2026-10-08T10-00-00-{id}.jsonl")),
+                    format!("{meta}\n"),
+                )
+                .unwrap();
+            }
+            let previous = std::env::var_os("CODEX_HOME");
+            std::env::set_var("CODEX_HOME", &dir);
+            Self { dir, previous }
+        }
+    }
+
+    impl Drop for FakeCodexHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Start a scheduled worker through the production task-start path, with
+    /// the PTY submit stubbed out so no agent process is launched.
+    fn start_scheduled_worker(app: &mut App, run_id: &str) -> TaskStartResult {
+        let workspace_id = app.ws().id.clone();
+        let task = app
+            .orch
+            .add_task("scheduled".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch
+            .attach_automation(
+                &task.id,
+                "summarize the readme".into(),
+                crate::orch::AutomationProvenance {
+                    automation_id: "a1".into(),
+                    run_id: run_id.into(),
+                    scheduled_at: 10,
+                },
+            )
+            .unwrap();
+        app.task_start_impl_with_submit(
+            &task.id,
+            None,
+            Some("codex".into()),
+            TaskWorkerMode::Workspace,
+            Some(workspace_id),
+            Some(crate::automation::AutomationAccess::ReadOnly),
+            |_pane, _line| Ok(()),
+        )
+        .unwrap()
+    }
+
+    fn report_session(app: &mut App, pane: PaneId, agent: &str, session_id: &str) {
+        let (reply, _r) = std::sync::mpsc::channel();
+        app.handle_api(&crate::ipc::api::ApiRequest {
+            id: "1".into(),
+            method: "pane.report_session".into(),
+            params: serde_json::json!({
+                "pane": pane.0.to_string(),
+                "agent": agent,
+                "session_id": session_id,
+            }),
+            reply,
+        });
+        assert!(
+            app.status[&pane].agent_session.is_some(),
+            "the live report is accepted"
+        );
+    }
+
+    /// The session a snapshot will resume in `pane`. A pane left out of the
+    /// snapshot resumes nothing either.
+    fn saved_session(
+        snap: &crate::persist::SessionSnapshot,
+        pane: PaneId,
+    ) -> Option<(String, String)> {
+        snap.workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| &tab.panes)
+            .find(|(raw, _)| *raw == pane.0)
+            .and_then(|(_, saved)| saved.agent_session.clone())
+    }
+
+    #[test]
+    fn a_scheduled_worker_does_not_save_its_reported_session_for_resume() {
+        let _env = crate::persist::test_env("worker-reported-session");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let worker = start_scheduled_worker(&mut app, "r1").pane;
+
+        report_session(&mut app, worker, "codex", "worker-session");
+
+        let snap = crate::persist::snapshot(&app);
+        assert_eq!(
+            saved_session(&snap, worker),
+            None,
+            "a restart must not reopen the headless run as an interactive session"
+        );
+    }
+
+    #[test]
+    fn a_scheduled_worker_is_not_bound_to_its_discovered_session() {
+        let _env = crate::persist::test_env("worker-discovered-session");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let worker = start_scheduled_worker(&mut app, "r1").pane;
+        let cwd = app.panes[&worker].cwd.clone();
+        let _codex = FakeCodexHome::new("discovered", &cwd, &["worker-exec"]);
+        // Detection identified the finished worker from its screen text.
+        app.status.get_mut(&worker).unwrap().agent = "codex".into();
+
+        let snap = crate::persist::snapshot(&app);
+        assert_eq!(
+            saved_session(&snap, worker),
+            None,
+            "the only session in the worker's directory is still its own run"
+        );
+    }
+
+    #[test]
+    fn an_interactive_pane_does_not_inherit_a_workers_session() {
+        let _env = crate::persist::test_env("worker-session-not-inherited");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let interactive = app.layout().focus;
+        let worker = start_scheduled_worker(&mut app, "r1").pane;
+        let cwd = app.panes[&worker].cwd.clone();
+        assert_eq!(
+            app.panes[&interactive].cwd, cwd,
+            "workspace mode shares the directory"
+        );
+        let _codex = FakeCodexHome::new("not-inherited", &cwd, &["worker-exec"]);
+        app.status.get_mut(&interactive).unwrap().agent = "codex".into();
+
+        // Discovery: the worker's exec rollout is the directory's only session.
+        app.status.get_mut(&worker).unwrap().agent = "codex".into();
+        let snap = crate::persist::snapshot(&app);
+        assert_eq!(saved_session(&snap, interactive), None);
+        assert_eq!(saved_session(&snap, worker), None);
+
+        // Report: the worker's own session stays out of discovery as well.
+        report_session(&mut app, worker, "codex", "worker-exec");
+        let snap = crate::persist::snapshot(&app);
+        assert_eq!(saved_session(&snap, interactive), None);
+        assert_eq!(saved_session(&snap, worker), None);
+    }
+
+    #[test]
+    fn a_restored_scheduled_worker_stays_unbound_when_identified_again() {
+        let _env = crate::persist::test_env("worker-restored-identity");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let started = start_scheduled_worker(&mut app, "r1");
+        let cwd = app.panes[&started.pane].cwd.clone();
+        let _codex = FakeCodexHome::new("restored", &cwd, &["worker-exec"]);
+
+        let snap = crate::persist::snapshot(&app);
+        assert_eq!(saved_session(&snap, started.pane), None);
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        let mut restored = App::from_snapshot(snap, tx2).expect("restore");
+
+        // Pane ids are reallocated on restore; the worker keeps its tab id.
+        let Some(worker) = restored
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .find(|tab| tab.id == started.tab_id)
+            .map(|tab| tab.layout.focus)
+        else {
+            // Leaving the finished worker out of restore also never resumes it.
+            return;
+        };
+        // The restored screen still shows the run, so detection can name the
+        // agent again in the next server lifetime.
+        restored.status.get_mut(&worker).unwrap().agent = "codex".into();
+
+        let snap = crate::persist::snapshot(&restored);
+        assert_eq!(
+            saved_session(&snap, worker),
+            None,
+            "the second restart must not resume the worker either"
+        );
+    }
+
+    #[test]
+    fn closing_a_scheduled_worker_forgets_it() {
+        let _env = crate::persist::test_env("worker-mark-closed");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let worker = start_scheduled_worker(&mut app, "r1").pane;
+        assert!(app.automation_worker_panes.contains(&worker));
+
+        app.close_pane(worker);
+
+        assert!(!app.automation_worker_panes.contains(&worker));
+    }
+
+    #[test]
+    fn a_manual_task_worker_still_saves_its_reported_session() {
+        let _env = crate::persist::test_env("manual-worker-session");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let workspace_id = app.ws().id.clone();
+        app.orch
+            .add_task("manual".into(), vec![], vec![], None)
+            .unwrap();
+        let worker = app
+            .task_start_impl_with_submit(
+                "t1",
+                None,
+                Some("codex".into()),
+                TaskWorkerMode::Workspace,
+                Some(workspace_id),
+                None,
+                |_pane, _line| Ok(()),
+            )
+            .unwrap()
+            .pane;
+
+        report_session(&mut app, worker, "codex", "manual-session");
+
+        let snap = crate::persist::snapshot(&app);
+        assert_eq!(
+            saved_session(&snap, worker),
+            Some(("codex".into(), "manual-session".into())),
+            "interactive ORCH workers keep resuming as before"
+        );
+        crate::orch::worker::discard(worker);
+    }
+
+    #[test]
+    fn a_worktree_scheduled_worker_is_marked_and_not_resumed() {
+        let _env = crate::persist::test_env("worker-worktree-mode");
+        let base = crate::persist::config_dir().join("worker-worktree-repo");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert!(app.create_workspace_at(base.clone()));
+        let workspace_id = app.ws().id.clone();
+        let project = app.task_project_at(app.active_ws).unwrap();
+        let task = app
+            .orch
+            .add_task_with_prompt_in_project(
+                "scheduled".into(),
+                None,
+                vec![],
+                vec![],
+                None,
+                Some(project),
+            )
+            .unwrap();
+        app.orch
+            .attach_automation(
+                &task.id,
+                "summarize the readme".into(),
+                crate::orch::AutomationProvenance {
+                    automation_id: "a1".into(),
+                    run_id: "r1".into(),
+                    scheduled_at: 10,
+                },
+            )
+            .unwrap();
+        let started = app
+            .task_start_impl_with_submit(
+                &task.id,
+                None,
+                Some("codex".into()),
+                TaskWorkerMode::Worktree,
+                Some(workspace_id),
+                Some(crate::automation::AutomationAccess::ReadOnly),
+                |_pane, _line| Ok(()),
+            )
+            .unwrap();
+        assert!(app.automation_worker_panes.contains(&started.pane));
+
+        report_session(&mut app, started.pane, "codex", "worktree-run");
+        let snap = crate::persist::snapshot(&app);
+        assert_eq!(saved_session(&snap, started.pane), None);
+
+        app.close_pane(started.pane);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_failed_scheduled_start_leaves_no_worker_mark() {
+        let _env = crate::persist::test_env("worker-failed-start");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let workspace_id = app.ws().id.clone();
+        let task = app
+            .orch
+            .add_task("scheduled".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch
+            .attach_automation(
+                &task.id,
+                "summarize the readme".into(),
+                crate::orch::AutomationProvenance {
+                    automation_id: "a1".into(),
+                    run_id: "r1".into(),
+                    scheduled_at: 10,
+                },
+            )
+            .unwrap();
+
+        let error = app
+            .task_start_impl_with_submit(
+                &task.id,
+                None,
+                Some("codex".into()),
+                TaskWorkerMode::Workspace,
+                Some(workspace_id),
+                Some(crate::automation::AutomationAccess::ReadOnly),
+                |_pane, _line| Err("injected submit failure".into()),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.0, "send_failed");
+        assert!(app.automation_worker_panes.is_empty());
+    }
+
+    #[test]
+    fn the_worker_mark_is_saved_only_for_workers() {
+        let _env = crate::persist::test_env("worker-mark-serialized");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let interactive = app.layout().focus;
+        let worker = start_scheduled_worker(&mut app, "r1").pane;
+
+        let snap = crate::persist::snapshot(&app);
+        let saved = |pane: PaneId| {
+            snap.workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs)
+                .flat_map(|tab| &tab.panes)
+                .find(|(raw, _)| *raw == pane.0)
+                .map(|(_, saved)| serde_json::to_value(saved).unwrap())
+                .unwrap()
+        };
+        assert_eq!(saved(worker)["automation_worker"], serde_json::json!(true));
+        assert!(
+            saved(interactive).get("automation_worker").is_none(),
+            "ordinary panes keep the existing session.json shape"
+        );
+
+        // A snapshot written before the field existed still loads.
+        let mut legacy = saved(worker);
+        legacy.as_object_mut().unwrap().remove("automation_worker");
+        let legacy: crate::persist::PaneSnap = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.automation_worker);
+    }
+
+    #[test]
+    fn a_restored_worker_keeps_its_mark_across_restarts() {
+        let _env = crate::persist::test_env("worker-mark-restored");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let started = start_scheduled_worker(&mut app, "r1");
+
+        let mut current = app;
+        for restart in 1..=2 {
+            let snap = crate::persist::snapshot(&current);
+            let (tx, _rx) = std::sync::mpsc::channel();
+            current = App::from_snapshot(snap, tx).expect("restore");
+            let worker = current
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs)
+                .find(|tab| tab.id == started.tab_id)
+                .map(|tab| tab.layout.focus)
+                .expect("the worker tab is restored");
+            assert!(
+                current.automation_worker_panes.contains(&worker),
+                "restart {restart} keeps the worker mark"
+            );
+            assert_eq!(current.automation_worker_panes.len(), 1);
+            assert!(current.status[&worker].agent_session.is_none());
+        }
+    }
+
+    #[test]
+    fn a_worker_snapshot_that_names_a_session_does_not_resume_it() {
+        let _env = crate::persist::test_env("worker-mixed-snapshot");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let started = start_scheduled_worker(&mut app, "r1");
+
+        // A hand-edited or mixed-version snapshot carries both.
+        let mut snap = crate::persist::snapshot(&app);
+        for (raw, saved) in snap
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.tabs)
+            .flat_map(|tab| &mut tab.panes)
+        {
+            if *raw == started.pane.0 {
+                assert!(saved.automation_worker);
+                saved.agent_session = Some(("codex".into(), "stale-run".into()));
+            }
+        }
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let restored = App::from_snapshot(snap, tx).expect("restore");
+
+        let worker = restored
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .find(|tab| tab.id == started.tab_id)
+            .map(|tab| tab.layout.focus)
+            .expect("the worker tab is restored");
+        assert!(restored.automation_worker_panes.contains(&worker));
+        assert!(restored.status[&worker].agent_session.is_none());
+        assert_ne!(restored.status[&worker].agent, "codex");
+    }
+
+    #[test]
+    fn an_interactive_pane_keeps_its_own_session_beside_a_reported_worker() {
+        let _env = crate::persist::test_env("worker-reported-beside-owner");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let interactive = app.layout().focus;
+        let worker = start_scheduled_worker(&mut app, "r1").pane;
+        let cwd = app.panes[&worker].cwd.clone();
+        assert_eq!(app.panes[&interactive].cwd, cwd);
+        let _codex = FakeCodexHome::new("beside-owner", &cwd, &["worker-run", "interactive-run"]);
+        app.status.get_mut(&interactive).unwrap().agent = "codex".into();
+        report_session(&mut app, worker, "codex", "worker-run");
+
+        // Before the worker mark existed, the reported run bound the worker and
+        // left the directory's other session to this pane. That must not change.
+        let snap = crate::persist::snapshot(&app);
+        assert_eq!(
+            saved_session(&snap, interactive),
+            Some(("codex".into(), "interactive-run".into()))
+        );
+        assert_eq!(saved_session(&snap, worker), None);
     }
 }

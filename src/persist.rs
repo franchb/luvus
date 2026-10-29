@@ -26,6 +26,24 @@ pub struct SessionSnapshot {
     pub closed_workspace_paths: Vec<PathBuf>,
 }
 
+impl SessionSnapshot {
+    /// Remove every persisted terminal screen while preserving layout and
+    /// resume metadata. Returns whether an older snapshot needs rewriting.
+    pub(crate) fn discard_pane_screens(&mut self) -> bool {
+        let mut discarded = false;
+        for pane in self
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.tabs)
+            .flat_map(|tab| &mut tab.panes)
+            .map(|(_, pane)| pane)
+        {
+            discarded |= pane.screen.take().is_some();
+        }
+        discarded
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct WsSnap {
     #[serde(default = "new_workspace_id")]
@@ -75,6 +93,9 @@ fn new_tab_id() -> String {
 pub struct PaneSnap {
     pub cwd: PathBuf,
     pub command: String,
+    /// UHP terminal label, kept separate from the user-facing agent alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_label: Option<String>,
     /// The pane's live name (`pane name` / `agent name`), so the alias and its
     /// title survive a restart. Re-attached to the pane's new id on restore.
     #[serde(default)]
@@ -88,7 +109,7 @@ pub struct PaneSnap {
     #[serde(default)]
     pub agent_launch: Option<Vec<String>>,
     /// The visible screen as ANSI, replayed on restore.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen: Option<String>,
     /// (module_id, entrypoint) for a module pane (MOD-2), re-spawned on restore.
     #[serde(default)]
@@ -103,6 +124,10 @@ pub struct PaneSnap {
     /// An explicit derived document preview. Source is always re-read.
     #[serde(default)]
     pub preview: Option<PreviewSnap>,
+    /// A scheduled automation worker. It restores as a plain shell and never
+    /// takes a native session for resume, in this or any later server lifetime.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub automation_worker: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -164,6 +189,7 @@ pub(crate) struct TestEnv {
     prev: Option<std::ffi::OsString>,
     prev_session: Option<std::ffi::OsString>,
     prev_socket: Option<std::ffi::OsString>,
+    prev_luvus_env: Option<std::ffi::OsString>,
     dir: PathBuf,
 }
 
@@ -182,6 +208,10 @@ impl Drop for TestEnv {
             Some(value) => std::env::set_var("LUVUS_SOCKET_PATH", value),
             None => std::env::remove_var("LUVUS_SOCKET_PATH"),
         }
+        match &self.prev_luvus_env {
+            Some(value) => std::env::set_var("LUVUS_ENV", value),
+            None => std::env::remove_var("LUVUS_ENV"),
+        }
         crate::session::clear_explicit_for_test();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -193,6 +223,7 @@ pub(crate) fn test_env(tag: &str) -> TestEnv {
     let prev = std::env::var_os("LUVUS_HOME");
     let prev_session = std::env::var_os(crate::session::SESSION_ENV_VAR);
     let prev_socket = std::env::var_os("LUVUS_SOCKET_PATH");
+    let prev_luvus_env = std::env::var_os("LUVUS_ENV");
     let dir = std::env::temp_dir().join(format!("luvus-test-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::env::set_var("LUVUS_HOME", &dir);
@@ -204,6 +235,7 @@ pub(crate) fn test_env(tag: &str) -> TestEnv {
         prev,
         prev_session,
         prev_socket,
+        prev_luvus_env,
         dir,
     }
 }
@@ -247,12 +279,18 @@ pub struct ServerPidFile;
 impl ServerPidFile {
     pub fn claim() -> Self {
         let pid = std::process::id();
-        let mut body = pid.to_string();
-        if let Some(marker) = crate::platform::process_start_marker(pid) {
-            body.push(' ');
-            body.push_str(&marker);
+        Self::claim_with_marker(pid, crate::platform::process_start_marker(pid))
+    }
+
+    fn claim_with_marker(pid: u32, marker: Option<String>) -> Self {
+        let path = session_dir().join("server.pid");
+        if let Some(marker) = marker {
+            let _ = fs::write(path, format!("{pid} {marker}"));
+        } else {
+            // A PID alone cannot prove a server lifetime. Do not retain a
+            // previous claim when this process cannot be identified safely.
+            let _ = fs::remove_file(path);
         }
-        let _ = fs::write(session_dir().join("server.pid"), body);
         Self
     }
 
@@ -300,6 +338,22 @@ mod server_pid_file_tests {
         assert_eq!(ServerPidFile::read(), None);
         drop(claimed);
     }
+
+    #[test]
+    fn server_pid_file_without_a_start_marker_removes_any_old_claim() {
+        let _env = test_env("server-pid-no-marker");
+        ensure_session_dir();
+        let path = session_dir().join("server.pid");
+        for previous in [None, Some("123"), Some("123 old-marker")] {
+            if let Some(previous) = previous {
+                fs::write(&path, previous).unwrap();
+            }
+            let claimed = ServerPidFile::claim_with_marker(std::process::id(), None);
+            assert!(!path.exists(), "an unidentified claim must not remain");
+            assert_eq!(ServerPidFile::read(), None);
+            drop(claimed);
+        }
+    }
 }
 
 /// Create the selected runtime directory with the same owner-only protection as
@@ -327,6 +381,62 @@ pub fn ensure_server_session_dir() -> std::io::Result<PathBuf> {
     for socket in [socket_path(), client_socket_path()] {
         if let Some(parent) = socket.parent().filter(|parent| *parent != dir) {
             ensure_private_server_dir(parent)?;
+        }
+    }
+    Ok(dir)
+}
+
+/// Create the selected server's private clipboard-image directory.
+///
+/// Image data arrives from an authenticated display client, but the server
+/// still owns the final path. Reusing the server directory validation keeps a
+/// malicious symlink or permissive directory from redirecting staged input.
+pub fn ensure_clipboard_image_dir() -> std::io::Result<PathBuf> {
+    let session = ensure_server_session_dir()?;
+    let dir = session.join("clipboard-images");
+    ensure_private_server_dir(&dir)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let metadata = fs::symlink_metadata(&dir)?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Luvus clipboard storage must be a real directory: {}",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    Ok(dir)
+}
+
+/// Create the selected server's private terminal-upload directory. Browser
+/// clients stream file bytes here before Luvus pastes the resulting remote path
+/// into a terminal. The directory is never supplied by the browser.
+pub fn ensure_terminal_upload_dir() -> std::io::Result<PathBuf> {
+    let session = ensure_server_session_dir()?;
+    let dir = session.join("terminal-uploads");
+    ensure_private_server_dir(&dir)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let metadata = fs::symlink_metadata(&dir)?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Luvus terminal upload storage must be a real directory: {}",
+                    dir.display()
+                ),
+            ));
         }
     }
     Ok(dir)
@@ -504,6 +614,12 @@ struct SessionEvidence {
     out: HashMap<PaneId, Option<(String, String)>>,
     claimed: HashSet<(String, String)>,
     unbound: HashMap<(String, PathBuf), Vec<PaneId>>,
+    /// The live terminal title of each unbound agent pane. An agent that
+    /// names its conversation there can be resolved per pane.
+    titles: HashMap<PaneId, String>,
+    /// Scheduled automation workers. They still count in their discovery
+    /// group, so a pane beside them stays ambiguous, but never take a session.
+    workers: HashSet<PaneId>,
 }
 
 fn capture_session_evidence(app: &App) -> SessionEvidence {
@@ -512,8 +628,26 @@ fn capture_session_evidence(app: &App) -> SessionEvidence {
     let mut ids: Vec<PaneId> = app.status.keys().copied().collect();
     ids.sort_by_key(|p| p.0);
 
+    // Externally managed panes are omitted from the snapshot, but their precise
+    // session IDs must remain claimed while resolving the panes that do restore.
+    // Otherwise discovery could hand the external conversation to another pane.
+    // A scheduled worker's reported run is claimed the same way: its headless
+    // conversation must not move to another pane. Pass 1 then finds it already
+    // claimed and leaves the worker unbound, as it does a duplicate report.
+    for id in &ids {
+        if !app.backend_non_restorable.contains(id) && !app.automation_worker_panes.contains(id) {
+            continue;
+        }
+        if let Some(a) = app.status.get(id).and_then(|s| s.agent_session.as_ref()) {
+            claimed.insert((a.agent.clone(), a.session_id.clone()));
+        }
+    }
+
     // Pass 1: precise, hook-reported sessions take their id outright.
     for id in &ids {
+        if app.backend_non_restorable.contains(id) {
+            continue;
+        }
         if let Some(a) = app.status.get(id).and_then(|s| s.agent_session.as_ref()) {
             let key = (a.agent.clone(), a.session_id.clone());
             if claimed.insert(key.clone()) {
@@ -530,7 +664,11 @@ fn capture_session_evidence(app: &App) -> SessionEvidence {
     // `(agent, cwd)` identifies a set of possible conversations, not a pane.
     // Only a one-pane / one-session group can be recovered safely.
     let mut unbound: HashMap<(String, PathBuf), Vec<PaneId>> = HashMap::new();
+    let mut titles: HashMap<PaneId, String> = HashMap::new();
     for id in ids {
+        if app.backend_non_restorable.contains(&id) {
+            continue;
+        }
         if out.contains_key(&id) {
             continue;
         }
@@ -555,12 +693,17 @@ fn capture_session_evidence(app: &App) -> SessionEvidence {
                 .entry((agent, pane.cwd.clone()))
                 .or_default()
                 .push(id);
+            if let Some(title) = app.agent_session_title(id) {
+                titles.insert(id, title);
+            }
         }
     }
     SessionEvidence {
         out,
         claimed,
         unbound,
+        titles,
+        workers: app.automation_worker_panes.clone(),
     }
 }
 
@@ -569,13 +712,53 @@ fn resolve_pane_sessions(evidence: SessionEvidence) -> HashMap<PaneId, Option<(S
         mut out,
         mut claimed,
         unbound,
+        titles,
+        workers,
     } = evidence;
+    // A pane whose title names its conversation resolves on its own, even
+    // beside other panes of the same agent in the same directory. A session
+    // two panes name, or one already claimed, binds neither.
+    let mut named: HashMap<(String, String), Vec<PaneId>> = HashMap::new();
+    for ((agent, cwd), pane_ids) in &unbound {
+        for id in pane_ids {
+            let session = titles
+                .get(id)
+                .and_then(|title| crate::agent::session_for_title(agent, cwd, title));
+            if let Some(session) = session {
+                named.entry((agent.clone(), session)).or_default().push(*id);
+            }
+        }
+    }
+    for (key, pane_ids) in named {
+        if claimed.contains(&key) {
+            continue;
+        }
+        let [id] = pane_ids[..] else {
+            continue;
+        };
+        // A worker's title still makes a shared name ambiguous above, but it
+        // never resumes the worker's own run.
+        if workers.contains(&id) {
+            continue;
+        }
+        claimed.insert(key.clone());
+        out.insert(id, Some(key));
+    }
     for ((agent, cwd), pane_ids) in unbound {
+        // A group keeps its size after title matches: the pane left beside a
+        // named one is still one of several, so the directory's only other
+        // session is not evidence that it belongs to that pane.
+        if pane_ids.iter().any(|id| out.contains_key(id)) {
+            for id in pane_ids {
+                out.entry(id).or_insert(None);
+            }
+            continue;
+        }
         let sessions: Vec<String> = crate::agent::sessions_for(&agent, &cwd)
             .into_iter()
             .filter(|sid| !claimed.contains(&(agent.clone(), sid.clone())))
             .collect();
-        if pane_ids.len() == 1 && sessions.len() == 1 {
+        if pane_ids.len() == 1 && sessions.len() == 1 && !workers.contains(&pane_ids[0]) {
             let id = pane_ids[0];
             let sid = sessions.into_iter().next().expect("length checked");
             claimed.insert((agent.clone(), sid.clone()));
@@ -642,6 +825,9 @@ pub(crate) fn capture_session(app: &App) -> SessionCapture {
     let evidence = capture_session_evidence(app);
     let mut launch_args = HashMap::new();
     for (id, status) in &app.status {
+        if app.backend_non_restorable.contains(id) {
+            continue;
+        }
         let agent = evidence
             .out
             .get(id)
@@ -683,8 +869,10 @@ fn snapshot_layout(
     sessions: &HashMap<PaneId, Option<(String, String)>>,
 ) -> SessionSnapshot {
     let mut workspaces = Vec::new();
+    let active_workspace_id = app.workspaces.get(app.active_ws).map(|ws| ws.id.as_str());
     for ws in &app.workspaces {
         let mut tabs = Vec::new();
+        let active_tab_id = ws.tabs.get(ws.active_tab).map(|tab| tab.id.as_str());
         for tab in &ws.tabs {
             // A git tab (docs/17) has no real panes — record just the flag; it's
             // re-created as the dashboard (and re-fetched) on restore.
@@ -729,11 +917,14 @@ fn snapshot_layout(
                 });
                 continue;
             }
-            let panes = tab
+            let panes: Vec<(u32, PaneSnap)> = tab
                 .layout
                 .leaves()
                 .into_iter()
                 .filter_map(|id| {
+                    if app.backend_non_restorable.contains(&id) {
+                        return None;
+                    }
                     // A file-view leaf (docs/38 FILE-3) is saved by its path and
                     // rebuilt on restore; it has no PTY.
                     if let Some(view) = app.views.get(&id) {
@@ -782,6 +973,7 @@ fn snapshot_layout(
                             PaneSnap {
                                 cwd: PathBuf::new(),
                                 command: String::new(),
+                                backend_label: None,
                                 name: app.agent_name_for(id).map(|s| s.to_string()),
                                 agent_session: None,
                                 agent_launch: None,
@@ -790,6 +982,7 @@ fn snapshot_layout(
                                 file,
                                 diff,
                                 preview,
+                                automation_worker: false,
                             },
                         ));
                     }
@@ -820,13 +1013,18 @@ fn snapshot_layout(
                                     .and_then(|cmds| app.manifests.launch_args_for(cmds, k))
                             })
                             .filter(|v| !v.is_empty());
-                        // Capture the visible screen (cap size to keep saves light).
-                        let screen = p
-                            .engine
-                            .lock()
-                            .ok()
-                            .map(|e| e.snapshot_ansi())
-                            .filter(|s| s.len() < 256 * 1024);
+                        // Capture the visible screen only when the user permits
+                        // terminal content on disk. The disabled path avoids the
+                        // engine lock and ANSI allocation entirely.
+                        let screen = if app.config.session.persist_pane_screen {
+                            p.engine
+                                .lock()
+                                .ok()
+                                .map(|e| e.snapshot_ansi())
+                                .filter(|s| s.len() < 256 * 1024)
+                        } else {
+                            None
+                        };
                         let module = app
                             .module_panes
                             .get(&id)
@@ -836,6 +1034,7 @@ fn snapshot_layout(
                             PaneSnap {
                                 cwd: p.cwd.clone(),
                                 command: p.command.clone(),
+                                backend_label: app.backend_labels.get(&id).cloned(),
                                 name: app.agent_name_for(id).map(|s| s.to_string()),
                                 agent_session,
                                 agent_launch,
@@ -844,11 +1043,15 @@ fn snapshot_layout(
                                 file: None,
                                 diff: None,
                                 preview: None,
+                                automation_worker: app.automation_worker_panes.contains(&id),
                             },
                         )
                     })
                 })
                 .collect();
+            if panes.is_empty() {
+                continue;
+            }
             tabs.push(TabSnap {
                 id: tab.id.clone(),
                 tree: tab.layout.to_tree(),
@@ -860,18 +1063,43 @@ fn snapshot_layout(
                 name: tab.name.clone(),
             });
         }
+        if tabs.is_empty() {
+            continue;
+        }
+        let active_tab = active_tab_id
+            .and_then(|id| tabs.iter().position(|tab| tab.id == id))
+            .unwrap_or_else(|| {
+                let retained_before = ws
+                    .tabs
+                    .iter()
+                    .take(ws.active_tab)
+                    .filter(|source| tabs.iter().any(|saved| saved.id == source.id))
+                    .count();
+                retained_before.min(tabs.len() - 1)
+            });
         workspaces.push(WsSnap {
             id: ws.id.clone(),
             name: ws.name.clone(),
             cwd: ws.cwd.clone(),
-            active_tab: ws.active_tab,
+            active_tab,
             tabs,
             pinned: ws.pinned,
         });
     }
+    let active_ws = active_workspace_id
+        .and_then(|id| workspaces.iter().position(|workspace| workspace.id == id))
+        .unwrap_or_else(|| {
+            let retained_before = app
+                .workspaces
+                .iter()
+                .take(app.active_ws)
+                .filter(|source| workspaces.iter().any(|saved| saved.id == source.id))
+                .count();
+            retained_before.min(workspaces.len().saturating_sub(1))
+        });
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
-        active_ws: app.active_ws,
+        active_ws,
         workspaces,
         closed_workspace_paths: app.closed_workspace_paths.clone(),
     }
@@ -1067,6 +1295,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn external_terminal_sessions_remain_claimed_for_restorable_panes() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _env = test_env("external-session-claim");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let external = app.layout().focus;
+        app.handle_event(crate::event::AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL,
+        )));
+        app.handle_event(crate::event::AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        )));
+        let restorable = app.layout().focus;
+        assert_ne!(external, restorable);
+
+        app.backend_non_restorable.insert(external);
+        let external_status = app.status.get_mut(&external).unwrap();
+        external_status.agent = "claude".into();
+        external_status.agent_session = Some(crate::app::AgentSession {
+            agent: "claude".into(),
+            session_id: "external-session".into(),
+        });
+        app.status.get_mut(&restorable).unwrap().agent = "claude".into();
+
+        let evidence = capture_session_evidence(&app);
+        assert!(evidence
+            .claimed
+            .contains(&("claude".into(), "external-session".into())));
+        assert!(!evidence.out.contains_key(&external));
+        let cwd = app.panes[&restorable].cwd.clone();
+        assert_eq!(
+            evidence.unbound.get(&("claude".into(), cwd)),
+            Some(&vec![restorable])
+        );
+    }
+
+    #[test]
+    fn pane_screen_opt_out_removes_terminal_content_from_session_json() {
+        let _env = test_env("pane-screen-opt-out");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.panes
+            .get(&pane)
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b[2J\x1b[HLUVUS-PRIVATE-SCREEN-MARKER");
+
+        assert!(save(&app));
+        let default_snapshot = fs::read_to_string(session_path()).unwrap();
+        assert!(
+            default_snapshot.contains("LUVUS-PRIVATE-SCREEN-MARKER"),
+            "screen persistence remains enabled by default"
+        );
+
+        app.config.session.persist_pane_screen = false;
+        assert!(save(&app));
+        let private_snapshot = fs::read_to_string(session_path()).unwrap();
+        assert!(!private_snapshot.contains("LUVUS-PRIVATE-SCREEN-MARKER"));
+        assert!(
+            !private_snapshot.contains("\"screen\""),
+            "the field is omitted rather than serialized as null"
+        );
+        assert!(load().unwrap().workspaces.iter().all(|workspace| workspace
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .all(|(_, pane)| pane.screen.is_none())));
+    }
+
     // The control sockets grant command execution as the user, so the state
     // dir must be owner-only (0700) and each bound socket 0600 — regardless of
     // the process umask (see `ensure_config_dir` / `transport::bind`).
@@ -1113,5 +1417,158 @@ mod tests {
         let _listener = crate::ipc::transport::bind(&sock).unwrap();
         let mode = fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "socket is chmod 0600, got {mode:o}");
+    }
+}
+
+#[cfg(test)]
+mod title_resolution_tests {
+    use super::*;
+
+    /// Two Codex panes share a directory, so the directory alone cannot say
+    /// which conversation is whose. A pane whose title names its thread still
+    /// resolves, even one resumed from the picker before any new prompt; the
+    /// pane beside it stays unbound rather than taking a guess.
+    #[test]
+    fn a_titled_codex_pane_resolves_beside_another_in_its_directory() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let codex = std::env::temp_dir().join(format!("luvus-titled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&codex);
+        let work = codex.join("work");
+        let sessions = codex.join("sessions/2026/09/30");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for id in ["01a0-named", "01a0-other"] {
+            let meta =
+                serde_json::json!({"type": "session_meta", "payload": {"id": id, "cwd": work}});
+            std::fs::write(
+                sessions.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl")),
+                format!("{meta}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            codex.join("session_index.jsonl"),
+            r#"{"id":"01a0-named","thread_name":"core-luvus"}"#,
+        )
+        .unwrap();
+        let previous = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_HOME", &codex);
+
+        let resolve = |titles: &[(u32, &str)], claimed: &[&str]| {
+            resolve_pane_sessions(SessionEvidence {
+                out: HashMap::new(),
+                claimed: claimed
+                    .iter()
+                    .map(|id| ("codex".to_string(), id.to_string()))
+                    .collect(),
+                unbound: HashMap::from([(
+                    ("codex".to_string(), work.clone()),
+                    vec![PaneId(1), PaneId(2)],
+                )]),
+                titles: titles
+                    .iter()
+                    .map(|(id, title)| (PaneId(*id), title.to_string()))
+                    .collect(),
+                workers: HashSet::new(),
+            })
+        };
+        let named = Some(("codex".to_string(), "01a0-named".to_string()));
+
+        let out = resolve(&[(1, "core-luvus | work"), (2, "work")], &[]);
+        assert_eq!(out[&PaneId(1)], named);
+        assert_eq!(
+            out[&PaneId(2)],
+            None,
+            "the other pane does not inherit the directory's remaining session"
+        );
+
+        let out = resolve(&[(1, "core-luvus | work"), (2, "core-luvus | work")], &[]);
+        assert_eq!(
+            (&out[&PaneId(1)], &out[&PaneId(2)]),
+            (&None, &None),
+            "two panes name it"
+        );
+
+        let out = resolve(&[(1, "core-luvus | work")], &["01a0-named"]);
+        assert_eq!(
+            out[&PaneId(1)],
+            None,
+            "a hook already bound it to another pane"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&codex);
+    }
+
+    #[test]
+    fn a_scheduled_worker_title_never_resolves_its_own_run() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let codex =
+            std::env::temp_dir().join(format!("luvus-titled-worker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&codex);
+        let work = codex.join("work");
+        let sessions = codex.join("sessions/2026/10/14");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for id in ["01a0-named", "01a0-other"] {
+            let meta =
+                serde_json::json!({"type": "session_meta", "payload": {"id": id, "cwd": work}});
+            std::fs::write(
+                sessions.join(format!("rollout-2026-10-14T10-00-00-{id}.jsonl")),
+                format!("{meta}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            codex.join("session_index.jsonl"),
+            r#"{"id":"01a0-named","thread_name":"nightly-review"}"#,
+        )
+        .unwrap();
+        let previous = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_HOME", &codex);
+
+        // Pane 1 is the scheduled worker in every case.
+        let resolve = |panes: &[u32], titles: &[(u32, &str)]| {
+            resolve_pane_sessions(SessionEvidence {
+                out: HashMap::new(),
+                claimed: HashSet::new(),
+                unbound: HashMap::from([(
+                    ("codex".to_string(), work.clone()),
+                    panes.iter().map(|id| PaneId(*id)).collect(),
+                )]),
+                titles: titles
+                    .iter()
+                    .map(|(id, title)| (PaneId(*id), title.to_string()))
+                    .collect(),
+                workers: HashSet::from([PaneId(1)]),
+            })
+        };
+
+        let out = resolve(&[1], &[(1, "nightly-review | work")]);
+        assert_eq!(out[&PaneId(1)], None, "its title names its own run");
+
+        let out = resolve(
+            &[1, 2],
+            &[(1, "nightly-review | work"), (2, "nightly-review | work")],
+        );
+        assert_eq!(
+            (&out[&PaneId(1)], &out[&PaneId(2)]),
+            (&None, &None),
+            "a name the worker shares stays ambiguous"
+        );
+
+        let out = resolve(&[1, 2], &[(1, "nightly-review | work"), (2, "work")]);
+        assert_eq!(
+            (&out[&PaneId(1)], &out[&PaneId(2)]),
+            (&None, &None),
+            "the pane beside it does not inherit a remaining session"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&codex);
     }
 }

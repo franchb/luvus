@@ -13,7 +13,7 @@ use crate::app::{
 use crate::event::AppEvent;
 use crate::files::FileView;
 use crate::ids::PaneId;
-use crate::layout::{Axis, TileLayout};
+use crate::layout::TileLayout;
 
 const RECENT_FILE_CAP: usize = 12;
 
@@ -66,7 +66,8 @@ impl App {
     /// there is nothing to do (a few `HashSet` checks), and a no-op when the dock
     /// isn't mounted.
     pub fn ensure_file_tree(&mut self) {
-        let dock_visible = self.sidebars.side_of(&DockKind::Files).is_some();
+        let dock_visible =
+            self.client_files_visible || self.sidebars.side_of(&DockKind::Files).is_some();
         let diff_visible = self
             .layout()
             .leaves()
@@ -91,6 +92,23 @@ impl App {
             self.rescan_file_tree();
         }
         self.refresh_git_status();
+    }
+
+    /// Re-root FILES as soon as the active workspace changes. The periodic
+    /// [`ensure_file_tree`](Self::ensure_file_tree) rides the PTY-driven CWD
+    /// scan, which never runs while every pane is quiet, so a workspace switch
+    /// could leave the dock showing the previous folder for an unbounded time.
+    /// This costs two cheap checks per loop turn; the reads and the git status
+    /// scan it schedules stay on worker threads. Returns whether it re-rooted,
+    /// so the caller repaints the dock's loading state right away.
+    pub(crate) fn follow_active_file_root(&mut self) -> bool {
+        let dock_visible =
+            self.client_files_visible || self.sidebars.side_of(&DockKind::Files).is_some();
+        if !dock_visible || self.file_tree.root() == self.ws().cwd.as_path() {
+            return false;
+        }
+        self.ensure_file_tree();
+        true
     }
 
     /// Park a first `files.tree` call until its root listing has returned from
@@ -509,6 +527,23 @@ impl App {
         }
     }
 
+    /// Open an indexed file's shared action menu without depending on tree rows.
+    pub(crate) fn open_file_path_menu(&mut self, path: PathBuf, anchor: (u16, u16)) {
+        let mut menu = FileMenu {
+            path,
+            is_dir: false,
+            anchor,
+            items: Vec::new(),
+            selected: None,
+            editors: self.editors.clone(),
+        };
+        menu.selected = menu
+            .build_items()
+            .iter()
+            .position(|item| *item != FileMenuItem::Divider);
+        self.file_menu = Some(menu);
+    }
+
     /// Open the selected row's action menu with an initial keyboard selection.
     fn open_file_menu_for_keyboard(&mut self) {
         self.clamp_file_cursor();
@@ -535,7 +570,15 @@ impl App {
     }
 
     fn file_tree_page(&self) -> usize {
-        self.files_area.height.saturating_sub(1).max(1) as usize
+        let filter_rows = if self.file_tree.filter.is_some() {
+            2
+        } else {
+            0
+        };
+        self.files_area
+            .height
+            .saturating_sub(crate::ui::DOCK_HEADER_ROWS.saturating_add(filter_rows))
+            .max(1) as usize
     }
 
     fn reveal_file_cursor(&mut self) {
@@ -616,8 +659,44 @@ impl App {
     /// Navigate the FILES tree while it owns keyboard focus. Returns to the
     /// pane before opening a file so its native view receives subsequent keys.
     pub fn handle_file_tree_key(&mut self, key: KeyEvent) -> bool {
+        if let Some(filter) = self.file_tree.filter.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.file_tree.clear_filter(),
+                KeyCode::Enter => self.open_file_menu_for_keyboard(),
+                KeyCode::Backspace => {
+                    filter.query.pop();
+                    filter.recompute();
+                    self.file_tree.cursor = 0;
+                    self.file_tree.scroll = 0;
+                }
+                KeyCode::Char(ch)
+                    if !super::keys::is_ctrl_chord(key.modifiers)
+                        && (!key.modifiers.contains(KeyModifiers::ALT)
+                            || key.modifiers.contains(KeyModifiers::CONTROL)) =>
+                {
+                    filter.append(&ch.to_string());
+                    self.file_tree.cursor = 0;
+                    self.file_tree.scroll = 0;
+                }
+                KeyCode::Up => self.move_file_cursor(-1),
+                KeyCode::Down => self.move_file_cursor(1),
+                KeyCode::PageUp => self.move_file_cursor(-(self.file_tree_page() as isize)),
+                KeyCode::PageDown => self.move_file_cursor(self.file_tree_page() as isize),
+                _ => {}
+            }
+            return true;
+        }
         let page = self.file_tree_page() as isize;
         match key.code {
+            KeyCode::Char('f') if key.modifiers == KeyModifiers::NONE => {
+                self.file_tree.filter = Some(crate::files::filter::FileFilter::start(
+                    self.file_tree.root().to_path_buf(),
+                    self.app_tx.clone(),
+                    (self.file_tree.cursor, self.file_tree.scroll),
+                ));
+                self.file_tree.cursor = 0;
+                self.file_tree.scroll = 0;
+            }
             KeyCode::Esc | KeyCode::Char('q') => self.files_focused = false,
             KeyCode::Up | KeyCode::Char('k') => self.move_file_cursor(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_file_cursor(1),
@@ -670,7 +749,7 @@ impl App {
             .filter_map(|(index, item)| (*item != FileMenuItem::Divider).then_some(index))
             .collect();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.file_menu = None,
+            KeyCode::Esc | KeyCode::Char('q') => self.cancel_file_menu(),
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Up | KeyCode::Char('k') => {
                 if selectable.is_empty() {
                     return;
@@ -712,7 +791,16 @@ impl App {
         match hit {
             Some(FileMenuItem::Divider) => {}
             Some(it) => self.file_menu_action(it),
-            None => self.file_menu = None,
+            None => self.cancel_file_menu(),
+        }
+    }
+
+    fn cancel_file_menu(&mut self) {
+        self.file_menu = None;
+        if let Some(search) = self.search.as_mut() {
+            search.file_action = None;
+        } else {
+            self.file_tree.clear_filter();
         }
     }
 
@@ -724,6 +812,10 @@ impl App {
         let Some(menu) = self.file_menu.take() else {
             return;
         };
+        if self.search.is_some() && !self.finish_search_file_action(&menu.path) {
+            return;
+        }
+        self.file_tree.clear_filter();
         // New entries land *inside* a folder, or beside a clicked file.
         let dir = if menu.is_dir {
             menu.path.clone()
@@ -794,7 +886,6 @@ impl App {
             }
             FileMenuItem::CopyPath => {
                 self.pending_clipboard = Some(menu.path.to_string_lossy().into_owned());
-                self.show_toast("copied path");
             }
             FileMenuItem::InsertPath => {
                 match self.insert_path(&menu.path) {
@@ -1110,7 +1201,7 @@ impl App {
                 ws.active_tab = ws.tabs.len() - 1;
             }
             OpenTarget::Preview | OpenTarget::Pane => {
-                self.layout_mut().split_focused(Axis::Col, id);
+                self.split_focused_auto(id);
                 self.layout_mut().focus = id;
             }
         }
@@ -1206,8 +1297,6 @@ impl App {
         match text {
             Some(t) => {
                 self.pending_clipboard = Some(t);
-                let msg = self.catalog.copied;
-                self.show_toast(msg);
             }
             None => self.show_toast("nothing to copy"),
         }
@@ -1231,21 +1320,55 @@ impl App {
         // Text column width: the scroll clamp needs it to measure how many rows a
         // soft-wrapped line really occupies.
         let text_w = rect.map(|r| view_text_w(v, r.width)).unwrap_or(0);
-        // While typing a search query, keys edit the query.
-        if v.search.as_ref().is_some_and(|s| s.editing) {
+        // Case, wrap, and copy toggle or copy in place; a held key runs once.
+        if super::is_key_repeat(&key) {
+            let ctrl = super::keys::is_ctrl_chord(key.modifiers);
+            let action = if v.search.is_some() {
+                ctrl && key.code == KeyCode::Char('i')
+            } else {
+                matches!(key.code, KeyCode::Char('w' | 'y' | 'c'))
+            };
+            if action {
+                return true;
+            }
+        }
+        // Active search owns all input. Editing accepts query text; committed
+        // search accepts only navigation and search controls. Everything else
+        // is swallowed so FILE commands cannot mutate or close the view under
+        // the search footer.
+        if v.search.is_some() {
+            let editing = v.search.as_ref().is_some_and(|search| search.editing);
             match key.code {
-                KeyCode::Char(c) => v.search_push(c),
-                KeyCode::Backspace => v.search_backspace(),
-                KeyCode::Enter => {
-                    v.search_commit();
-                    v.search_step(true, viewport); // reveal the first hit
+                KeyCode::Char('i') if super::keys::is_ctrl_chord(key.modifiers) => {
+                    v.search_toggle_case()
                 }
+                KeyCode::Char('u') if super::keys::is_ctrl_chord(key.modifiers) => v.search_clear(),
+                KeyCode::Char(c) if editing && !super::keys::is_ctrl_chord(key.modifiers) => {
+                    v.search_push(c)
+                }
+                KeyCode::Backspace if editing => v.search_backspace(),
+                KeyCode::Enter if editing => {
+                    v.search_commit();
+                    v.reveal_current_match(viewport);
+                }
+                KeyCode::Char('n') if !editing => v.search_step(true, viewport),
+                KeyCode::Char('N') if !editing => v.search_step(false, viewport),
                 KeyCode::Esc => v.search_cancel(),
-                _ => return false,
+                _ => {}
             }
             return true;
         }
         match key.code {
+            KeyCode::Char('i')
+                if super::keys::is_ctrl_chord(key.modifiers) && v.search.is_some() =>
+            {
+                v.search_toggle_case()
+            }
+            KeyCode::Char('u')
+                if super::keys::is_ctrl_chord(key.modifiers) && v.search.is_some() =>
+            {
+                v.search_clear()
+            }
             KeyCode::Char('j') | KeyCode::Down => v.scroll_by(1, viewport, text_w),
             KeyCode::Char('k') | KeyCode::Up => v.scroll_by(-1, viewport, text_w),
             KeyCode::Char('d') => v.scroll_by(viewport as i32 / 2, viewport, text_w),
@@ -1260,8 +1383,6 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => v.scroll_right(8),
             KeyCode::Char('w') => v.wrap = !v.wrap,
             KeyCode::Char('/') => v.search_begin(),
-            KeyCode::Char('n') => v.search_step(true, viewport),
-            KeyCode::Char('N') => v.search_step(false, viewport),
             // `y` copies the whole file to the clipboard, through the same path
             // as a pane text selection (native clipboard + OSC 52 + a toast).
             KeyCode::Char('y') | KeyCode::Char('c') => {
@@ -1269,14 +1390,7 @@ impl App {
                 return true;
             }
             KeyCode::Char('q') | KeyCode::Char('x') => self.close_pane(id),
-            KeyCode::Esc => {
-                // Esc clears a committed search first, else closes the view.
-                if v.search.is_some() {
-                    v.search_cancel();
-                } else {
-                    self.close_pane(id);
-                }
-            }
+            KeyCode::Esc => self.close_pane(id),
             _ => return false,
         }
         true
@@ -1287,7 +1401,102 @@ impl App {
 mod tests {
     use super::*;
     use crate::app::{DockKind, FileMenu, FileMenuItem, Side};
+    use crate::layout::Axis;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn a_held_modified_copy_or_wrap_key_acts_once() {
+        use ratatui::crossterm::event::KeyEventKind;
+
+        let _env = crate::persist::test_env("file-view-modified-copy-repeat");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let mut view = crate::files::FileView::new("sample.txt".into());
+        view.apply(crate::files::FileLoad::Text(vec!["text".into()]));
+        app.views.insert(pane, ViewKind::File(view));
+        let phase = |code, kind| {
+            crate::event::AppEvent::Key(KeyEvent::new_with_kind(code, KeyModifiers::CONTROL, kind))
+        };
+
+        app.handle_event(phase(KeyCode::Char('y'), KeyEventKind::Press));
+        assert_eq!(app.pending_clipboard.as_deref(), Some("text"));
+        app.pending_clipboard = None;
+        app.handle_event(phase(KeyCode::Char('y'), KeyEventKind::Repeat));
+        assert!(app.pending_clipboard.is_none(), "one copy per press");
+
+        let wrap = |app: &App| match &app.views[&pane] {
+            ViewKind::File(view) => view.wrap,
+            _ => panic!("file view retained"),
+        };
+        app.handle_event(phase(KeyCode::Char('w'), KeyEventKind::Press));
+        let toggled = wrap(&app);
+        app.handle_event(phase(KeyCode::Char('w'), KeyEventKind::Repeat));
+        assert_eq!(wrap(&app), toggled, "one wrap toggle per press");
+    }
+
+    #[test]
+    fn file_search_consumes_non_search_shortcuts_before_and_after_commit() {
+        let _env = crate::persist::test_env("file-search-input-ownership");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let mut view = crate::files::FileView::new("sample.txt".into());
+        view.apply(crate::files::FileLoad::Text(vec![
+            "needle".into(),
+            "middle".into(),
+            "needle".into(),
+        ]));
+        view.search_begin();
+        view.search.as_mut().unwrap().extend_text("needle");
+        app.views.insert(pane, ViewKind::File(view));
+
+        for key in ['j', 'w', 'y', 'c', 'q', 'x'] {
+            assert!(
+                app.handle_file_key(pane, KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+            );
+        }
+        let ViewKind::File(view) = &app.views[&pane] else {
+            panic!("file view retained");
+        };
+        assert_eq!(view.scroll, 0);
+        assert!(view.wrap);
+        assert!(view.search.as_ref().unwrap().editing);
+        assert!(app.pending_clipboard.is_none());
+
+        app.handle_file_key(
+            pane,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        for ch in "needle".chars() {
+            app.handle_file_key(pane, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_file_key(pane, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for key in ['j', 'w', 'y', 'c', 'q', 'x'] {
+            assert!(
+                app.handle_file_key(pane, KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+            );
+        }
+        let ViewKind::File(view) = &app.views[&pane] else {
+            panic!("file view retained");
+        };
+        assert_eq!(view.scroll, 0);
+        assert!(view.wrap);
+        assert!(!view.search.as_ref().unwrap().editing);
+        assert!(app.pending_clipboard.is_none());
+
+        app.handle_file_key(pane, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        let ViewKind::File(view) = &app.views[&pane] else {
+            panic!("file view retained");
+        };
+        assert_eq!(view.search.as_ref().unwrap().current, 1);
+
+        app.handle_file_key(pane, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let ViewKind::File(view) = &app.views[&pane] else {
+            panic!("file view retained");
+        };
+        assert!(view.search.is_none());
+    }
 
     #[test]
     fn files_focus_restores_last_side_across_restart() {
@@ -1381,6 +1590,101 @@ mod tests {
     }
 
     #[test]
+    fn files_filter_finds_collapsed_paths_and_restores_tree_after_actions() {
+        let _env = crate::persist::test_env("files-filter-workflow");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("luvus-filter-workflow-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("nested/deep")).unwrap();
+        let path = root.join("nested/deep/unique_filter.rs");
+        std::fs::write(&path, "fixture").unwrap();
+        app.file_tree.set_root(root.clone());
+        app.file_tree.apply_dir(
+            root.clone(),
+            vec![crate::files::Entry {
+                name: "nested".into(),
+                is_dir: true,
+            }],
+        );
+        app.files_focused = true;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_file_tree_key(key(KeyCode::Char('f')));
+        assert!(app.handle_event(AppEvent::Paste("uq\nfltr".into())));
+        assert_eq!(app.file_tree.filter.as_ref().unwrap().query, "uqfltr");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.file_tree.filter.as_ref().unwrap().loading {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            app.handle_event(event);
+        }
+        assert_eq!(app.file_tree.visible_rows().len(), 1);
+        assert_eq!(app.file_tree.visible_rows()[0].path, path);
+        let rows = app.file_tree.visible_rows().to_vec();
+        app.handle_file_tree_key(key(KeyCode::Enter));
+        assert_eq!(app.file_menu.as_ref().unwrap().path, path);
+        app.handle_file_menu_key(key(KeyCode::Esc));
+        assert!(app.files_focused);
+        assert!(app.file_tree.filter.is_none());
+        assert_eq!(app.file_tree.visible_rows().len(), 1);
+        assert!(!app.file_tree.visible_rows()[0].expanded);
+        app.handle_file_tree_key(key(KeyCode::Char('f')));
+        let filter = app.file_tree.filter.as_ref().unwrap();
+        app.handle_event(AppEvent::FileFilterResults {
+            instance: filter.instance,
+            generation: filter.generation,
+            rows,
+            partial: false,
+        });
+        app.handle_file_tree_key(key(KeyCode::Enter));
+        app.file_menu_action_pub(FileMenuItem::OpenReadonly);
+        assert!(app.file_menu.is_none());
+        assert!(app.file_tree.filter.is_none());
+        assert!(!app.file_tree.visible_rows()[0].expanded);
+        assert!(!app.files_focused);
+        assert!(
+            matches!(app.views.get(&app.layout().focus), Some(ViewKind::File(view)) if view.path == path)
+        );
+        app.files_focused = true;
+        app.handle_file_tree_key(key(KeyCode::Char('f')));
+        app.handle_file_tree_key(key(KeyCode::Esc));
+        assert!(app.file_tree.filter.is_none());
+        assert!(app.files_focused);
+        app.handle_file_tree_key(key(KeyCode::Esc));
+        assert!(!app.files_focused);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn files_filter_rejects_stale_results_and_clears_on_workspace_change() {
+        let _env = crate::persist::test_env("files-filter-stale");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        seed_keyboard_tree(&mut app);
+        app.file_tree.cursor = 2;
+        app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        let filter = app.file_tree.filter.as_ref().unwrap();
+        let instance = filter.instance;
+        let generation = filter.generation;
+        app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.file_menu.is_none(), "letters edit the query");
+        let stale = || AppEvent::FileFilterResults {
+            instance,
+            generation,
+            rows: Vec::new(),
+            partial: true,
+        };
+        assert!(!app.handle_event(stale()));
+        assert!(app.file_tree.filter.as_ref().unwrap().loading);
+        app.file_tree.set_root(PathBuf::from("another-project"));
+        assert!(app.file_tree.filter.is_none());
+        assert!(!app.handle_event(stale()));
+        app.file_tree.set_root(PathBuf::from("keyboard-project"));
+        assert_eq!(app.file_tree.cursor, 2);
+    }
+
+    #[test]
     fn files_keyboard_navigation_expands_walks_and_keeps_the_cursor_visible() {
         let _env = crate::persist::test_env("files-keyboard-navigation");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -1400,7 +1704,10 @@ mod tests {
         assert_eq!(app.file_tree.cursor, 0, "left returns to the parent");
         app.handle_file_tree_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(app.file_tree.cursor, 3);
-        assert_eq!(app.file_tree.scroll, 2, "the last row remains in view");
+        assert_eq!(
+            app.file_tree.scroll, 2,
+            "the two rendered rows keep the last entry in view"
+        );
 
         app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.files_focused, "q returns input to the pane");
@@ -2607,8 +2914,8 @@ mod tests {
             .expect("the file list has rows");
         assert_eq!(
             first_row_y,
-            header_y + 1,
-            "the list starts directly below FILES/DIFF without an identity row"
+            header_y + crate::ui::DOCK_HEADER_ROWS,
+            "the list starts directly below FILES/DIFF, with no identity row"
         );
 
         // Click the `src` row (find its rect) and re-render.
@@ -2694,7 +3001,7 @@ mod tests {
         std::fs::write(root.join(".env"), b"X=1").unwrap();
         std::fs::write(root.join("main.rs"), b"fn main(){}").unwrap();
 
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();
         app.workspaces[app.active_ws].cwd = root.clone();
         app.sidebars.left.docks.push(DockKind::Files);
@@ -2720,6 +3027,7 @@ mod tests {
 
         // The choice persists, so a fresh App reads it back off.
         assert!(!app.config.layout.files_show_hidden);
+        app.flush_config_for_test(&rx);
         let reopened = App::new(120, 40, std::sync::mpsc::channel().0).unwrap();
         assert!(
             !reopened.file_tree.show_hidden,
@@ -2946,7 +3254,15 @@ mod tests {
             Some("line one\nline two"),
             "the file content is queued to the clipboard"
         );
-        assert!(app.toast.is_some(), "a copy toast is shown");
+        assert!(
+            app.toast.is_none(),
+            "queueing a copy is not clipboard success"
+        );
+        app.handle_event(crate::event::AppEvent::LocalClipboardSucceeded);
+        assert_eq!(
+            app.toast.as_ref().map(|(text, _)| text.as_str()),
+            Some("Copied to Clipboard")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3924,6 +4240,158 @@ mod tests {
             "FILES re-roots to the focused workspace immediately"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Switching workspaces must not wait for PTY activity. The periodic
+    /// re-root rides the CWD scan, which only runs after a pane prints, so a
+    /// switch between quiet workspaces used to leave FILES on the old folder.
+    #[test]
+    fn workspace_switch_reroots_files_without_pane_activity() {
+        let _env = crate::persist::test_env("files-follow-active-root");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let dir = std::env::temp_dir().join(format!("luvus-follow-root-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(app.create_workspace_at(dir.clone()), "seed workspace");
+        let target = app.active_ws;
+        app.active_ws = 0;
+        app.sidebars.left.docks.push(DockKind::Files);
+        app.ensure_file_tree();
+        assert!(!crate::platform::same_path(app.file_tree.root(), &dir));
+
+        // A bare index switch, like most switch paths perform, with every pane
+        // quiet and no client attached: no CWD scan can run on this tick.
+        app.active_ws = target;
+        app.runtime_cwd_dirty = false;
+        app.runtime_cwd_dirty_panes.clear();
+        assert!(
+            app.detect_tick_with(std::time::Instant::now(), false),
+            "the re-root asks for a repaint"
+        );
+        assert_eq!(
+            app.file_tree.root(),
+            app.workspaces[target].cwd.as_path(),
+            "FILES follows the switch on the next loop turn"
+        );
+        assert!(
+            !app.follow_active_file_root(),
+            "an already-followed root costs no further work"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder that has never been read shows a loading line instead of a
+    /// blank dock that is indistinguishable from an empty folder.
+    #[test]
+    fn files_dock_says_loading_until_the_root_listing_arrives() {
+        let _env = crate::persist::test_env("files-dock-loading");
+        let root = std::env::temp_dir().join(format!("luvus-ft-loading-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("README.md"), b"# hi").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.workspaces[app.active_ws].cwd = root.clone();
+        app.sidebars.left.docks.push(DockKind::Files);
+        app.ensure_file_tree();
+        assert!(
+            !app.file_tree.root_loaded(),
+            "the root read is still in flight"
+        );
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("loading…"),
+            "an unread root says it is loading"
+        );
+        assert!(!text.contains("README.md"));
+        assert!(app.file_tree_rects.is_empty(), "no clickable rows yet");
+
+        app.file_tree
+            .apply_dir(root.clone(), crate::files::read_dir_entries(&root));
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("loading…"),
+            "the listing replaces the loading line"
+        );
+        assert!(text.contains("README.md"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Filtering owns its own file index, so it can return matches before the
+    /// lazy root listing arrives. The loading affordance must not hide those
+    /// results or their hit rectangles.
+    #[test]
+    fn files_filter_remains_visible_while_the_root_listing_loads() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let _env = crate::persist::test_env("files-filter-during-root-loading");
+        let root =
+            std::env::temp_dir().join(format!("luvus-filter-root-loading-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let match_path = root.join("match.rs");
+        std::fs::write(&match_path, b"// match").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.workspaces[app.active_ws].cwd = root.clone();
+        app.sidebars.left.docks.push(DockKind::Files);
+        app.ensure_file_tree();
+        assert!(!app.file_tree.root_loaded());
+
+        app.files_focused = true;
+        app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        let filter = app.file_tree.filter.as_ref().unwrap();
+        assert!(app.handle_event(AppEvent::FileFilterResults {
+            instance: filter.instance,
+            generation: filter.generation,
+            rows: vec![crate::files::VisibleRow {
+                path: match_path.clone(),
+                name: "match.rs".into(),
+                depth: 0,
+                is_dir: false,
+                expanded: false,
+                loading: false,
+            }],
+            partial: false,
+        }));
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("f: m"), "the active query remains visible");
+        assert!(text.contains("match.rs"), "the indexed match is rendered");
+        assert_eq!(
+            app.file_tree_rects.len(),
+            1,
+            "the indexed match remains clickable"
+        );
+        let rect = app.file_tree_rects[0].1;
+        assert!(app.handle_event(crate::event::AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 3,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        })));
+        let preview = app.layout().focus;
+        assert_eq!(
+            shown(&app, preview),
+            match_path,
+            "clicking the filtered row opens the match while the root is pending"
+        );
+        assert!(
+            app.preview_views.contains(&preview),
+            "the default click route opened the reusable preview"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// FILES can reach a folder through a symlink spelling while the open

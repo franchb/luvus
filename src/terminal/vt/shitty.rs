@@ -13,11 +13,12 @@ use ratatui::style::{Color, Modifier};
 use shitty_vt::{Cell as VtCell, ColorSource, Rgb, Terminal};
 
 use super::{
-    AlignedRows, CodexComposerRegion, Cursor, DamageKind, DamageSnapshot, HistoryMetrics,
-    RenderCell, RetainedRowLayout, VtEngine, ALIGNED_WIDE_CELL,
+    AlignedRows, ClaudeComposerEvidence, CodexComposerRegion, Cursor, DamageKind, DamageSnapshot,
+    HistoryMetrics, RenderCell, RetainedRowLayout, VtEngine, ALIGNED_WIDE_CELL,
 };
 use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::{CaptureMode, CaptureResult};
+use crate::terminal::keyboard::KeyboardProtocol;
 use crate::terminal::pty::{InputAction, InputSender};
 
 /// Cell size assumed before the terminal exists to report its own. Corrected
@@ -121,6 +122,29 @@ impl ShittyEngine {
             }
             if keep_clusters {
                 out.extend(points);
+            }
+        });
+    }
+
+    /// One row of the live screen as one `char` per terminal column.
+    ///
+    /// Unlike [`Self::row_text`] this is column-exact: every cell lands at its
+    /// own column index and a wide glyph's continuation cell stays blank, so a
+    /// column derived from this row can be compared against a cursor column.
+    /// The composer detectors need that; plain text does not.
+    fn live_row_chars(&self, index: u32, out: &mut Vec<char>) {
+        out.clear();
+        out.resize(self.cols as usize, ' ');
+        self.term.row_cells(index, |_, column, cell| {
+            let Some(first) = cell
+                .grapheme
+                .first()
+                .and_then(|point| char::from_u32(*point))
+            else {
+                return;
+            };
+            if let Some(slot) = out.get_mut(column as usize) {
+                *slot = first;
             }
         });
     }
@@ -436,6 +460,132 @@ impl VtEngine for ShittyEngine {
         }
     }
 
+    fn claude_composer_evidence(&self) -> ClaudeComposerEvidence {
+        if self.term.scroll_offset() != 0 {
+            return ClaudeComposerEvidence::Absent;
+        }
+        let rows = self.rows as usize;
+        let cols = self.cols as usize;
+        if rows < 3 || cols < 8 {
+            return ClaudeComposerEvidence::Absent;
+        }
+        let cursor = self.term.cursor().row as usize;
+        if cursor >= rows {
+            return ClaudeComposerEvidence::Absent;
+        }
+
+        let top_row = self.live_top();
+        let mut buffer = Vec::new();
+        let grid: Vec<Vec<char>> = (0..rows)
+            .map(|row| {
+                self.live_row_chars(top_row + row as u32, &mut buffer);
+                buffer.clone()
+            })
+            .collect();
+
+        // Claude's input is between two solid full-width rails. Its theme
+        // picker also has a selected `❯` item, but not this live geometry.
+        let row_is_rail = |row: usize| {
+            let mut rails = 0;
+            for &character in &grid[row] {
+                match character {
+                    '─' => rails += 1,
+                    ' ' => {}
+                    _ => return false,
+                }
+            }
+            rails >= cols - 2
+        };
+        let row_has_prompt = |row: usize| {
+            grid[row]
+                .iter()
+                .take(3)
+                .any(|&character| matches!(character, '❯' | '>'))
+        };
+        // Bound the search by the visible grid, not an arbitrary input height.
+        // A typed divider is not an upper rail: the rail must be immediately
+        // followed by Claude's prompt marker. Continue past divider text.
+        let Some(top) = (0..cursor)
+            .rev()
+            .find(|&top| row_has_prompt(top + 1) && row_is_rail(top))
+        else {
+            return ClaudeComposerEvidence::Absent;
+        };
+        let prompt = top + 1;
+
+        if !((cursor + 1)..rows).any(row_is_rail) {
+            return ClaudeComposerEvidence::Absent;
+        }
+
+        // A rail between the prompt and cursor can be either the closing rail
+        // of a stale compact composer or literal divider text inside a current
+        // multiline input. Their VT cells are identical, so preserve the
+        // ambiguity for a trusted Claude lifecycle event to resolve.
+        if ((prompt + 1)..=cursor).any(row_is_rail) {
+            ClaudeComposerEvidence::Ambiguous
+        } else {
+            ClaudeComposerEvidence::Ready
+        }
+    }
+
+    fn opencode_composer_ready(&self) -> bool {
+        let cursor = self.term.cursor();
+        if self.term.scroll_offset() != 0 || !cursor.visible {
+            return false;
+        }
+        let rows = self.rows as usize;
+        let cols = self.cols as usize;
+        if rows < 5 || cols < 16 {
+            return false;
+        }
+        let row = cursor.row as usize;
+        let col = cursor.column as usize;
+        if row >= rows || col < 3 || col >= cols - 1 {
+            return false;
+        }
+
+        let top_row = self.live_top();
+        let mut buffer = Vec::new();
+        let grid: Vec<Vec<char>> = (0..rows)
+            .map(|index| {
+                self.live_row_chars(top_row + index as u32, &mut buffer);
+                buffer.clone()
+            })
+            .collect();
+        let symbol = |row: usize, col: usize| grid[row][col];
+
+        // OpenCode draws a left rail beside the editable area and a wide
+        // lower edge. The cursor must be *inside* that live box: a welcome
+        // screen, old transcript, or partially painted frame is not enough.
+        for rail in (0..col).rev() {
+            if symbol(row, rail) != '┃' || col < rail + 2 {
+                continue;
+            }
+            let mut top = row;
+            while top > 0 && symbol(top - 1, rail) == '┃' {
+                top -= 1;
+            }
+            let mut bottom = row;
+            while bottom + 1 < rows && symbol(bottom + 1, rail) == '┃' {
+                bottom += 1;
+            }
+            if bottom - top < 2 || bottom + 1 >= rows {
+                continue;
+            }
+            let edge = bottom + 1;
+            let underline = (rail + 1..cols)
+                .take_while(|&col| symbol(edge, col) == '▀')
+                .count();
+            // A blank row can be an unfinished redraw, even when a transparent
+            // theme would also render a blank edge. Fail closed without a
+            // measured lower border, and keep the cursor inside that border.
+            if symbol(edge, rail) == '╹' && underline >= 16 && col <= rail + underline {
+                return true;
+            }
+        }
+        false
+    }
+
     fn codex_composer_region(&self) -> Option<CodexComposerRegion> {
         if self.term.scroll_offset() != 0 {
             return None;
@@ -555,6 +705,21 @@ impl VtEngine for ShittyEngine {
         selected.join("\n")
     }
 
+    fn screen_rows(&self) -> Vec<String> {
+        // Absolute row indices from the live top rather than the visible grid:
+        // this describes the frame the child last painted, so a scrolled pane
+        // still reports the live screen. Same rule as `detection_text`.
+        let top = self.live_top();
+        let mut buffer = String::with_capacity(self.cols as usize);
+        let mut rows = Vec::with_capacity(self.rows as usize);
+        for row in 0..self.rows as u32 {
+            self.row_text(top + row, true, 0, &mut buffer);
+            rows.push(buffer.clone());
+        }
+        rows
+    }
+
+    #[cfg(test)]
     fn visible_rows(&self) -> Vec<String> {
         let mut lines = vec![String::new(); self.rows as usize];
         self.term.for_each_cell(|row, _, cell| {
@@ -637,6 +802,13 @@ impl VtEngine for ShittyEngine {
             text: output,
             lines: returned,
             truncated,
+            // The caret is not located inside the rendered text. Doing it
+            // honestly means counting scalars through both row appenders and
+            // the trailing-blank trim, and a caret reported in the wrong place
+            // is worse than one the client knows it does not have: `None` is
+            // rendered as null by the IPC layer.
+            cursor_offset: None,
+            cursor_padding_cells: 0,
         }
     }
 
@@ -646,6 +818,19 @@ impl VtEngine for ShittyEngine {
 
     fn title_generation(&self) -> u64 {
         self.title_generation
+    }
+
+    fn take_pending_clipboard(&mut self) -> Option<String> {
+        // The facade reports each OSC 52 write with its selection byte, 0 for
+        // primary and 1 for the clipboard, and hands over bytes the core has
+        // already un-base64ed. Luvus keeps one pending string, so the last
+        // write wins; the alacritty engine discards the selection byte the
+        // same way.
+        self.term
+            .take_clipboard_writes()
+            .into_iter()
+            .next_back()
+            .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn set_history_budget(&mut self, bytes: usize) {
@@ -877,12 +1062,17 @@ impl VtEngine for ShittyEngine {
         Some(RetainedRowLayout::new(whitespace, has_text))
     }
 
-    fn disambiguate_escape_codes(&self) -> bool {
-        // The facade reports no CSI-u negotiation state. Luvus encodes input
-        // above the engine, so the honest answer is that this engine does not
-        // know rather than a guess either way; false leaves legacy encoding,
-        // which is what a child gets until it is told otherwise.
-        false
+    fn keyboard_protocol(&self) -> KeyboardProtocol {
+        // `Modes` carries no kitty keyboard bits, so this engine cannot say
+        // which protocol a child negotiated. Reporting `Legacy` is the only
+        // answer it can defend, but it is not free: luvus pairs a key press
+        // with a synthesised release only when the engine reports
+        // REPORT_EVENT_TYPES, so under this engine a held key is never
+        // released and the tests that assert the pairing are gated on
+        // `unsupported_by_selected_engine("the kitty keyboard protocol")`.
+        // Closing it means exposing the flags from the C facade, not shadowing
+        // the CSI-u parser up here where it would drift from the real one.
+        KeyboardProtocol::Legacy
     }
 
     fn for_each_retained_row(&self, f: &mut dyn FnMut(usize, &str)) {
@@ -892,6 +1082,21 @@ impl VtEngine for ShittyEngine {
             let trimmed = output.trim_end().len();
             output.truncate(trimmed);
             f(index as usize, &output);
+        }
+    }
+
+    fn try_for_each_retained_row(
+        &self,
+        f: &mut dyn FnMut(usize, &str) -> std::ops::ControlFlow<()>,
+    ) {
+        let mut output = String::with_capacity(self.cols as usize);
+        for index in 0..self.term.total_rows() {
+            self.row_text(index, true, 0, &mut output);
+            let trimmed = output.trim_end().len();
+            output.truncate(trimmed);
+            if f(index as usize, &output).is_break() {
+                return;
+            }
         }
     }
 

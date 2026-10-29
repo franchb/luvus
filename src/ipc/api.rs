@@ -20,6 +20,7 @@ use crate::event::AppEvent;
 use crate::ipc::transport::{self, Conn};
 
 /// A request handed to the app loop, with a channel to send the reply back.
+#[derive(Clone)]
 pub struct ApiRequest {
     pub id: String,
     pub method: String,
@@ -158,6 +159,10 @@ impl Drop for RequestMetrics {
 struct ConnectionPermit;
 
 impl ConnectionPermit {
+    #[allow(
+        deprecated,
+        reason = "AtomicUsize::try_update requires Rust 1.95; keep the Rust 1.88 MSRV"
+    )]
     fn acquire() -> Option<Self> {
         ACTIVE_CONNECTIONS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -171,6 +176,10 @@ impl ConnectionPermit {
 struct TerminalStreamPermit;
 
 impl TerminalStreamPermit {
+    #[allow(
+        deprecated,
+        reason = "AtomicUsize::try_update requires Rust 1.95; keep the Rust 1.88 MSRV"
+    )]
     fn acquire() -> Option<Self> {
         ACTIVE_TERMINAL_STREAMS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -1226,10 +1235,17 @@ fn matching_event(line: &str, event: &str, predicate: &Value) -> Option<Value> {
         .then_some(value)
 }
 
+/// A capture and the revision observed while its engine lock was held.
+struct TerminalStreamFrame {
+    serialized: String,
+    content_revision: u64,
+}
+
+/// Capture one bounded replacement frame together with its exact revision.
 fn terminal_stream_frame(
     target: &crate::terminal::backend::ObserveTarget,
     sequence: u64,
-) -> Result<String, &'static str> {
+) -> Result<TerminalStreamFrame, &'static str> {
     let engine = target
         .engine
         .lock()
@@ -1242,25 +1258,37 @@ fn terminal_stream_frame(
     );
     let content_revision = target.content_revision.load(Ordering::Acquire);
     let bytes = capture.text.len();
+    let mut data = json!({
+        "server_generation":target.server_generation,
+        "terminal_id":target.terminal_id,
+        "pane_id":target.pane_id,
+        "content_revision":content_revision,
+        "mode":target.mode.as_str(),
+        "ansi":target.ansi,
+        "text":capture.text,
+        "lines":capture.lines,
+        "bytes":bytes,
+        "truncated":capture.truncated,
+    });
+    if target.cursor {
+        data["cursor"] = capture.cursor_offset.map_or(Value::Null, |offset| {
+            json!({
+                "offset":offset,
+                "padding_cells":capture.cursor_padding_cells,
+            })
+        });
+    }
     let frame = json!({
         "event":"terminal.frame",
         "sequence":sequence,
-        "data":{
-            "server_generation":target.server_generation,
-            "terminal_id":target.terminal_id,
-            "pane_id":target.pane_id,
-            "content_revision":content_revision,
-            "mode":target.mode.as_str(),
-            "ansi":target.ansi,
-            "text":capture.text,
-            "lines":capture.lines,
-            "bytes":bytes,
-            "truncated":capture.truncated,
-        }
+        "data":data,
     })
     .to_string();
     (frame.len().saturating_add(1) <= crate::terminal::backend::MAX_FRAME_BYTES)
-        .then_some(frame)
+        .then_some(TerminalStreamFrame {
+            serialized: frame,
+            content_revision,
+        })
         .ok_or("serialized terminal frame exceeded protocol limit")
 }
 
@@ -1276,7 +1304,10 @@ fn stream_event_for_target(line: &str, terminal_id: &str) -> Option<(String, u64
     })
 }
 
+/// Serialize writes from the output forwarder and correlated control replies.
 fn write_shared_frame(writer: &Mutex<Conn>, frame: &str) -> io::Result<()> {
+    #[cfg(test)]
+    tests::pause_initial_frame_write(frame);
     let mut writer = writer
         .lock()
         .map_err(|_| io::Error::other("terminal stream writer unavailable"))?;
@@ -1287,6 +1318,7 @@ fn control_action_response(
     frame: &[u8],
     target: &crate::terminal::backend::ObserveTarget,
     event_tx: &Sender<AppEvent>,
+    uploads: &mut crate::terminal::upload::UploadState,
 ) -> String {
     if reject_duplicate_keys(frame).is_err() {
         return json!({"id":"0","error":{"code":"invalid_request","message":"bad json"}})
@@ -1315,22 +1347,199 @@ fn control_action_response(
         .to_string();
     }
     let action = value["action"].as_str().unwrap_or_default();
+    let mut params = value["params"].as_object().cloned().unwrap_or_default();
+    if action == "upload_start" {
+        if params.len() != 2 || !params.contains_key("name") || !params.contains_key("size") {
+            return json!({"id":id,"error":{"code":"invalid_params",
+                "message":"upload_start requires only name and size"}})
+            .to_string();
+        }
+        let Some(name) = params.get("name").and_then(Value::as_str) else {
+            return json!({"id":id,"error":{"code":"invalid_params",
+                "message":"upload name must be a string"}})
+            .to_string();
+        };
+        let Some(size) = params
+            .get("size")
+            .and_then(Value::as_u64)
+            .and_then(|size| usize::try_from(size).ok())
+        else {
+            return json!({"id":id,"error":{"code":"invalid_params",
+                "message":"upload size must be an integer"}})
+            .to_string();
+        };
+        return match uploads.start(name, size) {
+            Ok(upload_id) => json!({"id":id,"result":{
+                "type":"terminal_upload",
+                "upload_id":upload_id,
+                "max_chunk_bytes":crate::terminal::upload::MAX_CHUNK_BYTES,
+            }})
+            .to_string(),
+            Err(_) => json!({"id":id,"error":{"code":"upload_failed",
+                "message":"terminal upload could not be started"}})
+            .to_string(),
+        };
+    }
+    if action == "upload_chunk" {
+        if params.len() != 3
+            || !params.contains_key("upload_id")
+            || !params.contains_key("offset")
+            || !params.contains_key("data_base64")
+        {
+            return json!({"id":id,"error":{"code":"invalid_params",
+                "message":"upload_chunk requires only upload_id, offset, and data_base64"}})
+            .to_string();
+        }
+        let upload_id = params
+            .get("upload_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let offset = params
+            .get("offset")
+            .and_then(Value::as_u64)
+            .and_then(|offset| usize::try_from(offset).ok());
+        let encoded = params
+            .get("data_base64")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return match offset.and_then(|offset| uploads.append(upload_id, offset, encoded).ok()) {
+            Some(received) => json!({"id":id,"result":{
+                "type":"terminal_upload_chunk","received":received,
+            }})
+            .to_string(),
+            None => json!({"id":id,"error":{"code":"invalid_params",
+                "message":"terminal upload chunk was rejected"}})
+            .to_string(),
+        };
+    }
+    if action == "upload_cancel" {
+        let upload_id = params
+            .get("upload_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if params.len() != 1 || upload_id.is_empty() || !uploads.cancel(upload_id) {
+            return json!({"id":id,"error":{"code":"invalid_params",
+                "message":"terminal upload is not active"}})
+            .to_string();
+        }
+        return json!({"id":id,"result":{"type":"terminal_upload_cancelled"}}).to_string();
+    }
+    if action == "set_viewport" {
+        // Geometry is a stream-only action: only the terminal's single control
+        // lease may ask for it, and the app loop decides whether it applies.
+        let cols = crate::terminal::backend::viewport_dimension(
+            params.get("cols"),
+            crate::terminal::backend::MAX_VIEWPORT_COLS,
+        );
+        let rows = crate::terminal::backend::viewport_dimension(
+            params.get("rows"),
+            crate::terminal::backend::MAX_VIEWPORT_ROWS,
+        );
+        if params.len() != 2 || cols.is_none() || rows.is_none() {
+            return json!({"id":id,"error":{"code":"invalid_params",
+                "message":"set_viewport requires only bounded cols and rows"}})
+            .to_string();
+        }
+        params.insert(
+            "server_generation".into(),
+            Value::String(target.server_generation.clone()),
+        );
+        params.insert(
+            "terminal_id".into(),
+            Value::String(target.terminal_id.clone()),
+        );
+        params.insert("pane_id".into(), Value::String(target.pane_id.clone()));
+        let (reply, receiver) = mpsc::channel();
+        if event_tx
+            .send(AppEvent::BackendViewport {
+                params: Value::Object(params),
+                reply,
+            })
+            .is_err()
+        {
+            return json!({"id":id,"error":{"code":"unavailable","message":"app loop unavailable"}})
+                .to_string();
+        }
+        return match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(result)) => json!({"id":id,"result":result}).to_string(),
+            Ok(Err(error)) => error.envelope(id),
+            Err(_) => {
+                json!({"id":id,"error":{"code":"timeout","message":"control action timed out"}})
+                    .to_string()
+            }
+        };
+    }
+    let staged_upload = if action == "upload_finish" {
+        let upload_id = params
+            .get("upload_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if params.len() != 1 || upload_id.is_empty() {
+            return json!({"id":id,"error":{"code":"invalid_params",
+                "message":"upload_finish requires only upload_id"}})
+            .to_string();
+        }
+        let path = match uploads.finish(upload_id) {
+            Ok(path) => path,
+            Err(_) => {
+                return json!({"id":id,"error":{"code":"upload_failed",
+                    "message":"terminal upload could not be completed"}})
+                .to_string()
+            }
+        };
+        params.clear();
+        params.insert(
+            "text".into(),
+            Value::String(path.to_string_lossy().into_owned()),
+        );
+        Some(path)
+    } else {
+        None
+    };
     let (method, allowed): (&str, &[&str]) = match action {
         "type_literal" => ("terminal.backend.type_literal", &["text"]),
+        "paste_text" => ("terminal.backend.paste_text", &["text"]),
+        "paste_image" => ("terminal.backend.paste_text", &["png_base64"]),
+        "upload_finish" => ("terminal.backend.paste_text", &["text"]),
         "submit_text" => ("terminal.backend.submit_text", &["text"]),
         "send_key" => ("terminal.backend.send_key", &["key"]),
         _ => {
             return json!({"id":id,"error":{"code":"invalid_params",
-                "message":"action must be type_literal, submit_text, or send_key"}})
+                "message":"unknown terminal control action"}})
             .to_string()
         }
     };
-    let mut params = value["params"].as_object().cloned().unwrap_or_default();
     if params.keys().any(|key| !allowed.contains(&key.as_str())) {
+        if let Some(path) = staged_upload.as_deref() {
+            crate::terminal::upload::discard_completed(path);
+        }
         return json!({"id":id,"error":{"code":"invalid_params",
             "message":"control action contains an unknown parameter"}})
         .to_string();
     }
+    let staged_image = if action == "paste_image" {
+        let Some(encoded) = params.get("png_base64").and_then(Value::as_str) else {
+            return json!({"id":id,"error":{"code":"invalid_params",
+                "message":"png_base64 must be a bounded PNG encoding"}})
+            .to_string();
+        };
+        let path = match crate::clipboard_image::stage_web_png(encoded) {
+            Ok(path) => path,
+            Err(_) => {
+                return json!({"id":id,"error":{"code":"invalid_params",
+                    "message":"png_base64 must be a valid bounded PNG"}})
+                .to_string()
+            }
+        };
+        params.clear();
+        params.insert(
+            "text".into(),
+            Value::String(path.to_string_lossy().into_owned()),
+        );
+        Some(path)
+    } else {
+        None
+    };
     params.insert(
         "server_generation".into(),
         Value::String(target.server_generation.clone()),
@@ -1350,17 +1559,43 @@ fn control_action_response(
         }))
         .is_err()
     {
+        if let Some(path) = staged_image.as_deref() {
+            crate::clipboard_image::discard_staged_png(path);
+        }
+        if let Some(path) = staged_upload.as_deref() {
+            crate::terminal::upload::discard_completed(path);
+        }
         return json!({"id":id,"error":{"code":"unavailable","message":"app loop unavailable"}})
             .to_string();
     }
-    receiver
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap_or_else(|_| {
-            json!({"id":id,"error":{"code":"timeout","message":"control action timed out"}})
-                .to_string()
-        })
+    let response = match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(response) => response,
+        Err(_) => {
+            // The app may still consume an already-admitted request. Preserve
+            // the staged image for its bounded stale-file cleanup rather than
+            // racing that possible paste by deleting it here.
+            return json!({"id":id,"error":{"code":"timeout","message":"control action timed out"}})
+                .to_string();
+        }
+    };
+    if staged_image.is_some()
+        && serde_json::from_str::<Value>(&response)
+            .ok()
+            .is_some_and(|value| value.get("error").is_some())
+    {
+        crate::clipboard_image::discard_staged_png(staged_image.as_deref().unwrap());
+    }
+    if staged_upload.is_some()
+        && serde_json::from_str::<Value>(&response)
+            .ok()
+            .is_some_and(|value| value.get("error").is_some())
+    {
+        crate::terminal::upload::discard_completed(staged_upload.as_deref().unwrap());
+    }
+    response
 }
 
+/// Own a bounded observe/control subscription until disconnect or cancellation.
 fn handle_terminal_stream(
     reader: &mut BufReader<Conn>,
     writer: Conn,
@@ -1482,11 +1717,11 @@ fn handle_terminal_stream(
         .spawn(move || {
             let mut last_revision = u64::MAX;
             if let Ok(frame) = terminal_stream_frame(&forward_target, sequence) {
-                if write_shared_frame(&forward_writer, &frame).is_err() {
+                if write_shared_frame(&forward_writer, &frame.serialized).is_err() {
                     forward_active.store(false, Ordering::Release);
                     return;
                 }
-                last_revision = forward_target.content_revision.load(Ordering::Acquire);
+                last_revision = frame.content_revision;
             }
             for line in receiver {
                 if !forward_active.load(Ordering::Acquire) {
@@ -1513,11 +1748,11 @@ fn handle_terminal_stream(
                         forward_active.store(false, Ordering::Release);
                         break;
                     };
-                    if write_shared_frame(&forward_writer, &frame).is_err() {
+                    if write_shared_frame(&forward_writer, &frame.serialized).is_err() {
                         forward_active.store(false, Ordering::Release);
                         break;
                     }
-                    last_revision = revision;
+                    last_revision = frame.content_revision;
                 } else if matches!(event.as_str(), "terminal.exited" | "terminal.closed") {
                     let _ = write_shared_frame(&forward_writer, &line);
                     forward_active.store(false, Ordering::Release);
@@ -1536,6 +1771,7 @@ fn handle_terminal_stream(
         .ok();
     let mut chunk = [0_u8; 4096];
     let mut control_buffer = Vec::new();
+    let mut uploads = crate::terminal::upload::UploadState::new();
     while active.load(Ordering::Acquire) {
         match reader.read(&mut chunk) {
             Ok(0)
@@ -1557,6 +1793,7 @@ fn handle_terminal_stream(
                         &frame[..frame.len().saturating_sub(1)],
                         &target,
                         event_tx,
+                        &mut uploads,
                     );
                     if let Ok(mut locked) = shared_writer.lock() {
                         if write_response(&mut *locked, "0", &response).is_err() {
@@ -2702,6 +2939,137 @@ mod tests {
         assert!(reject_duplicate_keys(br#"{"id":"1","params":{"x":2}}"#).is_ok());
     }
 
+    struct FrameWriteBarrier {
+        captured: Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+
+    static FRAME_WRITE_BARRIERS: std::sync::LazyLock<
+        Mutex<std::collections::HashMap<String, FrameWriteBarrier>>,
+    > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+    /// Apply a terminal-specific, one-shot barrier after capture in tests only.
+    pub(super) fn pause_initial_frame_write(frame: &str) {
+        let value: Value = serde_json::from_str(frame).unwrap();
+        if value["event"] != "terminal.frame" {
+            return;
+        }
+        let barrier = FRAME_WRITE_BARRIERS
+            .lock()
+            .unwrap()
+            .remove(value["data"]["terminal_id"].as_str().unwrap());
+        if let Some(barrier) = barrier {
+            barrier.captured.send(()).unwrap();
+            barrier
+                .resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+
+    /// Force the quiet-final-update schedule through the real IPC forwarder.
+    fn assert_final_update_during_initial_write(control: bool) {
+        let _env = crate::persist::test_env("observe-write-race");
+        let root = crate::persist::ensure_config_dir();
+        let path = root.join("race.sock");
+        let lock = transport::acquire_server_startup_lock(&root).unwrap();
+        let listener = bind_server(&path, &lock).unwrap();
+        let (events, event_rx) = mpsc::channel();
+        let bus = new_bus();
+        start_server(listener, events, bus.clone());
+        drop(lock);
+        let mut target = observe_target();
+        target.terminal_id = format!("initial-write-race-{control}");
+        let terminal_id = target.terminal_id.clone();
+        let engine = Arc::clone(&target.engine);
+        let revision = Arc::clone(&target.content_revision);
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        FRAME_WRITE_BARRIERS.lock().unwrap().insert(
+            terminal_id.clone(),
+            FrameWriteBarrier {
+                captured: captured_tx,
+                resume: resume_rx,
+            },
+        );
+        let client_terminal = terminal_id.clone();
+        let client =
+            thread::spawn(move || {
+                let mut stream = transport::connect(&path).unwrap();
+                stream
+                    .set_timeouts(std::time::Duration::from_secs(5))
+                    .unwrap();
+                writeln!(stream, "{}", json!({"id":"race","method":if control {
+                "terminal.backend.control"
+            } else { "terminal.backend.observe" },"params":{
+                "server_generation":"generation","terminal_id":client_terminal,"pane_id":"7",
+                "mode":"visible","lines":4,"ansi":true
+            }})).unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut frames = Vec::new();
+                loop {
+                    let frame: Value =
+                        serde_json::from_str(&read_response_frame(&mut reader).unwrap()).unwrap();
+                    if frame["event"] == "terminal.closed" {
+                        break;
+                    }
+                    if frame["event"] == "terminal.frame" {
+                        frames.push(frame);
+                    }
+                }
+                frames
+            });
+        let AppEvent::BackendObserve { reply, .. } = event_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        else {
+            panic!("stream must resolve its target");
+        };
+        reply.send(Ok(target)).unwrap();
+        captured_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        {
+            let mut engine = engine.lock().unwrap();
+            engine.advance(b"\r\nfinal-quiet-marker");
+            revision.fetch_add(1, Ordering::AcqRel);
+        }
+        publish_event(
+            &bus,
+            "terminal.output_ready",
+            json!({"terminal_id":terminal_id,"content_revision":4}),
+        );
+        // Both events fit the bounded queue. Close gives a deterministic end
+        // marker even on the buggy baseline; no timeout is the red proof.
+        publish_event(&bus, "terminal.closed", json!({"terminal_id":terminal_id}));
+        resume_tx.send(()).unwrap();
+        let frames = client.join().unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|f| f["data"]["content_revision"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![3, 4],
+            "the final quiet revision must follow the emitted initial frame"
+        );
+        assert!(frames[1]["data"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("final-quiet-marker"));
+    }
+
+    #[test]
+    /// Pin observe delivery when output advances before the first write finishes.
+    fn observe_does_not_skip_output_during_initial_frame_write() {
+        assert_final_update_during_initial_write(false);
+    }
+
+    #[test]
+    /// Pin the same initial-write invariant on the shared control forwarder.
+    fn control_does_not_skip_output_during_initial_frame_write() {
+        assert_final_update_during_initial_write(true);
+    }
+
     fn observe_target() -> crate::terminal::backend::ObserveTarget {
         use crate::terminal::vt::VtEngine;
 
@@ -2717,23 +3085,37 @@ mod tests {
             mode: crate::terminal::backend::CaptureMode::Visible,
             lines: 4,
             ansi: true,
+            cursor: false,
         }
     }
 
     #[test]
+    /// Keep serialized identity, captured revision and payload bounds coupled.
     fn terminal_stream_frame_is_bounded_and_identified() {
         let target = observe_target();
         let frame = terminal_stream_frame(&target, 12).unwrap();
-        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame.content_revision, 3);
+        let frame: Value = serde_json::from_str(&frame.serialized).unwrap();
         assert_eq!(frame["event"], "terminal.frame");
         assert_eq!(frame["sequence"], 12);
         assert_eq!(frame["data"]["terminal_id"], "terminal");
         assert_eq!(frame["data"]["content_revision"], 3);
         assert!(frame["data"]["text"].as_str().unwrap().contains("hello"));
+        assert!(frame["data"].get("cursor").is_none());
         assert!(
             frame["data"]["bytes"].as_u64().unwrap()
                 <= crate::terminal::backend::MAX_OBSERVE_BYTES as u64
         );
+    }
+
+    #[test]
+    fn terminal_stream_cursor_is_explicitly_negotiated() {
+        let mut target = observe_target();
+        target.cursor = true;
+        let frame = terminal_stream_frame(&target, 12).unwrap();
+        let frame: Value = serde_json::from_str(&frame.serialized).unwrap();
+        assert!(frame["data"].get("cursor").is_some());
+        assert_eq!(frame["data"]["cursor"]["padding_cells"], 0);
     }
 
     #[test]
@@ -2761,8 +3143,87 @@ mod tests {
     }
 
     #[test]
-    fn terminal_control_frames_reuse_strict_uhp_actions() {
+    fn set_viewport_is_a_stream_action_answered_by_the_app_loop() {
+        let _env = crate::persist::test_env("terminal-control-viewport");
         let target = observe_target();
+        let mut uploads = crate::terminal::upload::UploadState::new();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let AppEvent::BackendViewport { params, reply } = event_rx.recv().unwrap() else {
+                panic!("set_viewport must not reuse a one-request terminal method");
+            };
+            assert_eq!(params["server_generation"], "generation");
+            assert_eq!(params["terminal_id"], "terminal");
+            assert_eq!(params["pane_id"], "7");
+            assert_eq!(params["cols"], 40);
+            assert_eq!(params["rows"], 18);
+            reply
+                .send(Ok(json!({"type":"terminal_backend_action",
+                    "state":"succeeded","dispatch":"executed"})))
+                .unwrap();
+        });
+        let response = control_action_response(
+            br#"{"id":"size-1","action":"set_viewport","params":{"cols":40,"rows":18}}"#,
+            &target,
+            &event_tx,
+            &mut uploads,
+        );
+        worker.join().unwrap();
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["id"], "size-1");
+        assert_eq!(value["result"]["type"], "terminal_backend_action");
+        assert_eq!(value["result"]["dispatch"], "executed");
+
+        let (refused_tx, refused_rx) = mpsc::channel();
+        let refusing = thread::spawn(move || {
+            let AppEvent::BackendViewport { reply, .. } = refused_rx.recv().unwrap() else {
+                panic!("set_viewport must reach the app loop");
+            };
+            reply
+                .send(Err(crate::terminal::backend::BackendError::mutation(
+                    "unavailable",
+                    "a native client owns terminal geometry",
+                    crate::terminal::backend::DispatchEvidence::Rejected,
+                )))
+                .unwrap();
+        });
+        let refused = control_action_response(
+            br#"{"id":"size-2","action":"set_viewport","params":{"cols":40,"rows":18}}"#,
+            &target,
+            &refused_tx,
+            &mut uploads,
+        );
+        refusing.join().unwrap();
+        let refused: Value = serde_json::from_str(&refused).unwrap();
+        assert_eq!(refused["id"], "size-2");
+        assert_eq!(refused["error"]["code"], "unavailable");
+        assert_eq!(refused["error"]["dispatch"], "rejected");
+
+        let (strict_tx, strict_rx) = mpsc::channel();
+        for frame in [
+            br#"{"id":"size-3","action":"set_viewport","params":{"cols":1,"rows":18}}"#.as_slice(),
+            br#"{"id":"size-3","action":"set_viewport","params":{"cols":40}}"#.as_slice(),
+            br#"{"id":"size-3","action":"set_viewport","params":{"cols":"40","rows":18}}"#
+                .as_slice(),
+            br#"{"id":"size-3","action":"set_viewport","params":{"cols":40,"rows":18,"pane_id":"9"}}"#
+                .as_slice(),
+        ] {
+            let rejected = control_action_response(frame, &target, &strict_tx, &mut uploads);
+            let rejected: Value = serde_json::from_str(&rejected).unwrap();
+            assert_eq!(rejected["error"]["code"], "invalid_params");
+        }
+        assert!(
+            strict_rx.try_recv().is_err(),
+            "malformed viewports never reach the app loop"
+        );
+    }
+
+    #[test]
+    fn terminal_control_frames_reuse_strict_uhp_actions() {
+        let _env = crate::persist::test_env("terminal-control-actions");
+        let target = observe_target();
+        let mut uploads = crate::terminal::upload::UploadState::new();
         let (event_tx, event_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
             let AppEvent::Api(request) = event_rx.recv().unwrap() else {
@@ -2782,6 +3243,7 @@ mod tests {
             br#"{"id":"action-1","action":"type_literal","params":{"text":"safe text"}}"#,
             &target,
             &event_tx,
+            &mut uploads,
         );
         worker.join().unwrap();
         assert_eq!(
@@ -2789,10 +3251,119 @@ mod tests {
             "ok"
         );
 
+        let (paste_tx, paste_rx) = mpsc::channel();
+        let paste_worker = thread::spawn(move || {
+            let AppEvent::Api(request) = paste_rx.recv().unwrap() else {
+                panic!("paste frame must use the normal API handoff");
+            };
+            assert_eq!(request.id, "paste-1");
+            assert_eq!(request.method, "terminal.backend.paste_text");
+            assert_eq!(request.params["text"], "first\nsecond");
+            request
+                .reply
+                .send(json!({"id":"paste-1","result":{"type":"ok"}}).to_string())
+                .unwrap();
+        });
+        let paste_response = control_action_response(
+            br#"{"id":"paste-1","action":"paste_text","params":{"text":"first\nsecond"}}"#,
+            &target,
+            &paste_tx,
+            &mut uploads,
+        );
+        paste_worker.join().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&paste_response).unwrap()["result"]["type"],
+            "ok"
+        );
+
+        let png = crate::clipboard_image::encode_rgba_png(1, 1, |_, _| [1, 2, 3, 255]).unwrap();
+        let encoded = crate::base64_encode(&png);
+        let (image_tx, image_rx) = mpsc::channel();
+        let image_worker = thread::spawn(move || {
+            let AppEvent::Api(request) = image_rx.recv().unwrap() else {
+                panic!("image frame must use the normal API handoff");
+            };
+            assert_eq!(request.id, "image-1");
+            assert_eq!(request.method, "terminal.backend.paste_text");
+            let path = std::path::Path::new(request.params["text"].as_str().unwrap());
+            assert!(path.exists());
+            assert_eq!(std::fs::read(path).unwrap(), png);
+            request
+                .reply
+                .send(json!({"id":"image-1","result":{"type":"ok"}}).to_string())
+                .unwrap();
+        });
+        let image_response = control_action_response(
+            format!(
+                r#"{{"id":"image-1","action":"paste_image","params":{{"png_base64":"{encoded}"}}}}"#
+            )
+            .as_bytes(),
+            &target,
+            &image_tx,
+            &mut uploads,
+        );
+        image_worker.join().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&image_response).unwrap()["result"]["type"],
+            "ok"
+        );
+
+        let start = control_action_response(
+            br#"{"id":"upload-1","action":"upload_start","params":{"name":"notes.txt","size":5}}"#,
+            &target,
+            &event_tx,
+            &mut uploads,
+        );
+        let upload_id = serde_json::from_str::<Value>(&start).unwrap()["result"]["upload_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let chunk = control_action_response(
+            format!(
+                r#"{{"id":"upload-2","action":"upload_chunk","params":{{"upload_id":"{upload_id}","offset":0,"data_base64":"aGVsbG8="}}}}"#
+            )
+            .as_bytes(),
+            &target,
+            &event_tx,
+            &mut uploads,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&chunk).unwrap()["result"]["received"],
+            5
+        );
+        let (upload_tx, upload_rx) = mpsc::channel();
+        let upload_worker = thread::spawn(move || {
+            let AppEvent::Api(request) = upload_rx.recv().unwrap() else {
+                panic!("completed upload must use bracketed-paste handoff");
+            };
+            assert_eq!(request.method, "terminal.backend.paste_text");
+            let path = std::path::Path::new(request.params["text"].as_str().unwrap());
+            assert_eq!(std::fs::read(path).unwrap(), b"hello");
+            request
+                .reply
+                .send(json!({"id":"upload-3","result":{"type":"ok"}}).to_string())
+                .unwrap();
+        });
+        let finish = control_action_response(
+            format!(
+                r#"{{"id":"upload-3","action":"upload_finish","params":{{"upload_id":"{upload_id}"}}}}"#
+            )
+            .as_bytes(),
+            &target,
+            &upload_tx,
+            &mut uploads,
+        );
+        upload_worker.join().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&finish).unwrap()["result"]["type"],
+            "ok"
+        );
+
         let rejected = control_action_response(
             br#"{"id":"bad","action":"type_literal","params":{"text":"x","extra":true}}"#,
             &target,
             &event_tx,
+            &mut uploads,
         );
         assert_eq!(
             serde_json::from_str::<Value>(&rejected).unwrap()["error"]["code"],
@@ -2801,6 +3372,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserve initial/change frames, exact filtering, deduplication and exit.
     fn observe_stream_sends_initial_and_change_driven_frames() {
         let _env = crate::persist::test_env("terminal-observe-stream");
         let root = crate::persist::ensure_config_dir();
@@ -2814,6 +3386,7 @@ mod tests {
 
         let client_path = path.clone();
         let (initial_tx, initial_rx) = mpsc::channel();
+        let (updated_tx, updated_rx) = mpsc::channel();
         let client = thread::spawn(move || {
             let mut stream = transport::connect(&client_path).unwrap();
             stream
@@ -2830,12 +3403,15 @@ mod tests {
             .unwrap();
             let mut reader = BufReader::new(stream);
             let mut lines = Vec::new();
-            for index in 0..3 {
+            for index in 0..4 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 lines.push(serde_json::from_str::<Value>(&line).unwrap());
                 if index == 1 {
                     initial_tx.send(()).unwrap();
+                }
+                if index == 2 {
+                    updated_tx.send(()).unwrap();
                 }
             }
             lines
@@ -2849,6 +3425,11 @@ mod tests {
         let revision = Arc::clone(&target.content_revision);
         reply.send(Ok(target)).unwrap();
         initial_rx.recv().unwrap();
+        publish_event(
+            &bus,
+            "terminal.output_ready",
+            json!({"terminal_id":"other-terminal","content_revision":99}),
+        );
         engine.lock().unwrap().advance(b"\r\nupdated");
         revision.fetch_add(1, Ordering::AcqRel);
         publish_event(
@@ -2857,6 +3438,16 @@ mod tests {
             json!({"terminal_id":"terminal","pane":"7","content_revision":4}),
         );
 
+        updated_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        publish_event(
+            &bus,
+            "terminal.output_ready",
+            json!({"terminal_id":"terminal","content_revision":4}),
+        );
+        publish_event(&bus, "terminal.exited", json!({"terminal_id":"terminal"}));
+
         let lines = client.join().unwrap();
         assert_eq!(lines[0]["result"]["type"], "terminal_backend_stream");
         assert_eq!(lines[0]["result"]["queue_capacity"], 2);
@@ -2864,6 +3455,10 @@ mod tests {
         assert_eq!(lines[1]["data"]["content_revision"], 3);
         assert_eq!(lines[2]["event"], "terminal.frame");
         assert_eq!(lines[2]["data"]["content_revision"], 4);
+        assert_eq!(
+            lines[3]["event"], "terminal.exited",
+            "duplicate revisions must not emit another frame"
+        );
         assert!(lines[2]["data"]["text"]
             .as_str()
             .unwrap()

@@ -65,6 +65,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transpose_contract_is_mutating_and_revision_fenced() {
+        let bundle = schema_bundle();
+        let params = &bundle["request"]["$defs"]["paneTransposeParams"];
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(params["properties"]["if_revision"]["type"], "integer");
+        assert_eq!(
+            crate::api::capabilities::required_scope("pane.transpose"),
+            "workspace"
+        );
+        assert!(!crate::api::capabilities::is_read_only("pane.transpose"));
+    }
+
+    #[test]
     fn schema_method_enum_tracks_registry() {
         let bundle = schema_bundle();
         let methods = bundle["request"]["properties"]["method"]["enum"]
@@ -75,6 +88,100 @@ mod tests {
         let registry: std::collections::BTreeSet<_> =
             super::super::capabilities::all_methods().collect();
         assert_eq!(schema, registry);
+    }
+
+    #[test]
+    fn module_update_contract_requires_the_old_identity_fence() {
+        let bundle = schema_bundle();
+        let params = &bundle["request"]["$defs"]["moduleUpdateParams"];
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(
+            params["required"],
+            json!(["id", "path", "source", "expected_root", "expected_source"])
+        );
+        assert_eq!(
+            params["properties"]["git_ref"]["type"],
+            json!(["string", "null"])
+        );
+        assert!(bundle["request"]["allOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|branch| {
+                branch["if"]["properties"]["method"]["const"] == "module.update"
+                    && branch["then"]["properties"]["params"]["$ref"]
+                        == "#/$defs/moduleUpdateParams"
+            }));
+        assert_eq!(
+            crate::api::capabilities::required_scope("module.update"),
+            "extensions"
+        );
+        assert!(!crate::api::capabilities::is_read_only("module.update"));
+    }
+
+    #[test]
+    fn pane_list_request_contract_exposes_boolean_all_tabs_scope() {
+        let bundle = schema_bundle();
+        let request = &bundle["request"];
+        let params = &request["$defs"]["paneListParams"];
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(params["properties"]["all_tabs"]["type"], "boolean");
+        assert_eq!(params["properties"]["all_tabs"]["default"], true);
+        assert!(params.get("required").is_none());
+        assert!(request["allOf"].as_array().unwrap().iter().any(|branch| {
+            branch["if"]["properties"]["method"]["const"] == "pane.list"
+                && branch["then"]["properties"]["params"]["$ref"] == "#/$defs/paneListParams"
+        }));
+    }
+
+    #[test]
+    fn task_start_request_contract_can_preserve_focus() {
+        let bundle = schema_bundle();
+        let params = &bundle["request"]["$defs"]["taskStartParams"];
+
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(params["properties"]["focus"]["type"], "boolean");
+        assert!(!params["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "focus"));
+    }
+
+    /// `agent.list`, `agent.get`, and snapshot rows share one bounded,
+    /// nullable, optional title definition in the embedded schema.
+    #[test]
+    fn agent_session_title_contract_is_shared_by_every_projection() {
+        let response = &schema_bundle()["response"];
+        let title = &response["$defs"]["agentSessionTitle"];
+        assert_eq!(
+            title["anyOf"],
+            json!([
+                { "type": "null" },
+                { "type": "string", "minLength": 1, "maxLength": 160 }
+            ])
+        );
+        let reference = json!({ "$ref": "#/$defs/agentSessionTitle" });
+        let terminal_row = &response["$defs"]["snapshotAliasRow"]["allOf"][0]["then"];
+        assert_eq!(terminal_row["properties"]["agent_session_title"], reference);
+        let list_row = &response["$defs"]["agentListTitles"]["properties"]["agents"]["items"];
+        assert_eq!(list_row["properties"]["agent_session_title"], reference);
+        assert!(
+            list_row.get("required").is_none() && list_row.get("additionalProperties").is_none(),
+            "older servers may omit the field, and rows stay extensible"
+        );
+        let get = response["allOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| {
+                branch["if"]["properties"]["result"]["properties"]["type"]["const"] == "agent"
+            })
+            .expect("agent result branch");
+        assert_eq!(
+            get["then"]["properties"]["result"]["properties"]["agent_session_title"],
+            reference
+        );
     }
 
     #[test]
@@ -101,6 +208,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn task_prompt_request_contract_is_bounded_and_editable() {
+        let bundle = schema_bundle();
+        let definitions = &bundle["request"]["$defs"];
+        assert_eq!(definitions["taskAddParams"]["required"], json!(["title"]));
+        assert_eq!(
+            definitions["taskAddParams"]["properties"]["title"]["$comment"],
+            format!(
+                "Consumers must enforce a {}-byte UTF-8 limit.",
+                crate::orch::MAX_TASK_TITLE_BYTES
+            )
+        );
+        assert_eq!(
+            definitions["taskAddParams"]["properties"]["prompt"]["$comment"],
+            format!(
+                "Consumers must enforce a {}-byte UTF-8 limit.",
+                crate::orch::MAX_TASK_PROMPT_BYTES
+            )
+        );
+        assert!(definitions["taskAddParams"]["properties"]["title"]
+            .get("maxLength")
+            .is_none());
+        assert!(definitions["taskAddParams"]["properties"]["prompt"]
+            .get("maxLength")
+            .is_none());
+        assert_eq!(
+            definitions["taskAddParams"]["properties"]["workspace_id"]["type"],
+            "string"
+        );
+        assert!(definitions["taskAddParams"]["properties"]
+            .get("pane")
+            .is_some());
+        assert_eq!(
+            definitions["taskUpdateParams"]["properties"]["prompt"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            definitions["taskUpdateParams"]["properties"]["prompt"]["$comment"],
+            format!(
+                "Consumers must enforce a {}-byte UTF-8 limit.",
+                crate::orch::MAX_TASK_PROMPT_BYTES
+            )
+        );
+        assert!(definitions["taskUpdateParams"]["properties"]["prompt"]
+            .get("maxLength")
+            .is_none());
     }
 
     #[test]
@@ -145,6 +300,7 @@ mod tests {
             "pane.renamed",
             "pane.resized",
             "pane.swapped",
+            "pane.transposed",
             "pane.zoomed",
             "server.agent_manifests_reloaded",
             "tab.closed",
@@ -164,6 +320,7 @@ mod tests {
             "task.needs_compaction",
             "task.ready",
             "task.released",
+            "task.retried",
             "task.started",
             "task.updated",
             "terminal.closed",
@@ -293,8 +450,12 @@ mod tests {
             .iter()
             .map(|value| value.as_str().unwrap())
             .collect();
+        assert!(!task_required.contains("prompt"));
         assert!(!task_required.contains("mode"));
         assert!(!task_required.contains("workspace_worker"));
+        assert!(!task_required.contains("project"));
+        assert!(task_required.contains("attempt"));
+        assert!(task_required.contains("previous_attempts"));
         assert_eq!(
             task["properties"]["mode"]["enum"],
             json!(["worktree", "workspace"])
@@ -303,6 +464,23 @@ mod tests {
             task["properties"]["workspace_worker"]["$ref"],
             "#/$defs/workspace_worker"
         );
+        assert_eq!(
+            task["properties"]["project"]["$ref"],
+            "#/$defs/task_project"
+        );
+        assert_eq!(
+            task["properties"]["prompt"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(task["properties"]["attempt"]["minimum"], 1);
+        assert_eq!(
+            task["properties"]["previous_attempts"]["maxItems"],
+            crate::orch::MAX_TASK_ATTEMPTS
+        );
+
+        let task_retried = &definitions["task_retried"];
+        assert_eq!(task_retried["additionalProperties"], false);
+        assert_eq!(task_retried["properties"]["attempt"]["minimum"], 2);
 
         let workspace_worker = &definitions["workspace_worker"];
         let workspace_worker_required: std::collections::BTreeSet<_> = workspace_worker["required"]

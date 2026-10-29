@@ -17,6 +17,9 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
+use windows_sys::Win32::System::Console::{
+    GetCurrentConsoleFontEx, GetStdHandle, CONSOLE_FONT_INFOEX, STD_OUTPUT_HANDLE,
+};
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -26,6 +29,73 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_BASIC_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_VM_READ, RTL_USER_PROCESS_PARAMETERS,
 };
+
+mod clipboard;
+
+pub(super) fn directory_identity(path: &Path) -> Option<super::DirectoryIdentity> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: the path is NUL-terminated, and the owned handle is closed below.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is valid and `info` is writable for this call.
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) } != 0;
+    // SAFETY: `handle` is owned by this function and is no longer needed.
+    unsafe { CloseHandle(handle) };
+    if !ok || info.dwVolumeSerialNumber == 0 {
+        return None;
+    }
+    let file = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    if file == 0 {
+        return None;
+    }
+    Some(super::DirectoryIdentity {
+        volume: u64::from(info.dwVolumeSerialNumber),
+        file,
+    })
+}
+
+pub(super) fn clipboard_image() -> Option<Vec<u8>> {
+    clipboard::clipboard_image()
+}
+
+pub(super) fn terminal_cell_pixels() -> Option<(u16, u16)> {
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut info: CONSOLE_FONT_INFOEX = std::mem::zeroed();
+        info.cbSize = size_of::<CONSOLE_FONT_INFOEX>() as u32;
+        if GetCurrentConsoleFontEx(handle, 0, &mut info) == 0 {
+            return None;
+        }
+        let width = info.dwFontSize.X;
+        let height = info.dwFontSize.Y;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some((width as u16, height as u16))
+    }
+}
 
 const MAX_PROCESS_ENTRIES: usize = 16_384;
 const MAX_DESCENDANTS_PER_ROOT: usize = 64;

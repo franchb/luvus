@@ -17,21 +17,65 @@ env:
   CARGO_HTTP_MULTIPLEXING: "false"
 
 jobs:
+  npm:
+    name: npm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.18.0
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            website/package-lock.json
+      - name: Audit web dependencies
+        run: npm --prefix web audit --package-lock-only --ignore-scripts
+      - name: Audit website dependencies
+        run: npm --prefix website audit --package-lock-only --ignore-scripts
+
   test:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.18.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --prefix web
+      - name: Verify embedded web assets
+        run: |
+          npm --prefix web run build:native
+          git diff --exit-code -- src/web/assets
       # Path dependencies retain their upstream formatting; check Luvus itself.
       - run: cargo fmt --package luvus --check
       # `-D warnings` is scoped to clippy on our own crate — NOT a global
       # RUSTFLAGS, which would also fail on harmless dependency warnings.
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Validate detached server lifecycle
+        run: |
+          cargo build --locked
+          python3 tests/server_detach_pty.py --luvus target/debug/luvus
+          python3 scripts/test-terminal-colors-pty.py --luvus target/debug/luvus
+      - name: Validate web client and bridge
+        run: |
+          cargo build --locked
+          npm --prefix web run check
+          npm --prefix web test
+          npm --prefix web run test:integration
+          LUVUS_BIN="$PWD/target/debug/luvus" npm --prefix web run test:native
+          LUVUS_BIN="$PWD/target/debug/luvus" LUVUS_BROWSER_BIN=/usr/bin/google-chrome npm --prefix web run test:browser-pairing
       - name: Validate terminal backend contract
         run: |
           python3 examples/uhp/terminal/consumer.py --fixtures
@@ -137,6 +181,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+      - name: Validate detached server lifecycle
+        run: |
+          cargo build --locked
+          python3 tests/server_detach_pty.py --luvus target/debug/luvus
+          python3 scripts/test-terminal-colors-pty.py --luvus target/debug/luvus
       - name: Validate terminal backend contract
         run: |
           python3 examples/uhp/terminal/consumer.py --fixtures
@@ -167,9 +216,61 @@ jobs:
             --binary target/release/luvus \
             --archive target/luvus-size.tar.gz
 
+  binary-size-intel-macos:
+    name: macos Intel binary size
+    runs-on: macos-14
+    permissions:
+      contents: read
+    env:
+      SQLITE3_LIB_DIR: /usr/lib
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - run: cargo build --release --locked --target x86_64-apple-darwin
+      - name: Package measured binary
+        run: |
+          COPYFILE_DISABLE=1 tar \
+            -C target/x86_64-apple-darwin/release \
+            -czf target/luvus-x86_64-size.tar.gz \
+            luvus
+      - name: Check reviewed baseline
+        run: |
+          python3 scripts/check-binary-size.py \
+            --target x86_64-apple-darwin \
+            --binary target/x86_64-apple-darwin/release/luvus \
+            --archive target/luvus-x86_64-size.tar.gz
+
+  binary-size-windows:
+    name: windows binary size
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - id: package
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: luvus
+          target: x86_64-pc-windows-msvc
+          archive: luvus-size-$target
+          checksum: sha256
+          locked: true
+          dry-run: true
+          dry-run-intended: true
+      - name: Check reviewed baseline
+        shell: bash
+        run: |
+          python3 scripts/check-binary-size.py \
+            --target x86_64-pc-windows-msvc \
+            --binary target/x86_64-pc-windows-msvc/release/luvus.exe \
+            --archive "${{ steps.package.outputs.zip }}"
+
   windows:
     name: windows protocol · ConPTY
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -182,9 +283,17 @@ jobs:
         shell: pwsh
         run: |
           cargo test --locked platform::windows::tests
+          cargo test --locked clipboard_image
+          cargo test --locked image_paste
           cargo test --locked app::cwd::tests
           cargo test --locked platform::tests::no_window_keeps_the_command_working
           cargo test --locked ipc::transport::windows_
+          cargo test --locked machine::
+          if ($LASTEXITCODE -ne 0) { throw "Windows saved-machine tests failed" }
+          cargo test --locked ipc::federated::tests::local_negotiation
+          if ($LASTEXITCODE -ne 0) { throw "Windows local attach handshake test failed" }
+          cargo test --locked ipc::server::tests::client_sidebars
+          if ($LASTEXITCODE -ne 0) { throw "Windows client-sidebar tests failed" }
           cargo test --locked app::backend::tests
           cargo test --locked terminal::backend::tests
           cargo test --locked altgr

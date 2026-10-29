@@ -1,0 +1,197 @@
+# Luvus Web
+
+Mobile-first access to a running Luvus session through a private bridge and the
+public UHP contract. The browser never receives a Luvus owner socket, UHP
+pairing code, or delegated UHP token.
+
+## Production run
+
+Released Luvus binaries embed the browser application and serve it through an
+explicit foreground command. Normal `luvus` startup never opens an HTTP port or
+starts a web runtime.
+
+```sh
+# Read-only monitoring of the default session
+luvus web
+
+# Interactive terminal and workspace control
+luvus web --control
+
+# Target one named session
+luvus --session project web --control
+```
+
+The native bridge binds `127.0.0.1` and opens a one-use pairing URL. Pressing
+Ctrl+C stops only the web bridge and revokes its process-bound UHP authority;
+the selected Luvus server, PTYs, TUI clients, and sessions keep running. Run
+`luvus help web` for ports, device limits, browser opening, and private TLS
+tunnel options. Node and npm are required only for web development.
+
+## Quick development run
+
+From the repository root:
+
+```sh
+npm --prefix web run dev
+```
+
+That one command installs missing web dependencies, builds the debug binary and
+web packages, starts the isolated `web-dev` session with terminal control,
+starts the bridge, and opens the one-use pairing URL in the default browser.
+Press `Ctrl+C` to stop both the bridge and its isolated server.
+
+Useful variants:
+
+```sh
+# Monitoring only; no terminal input
+npm --prefix web run dev -- --read-only
+
+# Full isolated integration test, including a server restart
+npm --prefix web run test:live
+
+# Clean up the default development session after an interrupted run
+npm --prefix web run dev:stop
+```
+
+Override `LUVUS_WEB_SESSION`, `LUVUS_WEB_HOME`, or `LUVUS_WEB_PORT` when
+another isolated profile or port is needed. Set `LUVUS_WEB_NO_OPEN=1` or pass
+`--no-open` to print the URL without opening a browser. The ordinary
+`LUVUS_SESSION` and `LUVUS_HOME` selectors remain supported outside a managed
+Luvus pane.
+
+## Pair local and mobile devices
+
+QR/code pairing registers a browser profile for this bridge's origin, not a
+physical device. Normal tabs in the same profile share one pairing and count as
+one paired browser; another browser or profile needs its own pairing. There is
+a separate limit of eight simultaneous browser connections across the bridge.
+
+The bridge authorizes two browser profiles by default. Use `--max-devices <1-8>`
+at startup to allow more; **Devices** can adjust the limit up to that ceiling.
+After the first browser connects, open **Devices** and create a new
+one-use pairing for each phone, tablet, or computer. Scan the locally generated
+QR code with the phone camera, or use Copy/Share as a fallback. Existing devices
+stay live; each browser profile receives an independent ticket remembered in
+origin-scoped browser storage. Reopening the address in another tab or restarting
+the browser reuses that ticket and does not spend another device slot. By default
+it lasts until the bridge stops or the browser is revoked. **Disconnect this browser**
+revokes its ticket, disconnects all its tabs, and frees its pairing slot without
+revoking other browsers or stopping running terminals. Pair again with a new
+QR/code to reconnect.
+QR generation happens
+inside the browser and never sends the pairing secret to an external service.
+
+For a bridge behind a private TLS tunnel, configure the public address so links
+created from a localhost browser are immediately usable on a phone:
+
+```sh
+LUVUS_WEB_PUBLIC_URL=https://luvus.example.test \
+LUVUS_WEB_ORIGINS=https://luvus.example.test \
+LUVUS_WEB_MAX_DEVICES=3 \
+npm --prefix web run dev
+```
+
+`LUVUS_WEB_PUBLIC_URL` accepts an HTTPS origin only; path-prefixed proxy
+mounts are rejected because the browser assets and WebSocket route live at the
+origin root.
+
+An authorized browser may update the pairing address for the current bridge
+lifetime in **Devices**. This only changes generated QR codes and pairing links;
+it does not expose the loopback listener or change allowed origins. Clear the
+field to return to the browser's current origin.
+
+`LUVUS_WEB_MAX_DEVICES` sets the initial limit and accepts 1 through 8. The
+Devices panel may change that limit for the current bridge lifetime, but cannot
+exceed the startup value or go below the number of authorized profiles plus
+unspent pairing links.
+
+For finite browser access, set `LUVUS_WEB_TICKET_TTL` to 1 through 86400 seconds
+for the development bridge, or use `luvus web --ticket-ttl <seconds>` for the
+native bridge. Leaving it unset means process-bound access with no fixed timeout.
+Reconnects do not extend a finite lifetime. Browser storage is a bearer credential
+store: pair only trusted browsers, use a stable HTTPS origin remotely, and pair
+again after a bridge restart. Blocked or private storage may not retain access.
+
+Verify real multi-tab pairing with the exact debug binary and an installed
+Chromium browser. The harness creates and cleans up its own home under `target/`:
+
+```sh
+LUVUS_BIN="$PWD/target/debug/luvus" LUVUS_BROWSER_BIN=/path/to/chromium \
+  npm --prefix web run test:browser-pairing
+```
+
+It checks that eight tabs share one pairing, reopening tabs and restarting the
+browser retain access while the bridge runs, and revoking one profile signs out
+all its tabs without revoking a separately paired profile. It also checks the
+header-free rounded content frame, aligned compact sidebar rails at multiple
+widths, independently collapsed sidebars, real terminal input, and mobile drawer
+focus and viewport behavior. Add
+`LUVUS_WEB_SCREENSHOTS=1` to save layout screenshots under the repository's
+`target/` directory for visual inspection.
+
+## Manual development
+
+Build Luvus first, then run an isolated server and the bridge:
+
+```sh
+cargo build
+env -u LUVUS_SOCKET_PATH -u LUVUS_SESSION \
+  LUVUS_HOME="$HOME/.luvus-dev" \
+  ./target/debug/luvus --session web-dev server restart
+
+cd web
+npm install
+npm run build
+LUVUS_BIN="$PWD/../target/debug/luvus" \
+LUVUS_HOME="$HOME/.luvus-dev" \
+LUVUS_SESSION=web-dev \
+npm start
+```
+
+Open the fragment-bearing URL printed by the bridge. Every browser pairing code
+is one-use and is exchanged for an independent bridge ticket. The browser stores
+it in origin-scoped `localStorage` for reuse across tabs and browser restarts.
+Server-side grants remain in memory and are revoked when the bridge stops.
+
+In a controlled terminal, click the terminal or the keyboard button to focus
+native input. Physical and mobile keyboards write directly to the PTY; shell
+or agent history, cursor movement, and Tab completion therefore remain owned by
+the child application. `Alt`/`Option`+Backspace and `Ctrl`+Backspace delete the
+previous word; `Alt`/`Option`+forward Delete and `Ctrl`+Delete delete the next
+word. `Command`+Backspace/Delete clear toward the start/end of the line, as do
+`Ctrl+U`/`Ctrl+K`. The bottom dock only supplies keys that are awkward on
+touch keyboards; Enter and Backspace remain on the native keyboard. On mobile,
+the terminal follows the visual viewport and keeps the live cursor above the
+software keyboard. Submitting input resumes follow-tail so streaming output
+stays visible; an intentional touch or wheel scroll still pauses it for history
+reading. Clipboard paste uses terminal bracketed-paste semantics and
+does not add Enter. The `+` button, clipboard file paste, and drag/drop all
+stream files up to 32 MiB in bounded chunks. Luvus stores the bytes privately
+on the selected server and pastes only the resulting remote path, so the same
+flow works through a remote bridge and never exposes a meaningless local
+browser path to the PTY.
+
+On Mission Control, select the **SESSION** name below Live stats to list known
+Luvus sessions and move the web bridge to another namespace. Running sessions
+are attached without disturbing their TUI clients or PTYs. In control mode, a
+known stopped session may be started on selection; read-only bridges can switch
+only to sessions that are already running. Because one bridge owns one selected
+upstream, a switch moves every browser device connected to that bridge while
+other TUI and CLI clients remain attached to their own sessions.
+
+The bridge binds `127.0.0.1` by default and starts read-only access. Set
+`LUVUS_WEB_CONTROL=1` to enable terminal control. To place the bridge behind a
+TLS tunnel, keep the bridge loopback-bound and set `LUVUS_WEB_ORIGINS` to the
+comma-separated public HTTPS origins accepted during WebSocket upgrade.
+
+## Security boundaries
+
+- Luvus owns state, PTYs, validation, and scoped UHP authority.
+- The bridge owns browser authentication and injects UHP credentials upstream.
+- The external provider owns TLS/WSS and reachability.
+- The browser uses a separate, bounded protocol and cannot supply upstream
+  authentication fields.
+
+The bridge enforces origin checks, payload and connection limits, per-client
+rate limits, bounded pending work, and outbound backpressure. It exits when its
+child UHP access process exits, revoking upstream authority.

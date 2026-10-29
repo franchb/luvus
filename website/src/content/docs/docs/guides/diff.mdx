@@ -33,6 +33,13 @@ workspace or branch. Press `f` in an open DIFF view to cycle **All**,
 | `r` | refresh the Git status snapshot |
 | `q` / `Esc` | return keyboard input to the terminal pane |
 
+Selection follows the WORKSPACES and AGENTS lists: focusing DIFF starts at the
+currently open diff when its row is visible. Moving with `j` / `k` only
+preselects a file; Enter opens it, while Esc cancels without changing the view.
+The open file has the theme's active-row background, and keyboard preselection
+or hover uses the stronger selection background. Background refreshes preserve
+the preselected file instead of moving it back to the open file.
+
 ```text
 FILES  DIFF
 STAGED  2
@@ -48,18 +55,24 @@ WORKTREE  1
 Luvus parses one selected file at a time and renders the same normalized data
 as **Auto**, **Split**, or **Stack**. Auto uses Split when both sides remain
 readable and falls back to Stack on a narrow local or remote viewport. Resizing
-one attachment does not change another attachment's effective layout.
+one attachment does not change another attachment's effective layout. Split
+wraps each side within its own column and keeps corresponding before and after
+rows vertically aligned. Its narrow Stack fallback keeps wrapping too, so long
+source lines remain inside the pane at every responsive width.
 
 | Key | Action |
 |---|---|
 | `j` / `k`, arrows | next or previous source row |
 | `d` / `u` | half page down or up |
 | `g` / `G` | first or last row |
-| `h` / `l` | scroll long lines horizontally |
+| `h` / `l` | scroll long lines horizontally in Stack when wrapping is off |
 | Left / Right | select the old or new side in Split |
 | `s` | cycle Auto, Split, Stack |
-| `w` | toggle wrapping preference |
-| `/` | search the loaded file diff |
+| `w` | toggle wrapping for an explicitly selected Stack layout; Split and Auto wrap at every responsive width |
+| `/`, then `Enter` | search exact text in the loaded diff (case-insensitive by default) |
+| `n` / `N` | next / previous search match, wrapping at the ends |
+| `Ctrl-I` | toggle search case sensitivity (`Aa` marks sensitive mode) |
+| `Ctrl-U` | clear the active search and return to query editing |
 | `{` / `}` | previous or next hunk |
 | `K` / `J` | previous or next file |
 | `P` / `N` | previous or next note |
@@ -68,6 +81,18 @@ one attachment does not change another attachment's effective layout.
 | `m` | mark the current version viewed |
 | `f` | cycle All, Unviewed, Changed, and Notes filters |
 | `q` / `Esc` | close the native view |
+
+Search follows the same local-content contract as FILE and document previews:
+`Enter` commits the literal query, `n` and `N` wrap through matches, `Ctrl-I`
+toggles case sensitivity, `Ctrl-U` clears the query without closing search, and
+`Esc` cancels search before it closes DIFF. The current match uses the accent
+color and other visible matches use amber in Auto, Split, and Stack layouts.
+The query, result count, case state, and search shortcuts replace the DIFF
+footer while search is active, including on mobile. A `+` after a 10,000-match
+count indicates additional matches beyond the bounded navigable set. Outside
+search, the footer returns to review status and note information. This is
+separate from the DIFF sidebar's `f` state filter and from the global fuzzy
+finder.
 
 Binary files and conflicts show an explicit summary instead of misleading
 text. Large patches and lines are bounded and visibly marked **TRUNCATED**.

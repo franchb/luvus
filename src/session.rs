@@ -12,10 +12,14 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+#[cfg(unix)]
+mod launch;
+
 pub const SESSION_ENV_VAR: &str = "LUVUS_SESSION";
 pub const DEFAULT_SESSION_NAME: &str = "default";
 
 const MAX_SESSION_NAME_LEN: usize = 64;
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,6 +40,19 @@ pub struct SessionInfo {
 pub struct SessionEndpoint {
     pub transport: &'static str,
     pub address: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientSessionAction {
+    Start,
+    Reuse,
+    Restart,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionServerIdentity {
+    version: String,
+    client_protocol: Option<u32>,
 }
 
 /// Resolve `session attach` and leading global `--session` flags before normal
@@ -118,7 +135,16 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
 }
 
 fn apply_explicit_name(name: &str) -> Result<(), String> {
-    match normalize_name(name)? {
+    let normalized = normalize_name(name)?;
+    let target_socket = api_socket_path_for(normalized.as_deref());
+    let inherited_socket = std::env::var_os("LUVUS_SOCKET_PATH").map(PathBuf::from);
+    if inherited_socket.as_deref() != Some(target_socket.as_path()) {
+        // Pane ids are scoped to one server lifetime and may collide across
+        // named sessions. An explicit cross-session command must not inherit
+        // the caller pane's otherwise-valid numeric id.
+        std::env::remove_var("LUVUS_PANE_ID");
+    }
+    match normalized {
         Some(name) => {
             std::env::set_var(SESSION_ENV_VAR, name);
         }
@@ -286,11 +312,47 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
 pub fn start_client_session(name: &str) -> Result<SessionInfo, String> {
     let selected = normalize_name(name)?;
     let selected = selected.as_deref();
-    start_session(selected)?;
+    let info = session_info(selected);
+    let running_identity = info
+        .running
+        .then(|| {
+            server_identity_for(selected, CONTROL_TIMEOUT).map_err(|error| {
+                format!("session {name} is running but its version could not be checked: {error}")
+            })
+        })
+        .transpose()?;
+    match client_session_action(
+        info.running,
+        running_identity.as_ref(),
+        env!("CARGO_PKG_VERSION"),
+        crate::ipc::protocol::PROTOCOL_VERSION,
+    ) {
+        ClientSessionAction::Start => {
+            start_session(selected)?;
+        }
+        ClientSessionAction::Reuse => {}
+        ClientSessionAction::Restart => {
+            restart_session(selected)?;
+        }
+    }
     let client = client_socket_path_for(selected);
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
         if is_running_at(&client) {
+            let running = server_identity_for(selected, CONTROL_TIMEOUT).map_err(|error| {
+                format!("session {name} started but its version could not be checked: {error}")
+            })?;
+            if running.version != env!("CARGO_PKG_VERSION")
+                || running.client_protocol != Some(crate::ipc::protocol::PROTOCOL_VERSION)
+            {
+                return Err(format!(
+                    "session {name} is running luvus v{} with client protocol {}, but this client is v{} with protocol {}",
+                    running.version,
+                    running.client_protocol.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                    env!("CARGO_PKG_VERSION"),
+                    crate::ipc::protocol::PROTOCOL_VERSION,
+                ));
+            }
             return Ok(session_info(selected));
         }
         std::thread::sleep(STOP_POLL_INTERVAL);
@@ -299,6 +361,69 @@ pub fn start_client_session(name: &str) -> Result<SessionInfo, String> {
         "session {name} started but its client transport was unavailable after {}ms",
         START_TIMEOUT.as_millis(),
     ))
+}
+
+fn client_session_action(
+    running: bool,
+    running_identity: Option<&SessionServerIdentity>,
+    binary_version: &str,
+    client_protocol: u32,
+) -> ClientSessionAction {
+    if !running {
+        ClientSessionAction::Start
+    } else if running_identity.is_some_and(|identity| {
+        identity.version == binary_version && identity.client_protocol == Some(client_protocol)
+    }) {
+        ClientSessionAction::Reuse
+    } else {
+        ClientSessionAction::Restart
+    }
+}
+
+/// Read the selected session's version over the stable newline-delimited JSON
+/// control endpoint. This check happens before a client enters the binary
+/// protocol, whose schema is intentionally versioned and may be incompatible.
+fn server_identity_for(
+    name: Option<&str>,
+    timeout: Duration,
+) -> Result<SessionServerIdentity, String> {
+    let mut stream = crate::ipc::transport::connect_timeout(&api_socket_path_for(name), timeout)
+        .map_err(|error| error.to_string())?;
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({"id":"session:version","method":"ping","params":{}})
+    )
+    .map_err(|error| error.to_string())?;
+    stream.flush().map_err(|error| error.to_string())?;
+    let frame = crate::ipc::api::read_response_frame_with_deadline(&mut stream, timeout)
+        .map_err(|error| error.to_string())?;
+    let response: serde_json::Value =
+        serde_json::from_str(&frame).map_err(|error| error.to_string())?;
+    if response.get("id").and_then(serde_json::Value::as_str) != Some("session:version") {
+        return Err("server control response id does not match request".to_string());
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "server returned an invalid ping response".to_string())?;
+    let version = result
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
+        .ok_or_else(|| "server returned an invalid ping response".to_string())?;
+    let client_protocol = result
+        .get("client_protocol")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| "server returned an invalid client protocol".to_string())
+        })
+        .transpose()?;
+    Ok(SessionServerIdentity {
+        version,
+        client_protocol,
+    })
 }
 
 pub fn stop_session(name: Option<&str>) -> Result<SessionInfo, String> {
@@ -347,29 +472,51 @@ pub fn start_session(name: Option<&str>) -> Result<SessionInfo, String> {
     }
     let info = session_info(name);
     if info.running {
+        #[cfg(unix)]
+        server_identity_for(name, START_TIMEOUT).map_err(|error| {
+            format!(
+                "session {} is present but not ready: {error}; no restart was attempted",
+                name.unwrap_or(DEFAULT_SESSION_NAME)
+            )
+        })?;
         return Ok(info);
     }
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let mut command = Command::new(executable);
-    command
-        .arg("--session")
-        .arg(name.unwrap_or(DEFAULT_SESSION_NAME))
-        .arg("server")
-        .env_remove("LUVUS_SOCKET_PATH")
-        .env_remove(SESSION_ENV_VAR)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    detach_server_command(&mut command);
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    let mut child = launch::PendingServer::spawn(server_start_command(name)?)
+        .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    let mut child = server_start_command(name)?
+        .spawn()
+        .map_err(|error| error.to_string())?;
 
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
         let info = session_info(name);
-        if info.running {
+        // Binding sockets precedes App initialization and the server PID file.
+        // A bound listener alone cannot prove app-loop readiness. Keep the
+        // caller's wait bounded without treating slow restoration as failure
+        // of the server itself.
+        #[cfg(unix)]
+        let ready = info.running
+            && server_identity_for(
+                name,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100)),
+            )
+            .is_ok();
+        #[cfg(windows)]
+        let ready = info.running;
+        if ready {
+            #[cfg(unix)]
+            child.accept().map_err(|error| error.to_string())?;
             return Ok(info);
         }
         match child.try_wait() {
+            // A startup-lock loser exits successfully while the winner may
+            // still be initializing. Wait for the winner's readiness proof.
+            #[cfg(unix)]
+            Ok(Some(status)) if status.success() => {}
             Ok(Some(status)) => {
                 return Err(format!(
                     "session {} server exited before startup with {status}",
@@ -378,6 +525,9 @@ pub fn start_session(name: Option<&str>) -> Result<SessionInfo, String> {
             }
             Ok(None) => {}
             Err(error) => {
+                #[cfg(unix)]
+                let _ = child.cancel();
+                #[cfg(windows)]
                 let _ = terminate_and_wait(&mut child);
                 return Err(format!(
                     "could not inspect session {} startup: {error}",
@@ -387,6 +537,21 @@ pub fn start_session(name: Option<&str>) -> Result<SessionInfo, String> {
         }
         std::thread::sleep(STOP_POLL_INTERVAL);
     }
+    #[cfg(unix)]
+    {
+        let info = session_info(name);
+        if info.running {
+            child.accept().map_err(|error| error.to_string())?;
+            return Err(format!(
+                "session {} did not become ready within {}ms; server was left running, retry when ready",
+                name.unwrap_or(DEFAULT_SESSION_NAME),
+                START_TIMEOUT.as_millis(),
+            ));
+        }
+    }
+    #[cfg(unix)]
+    let cleanup = child.cancel().map_err(|error| error.to_string());
+    #[cfg(windows)]
     let cleanup = terminate_and_wait(&mut child);
     let mut message = format!(
         "session {} did not start within {}ms",
@@ -399,11 +564,87 @@ pub fn start_session(name: Option<&str>) -> Result<SessionInfo, String> {
     Err(message)
 }
 
+/// Preserve automatic startup's detached lifetime independently of the caller's
+/// readiness deadline. Slow startup may continue after an attach times out.
+#[cfg(unix)]
+pub(crate) fn spawn_session_server(name: Option<&str>) -> Result<(), String> {
+    let child = launch::PendingServer::spawn(server_start_command(name)?)
+        .map_err(|error| error.to_string())?;
+    child.accept().map_err(|error| error.to_string())
+}
+
+fn server_start_command(name: Option<&str>) -> Result<Command, String> {
+    if let Some(name) = name {
+        validate_name(name)?;
+    }
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = Command::new(executable);
+    #[cfg(unix)]
+    let role = launch::SERVER_ROLE;
+    #[cfg(windows)]
+    let role = "server";
+    command
+        .arg("--session")
+        .arg(name.unwrap_or(DEFAULT_SESSION_NAME))
+        .arg(role)
+        .env_remove("LUVUS_SOCKET_PATH")
+        .env_remove(SESSION_ENV_VAR)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    detach_server_command(&mut command);
+    Ok(command)
+}
+
 pub fn restart_session(name: Option<&str>) -> Result<SessionInfo, String> {
     if session_info(name).running {
         stop_session(name)?;
     }
     start_session(name)
+}
+
+/// Restart one server from a detached helper process. The caller may live in a
+/// pane owned by that server, so the helper must survive the server closing the
+/// caller's PTY before the replacement server is started.
+pub fn restart_session_via_helper(name: Option<&str>) -> Result<SessionInfo, String> {
+    if let Some(name) = name {
+        validate_name(name)?;
+    }
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--session")
+        .arg(name.unwrap_or(DEFAULT_SESSION_NAME))
+        .arg("__restart-session-helper")
+        .env_remove("LUVUS_SOCKET_PATH")
+        .env_remove(SESSION_ENV_VAR)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    detach_server_command(&mut command);
+    let output = command
+        .spawn()
+        .map_err(|error| format!("could not start detached restart helper: {error}"))?
+        .wait_with_output()
+        .map_err(|error| format!("could not wait for detached restart helper: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        return Err(if detail.is_empty() {
+            format!("detached restart helper exited with {}", output.status)
+        } else {
+            detail.to_string()
+        });
+    }
+    let info = session_info(name);
+    if info.running {
+        Ok(info)
+    } else {
+        Err(format!(
+            "detached restart helper exited before session {} became ready",
+            name.unwrap_or(DEFAULT_SESSION_NAME)
+        ))
+    }
 }
 
 fn terminate_and_wait(child: &mut std::process::Child) -> Result<(), String> {
@@ -424,10 +665,18 @@ fn detach_server_command(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     unsafe {
         command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         });
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn run_server_launch_helper() -> std::io::Result<()> {
+    launch::run_helper()
 }
 
 #[cfg(windows)]
@@ -505,6 +754,46 @@ mod tests {
     }
 
     #[test]
+    fn client_session_restarts_only_a_running_stale_target() {
+        assert_eq!(
+            client_session_action(false, None, "0.14.2", 18),
+            ClientSessionAction::Start
+        );
+        let current = SessionServerIdentity {
+            version: "0.14.2".into(),
+            client_protocol: Some(18),
+        };
+        assert_eq!(
+            client_session_action(true, Some(&current), "0.14.2", 18),
+            ClientSessionAction::Reuse
+        );
+        let old_version = SessionServerIdentity {
+            version: "0.13.4".into(),
+            client_protocol: None,
+        };
+        assert_eq!(
+            client_session_action(true, Some(&old_version), "0.14.2", 18),
+            ClientSessionAction::Restart
+        );
+        let old_protocol = SessionServerIdentity {
+            version: "0.14.2".into(),
+            client_protocol: Some(17),
+        };
+        assert_eq!(
+            client_session_action(true, Some(&old_protocol), "0.14.2", 18),
+            ClientSessionAction::Restart
+        );
+        let unknown_protocol = SessionServerIdentity {
+            version: "0.14.2".into(),
+            client_protocol: None,
+        };
+        assert_eq!(
+            client_session_action(true, Some(&unknown_protocol), "0.14.2", 18),
+            ClientSessionAction::Restart
+        );
+    }
+
+    #[test]
     fn validates_safe_session_names() {
         for name in ["api", "work-2", "release_3", "v0.10.4"] {
             assert!(validate_name(name).is_ok(), "{name}");
@@ -528,6 +817,37 @@ mod tests {
             crate::persist::cli_socket_path(),
             api_socket_path_for(Some("alpha"))
         );
+    }
+
+    #[test]
+    fn explicit_cross_session_selector_discards_inherited_pane_context() {
+        let _env = crate::persist::test_env("session-cross-pane-context");
+        std::env::set_var(SESSION_ENV_VAR, "source");
+        std::env::set_var("LUVUS_SOCKET_PATH", api_socket_path_for(Some("source")));
+        std::env::set_var("LUVUS_PANE_ID", "7");
+
+        let cleaned =
+            configure_from_args(&argv(&["luvus", "--session", "target", "task", "add", "x"]))
+                .unwrap();
+        let inherited_pane = std::env::var_os("LUVUS_PANE_ID");
+        std::env::remove_var("LUVUS_PANE_ID");
+
+        assert_eq!(cleaned, argv(&["luvus", "task", "add", "x"]));
+        assert!(inherited_pane.is_none());
+    }
+
+    #[test]
+    fn explicit_same_session_selector_keeps_inherited_pane_context() {
+        let _env = crate::persist::test_env("session-same-pane-context");
+        std::env::set_var(SESSION_ENV_VAR, "target");
+        std::env::set_var("LUVUS_SOCKET_PATH", api_socket_path_for(Some("target")));
+        std::env::set_var("LUVUS_PANE_ID", "7");
+
+        configure_from_args(&argv(&["luvus", "--session", "target", "task", "add", "x"])).unwrap();
+        let inherited_pane = std::env::var("LUVUS_PANE_ID");
+        std::env::remove_var("LUVUS_PANE_ID");
+
+        assert_eq!(inherited_pane.as_deref(), Ok("7"));
     }
 
     #[test]

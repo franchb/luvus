@@ -44,6 +44,12 @@ accepted the submission, not that the agent completed it. A closed queue fails
 without recording a successful handoff. Submission uses the existing PTY writer
 and does not create a delayed-send thread.
 
+Paired control Access also permits this exact RPC; read-only Access refuses
+it. The key grammar stays identical to local `agent keys`, including `ctrl+z`
+and printable Unicode. `["esc","[","Z"]` sends Shift+Tab as one ordered batch.
+Inspect the prompt before answering; Enter remains a separate intentional
+action. Access does not permit the compatibility `agent.send` method.
+
 For line-specific feedback, the native [DIFF review](/docs/guides/diff/) uses
 the same target validation. It groups selected local notes into one bounded
 message, quotes source context as untrusted review data, and records delivery
@@ -150,7 +156,11 @@ skill through their native adapters:
 
 - **Claude Code:** `~/.claude/skills/luvus/`
 - **Codex:** `~/.agents/skills/luvus/`
-- **opencode:** `${XDG_CONFIG_HOME:-~/.config}/opencode/skills/luvus/`
+- **Kilo Code:** `~/.agents/skills/luvus/`
+- **Devin:** `~/.agents/skills/luvus/`
+- **Letta Code:** `~/.letta/skills/luvus/`
+- **opencode** (including the `opencode2` compatibility alias):
+  `${XDG_CONFIG_HOME:-~/.config}/opencode/skills/luvus/`
 
 The command makes no network request and never replaces a skill directory it
 does not own. Luvus does not add a global `AGENTS.md` pointer. Supported agents
@@ -165,8 +175,8 @@ one never enables the other.
 
 The messaging **commands themselves work with every agent luvus detects**
 (claude, codex, gemini, opencode, kimi, grok, aider, and more), whether or not
-that agent has the skill installed. The skill just teaches an agent to reach for
-them on its own.
+that agent has the skill installed. The skill just teaches an agent to reach
+for them on its own.
 
 Inspect the logical skill state or print the canonical instructions bundled
 with the running Luvus binary:

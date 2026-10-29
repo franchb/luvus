@@ -9,6 +9,9 @@ mod automation;
 mod bar;
 mod changelog;
 mod cli;
+mod clipboard;
+mod clipboard_image;
+mod commander;
 mod config;
 mod detect;
 mod diff;
@@ -22,6 +25,7 @@ mod ipc;
 mod layout;
 mod links;
 mod logging;
+mod machine;
 mod mission;
 mod module;
 mod orch;
@@ -36,6 +40,8 @@ mod theme;
 mod uhp;
 mod ui;
 mod update;
+mod web;
+mod worktree;
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -44,12 +50,12 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
-#[cfg(windows)]
-use ratatui::crossterm::event::poll as poll_event;
+use anyhow::{anyhow, Context, Result};
+#[cfg(not(windows))]
+use ratatui::crossterm::event::read as read_event;
 use ratatui::crossterm::event::{
-    read as read_event, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
-    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
@@ -90,11 +96,40 @@ fn main() -> Result<()> {
     if is_backend_discovery_request(&args) {
         std::process::exit(cli::run(&args)?);
     }
-    // Private foreground route used only by scheduled worker panes. Keep it
+    if args.get(1).map(String::as_str) == Some("remote-client-info")
+        && args.get(2).map(String::as_str) == Some("--json")
+        && args.len() == 3
+    {
+        return remote_client_info(&args);
+    }
+    // Private foreground routes used only by ORCH worker panes. Keep them
     // ahead of migrations and TUI/server routing: it must run exactly one
     // adapter process, settle its ORCH task, and exit.
+    if args.get(1).map(String::as_str) == Some("__task-worker") {
+        std::process::exit(orch::worker::run(&args)?);
+    }
     if args.get(1).map(String::as_str) == Some("__automation-worker") {
         std::process::exit(automation::run_worker(&args)?);
+    }
+    // A short-lived Unix launcher owns startup cleanup, then exits so a ready
+    // server is no longer a descendant of the client that started it.
+    #[cfg(unix)]
+    if args.get(1).map(String::as_str) == Some("__server-launch-helper") {
+        if args.len() != 2 {
+            return Err(anyhow!("invalid internal server launch invocation"));
+        }
+        return session::run_server_launch_helper().map_err(Into::into);
+    }
+    // A server restart initiated inside one of its panes cannot synchronously
+    // survive that server closing the pane's PTY. `restart_session_via_helper`
+    // launches this private route in a detached process group first.
+    if args.get(1).map(String::as_str) == Some("__restart-session-helper") {
+        if args.len() != 2 {
+            return Err(anyhow!("invalid internal session restart invocation"));
+        }
+        let selected = session::active_name();
+        session::restart_session(selected.as_deref()).map_err(anyhow::Error::msg)?;
+        return Ok(());
     }
 
     // One-time local cleanup of the old default-on skill installation. This
@@ -103,18 +138,40 @@ fn main() -> Result<()> {
     let _ = skill::migrate_legacy_installation();
     match args.get(1).map(String::as_str) {
         Some("server") => return server_cmd(&args),
-        Some("client") => return ipc::client::run(&persist::client_socket_path()),
+        Some("web") => std::process::exit(web::run_cli(&args[2..])?),
+        Some("client") => {
+            ensure_interactive_launch_allowed()?;
+            return ipc::client::run(&persist::client_socket_path());
+        }
         // Remote attach (docs/18 RA): the bridge runs on the remote host (via
         // ssh); `--remote <host>` launches it from the local side.
-        Some("remote-client-bridge") => return remote_client_bridge(),
-        Some("--remote") => return remote_attach(&args),
+        Some("remote-client-bridge") => return remote_client_bridge(&args[2..]),
+        Some("--remote") => {
+            ensure_interactive_launch_allowed()?;
+            return remote_attach(&args);
+        }
         // `attach <id>` (docs/18 WA-2): focus + zoom the pane, then open the TUI
         // straight into that fullscreen terminal.
-        Some("attach") => return attach_cmd(&args),
+        Some("attach") => {
+            ensure_interactive_launch_allowed()?;
+            return attach_cmd(&args);
+        }
         Some("integration") => {
             std::process::exit(integration::run(&args, i18n::cli::Context::configured())?)
         }
-        Some("--local") => return run_local(),
+        Some("machine") => {
+            if args.get(2).map(String::as_str) == Some("open") {
+                ensure_interactive_launch_allowed()?;
+            }
+            std::process::exit(machine::run_cli(
+                &args[2.min(args.len())..],
+                i18n::cli::Context::configured(),
+            )?);
+        }
+        Some("--local") => {
+            ensure_interactive_launch_allowed()?;
+            return run_local();
+        }
         Some(_) if cli::is_cli(&args) => {
             let code = cli::run(&args)?;
             std::process::exit(code);
@@ -122,7 +179,18 @@ fn main() -> Result<()> {
         _ => {}
     }
     // Default: attach to the session server, spawning it if needed.
+    ensure_interactive_launch_allowed()?;
     autodetect_and_attach()
+}
+
+fn ensure_interactive_launch_allowed() -> Result<()> {
+    let inside_luvus = std::env::var_os("LUVUS_ENV").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if inside_luvus && !config::load().allow_nested {
+        return Err(anyhow!(
+            "cannot open luvus inside a luvus pane; set `allow_nested` to `true` in config.json to allow nested clients"
+        ));
+    }
+    Ok(())
 }
 
 fn is_backend_discovery_request(args: &[String]) -> bool {
@@ -149,29 +217,34 @@ pub(crate) fn install_tui_panic_hook() {
     }));
 }
 
-/// Ask the host terminal to report **modified keys unambiguously** (the Kitty
-/// keyboard protocol, via crossterm's `DISAMBIGUATE_ESCAPE_CODES`).
+/// Ask the host terminal to report modified keys unambiguously and preserve
+/// functional-key press/repeat/release phases (Kitty flags 1 and 2).
 ///
-/// Legacy terminal encoding has no room for modifiers on `Enter`: the terminal
-/// sends a bare `CR` for Enter *and* Shift+Enter, so luvus literally cannot tell
-/// them apart and an agent's "new line, don't submit" key never works. With this
-/// pushed, a capable terminal (Ghostty, Kitty, WezTerm, foot, rio, recent
-/// iTerm2) reports `Shift+Enter` as its own key, which `encode_key` forwards to
-/// the pane as `ESC CR`.
+/// Legacy encoding sends a bare `CR` for Enter *and* Shift+Enter, so Luvus
+/// could not tell them apart. Flag 1 keeps them distinct. Flag 2 lets nested
+/// applications that ask Luvus for `REPORT_EVENT_TYPES` receive real repeat and
+/// release events, and lets Luvus stop independent UI actions from repeating
+/// while a key is held. Text-producing keys and legacy Enter/Tab/Backspace stay
+/// ordinary bytes unless a nested application also asks for report-all.
 ///
-/// Only `DISAMBIGUATE_ESCAPE_CODES` is requested — deliberately *not*
-/// `REPORT_EVENT_TYPES` (key-release events) or `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
-/// (which would stop plain text arriving as `Char`). Pushed only when the
-/// terminal advertises support, so nothing is emitted into a terminal that would
-/// print it as garbage, and popped on teardown (including the panic hook).
+/// Flags 4/8/16 are not requested: Crossterm 0.29 does not expose complete
+/// alternate-key or associated-text payloads, and report-all would stop plain
+/// text arriving as `Char`. Pushed only when the terminal advertises support,
+/// so nothing is emitted into a terminal that would print it as garbage, and
+/// popped on teardown (including the panic hook).
 pub(crate) fn push_key_protocol() {
     use ratatui::crossterm::terminal::supports_keyboard_enhancement;
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
         let _ = execute!(
             std::io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(host_keyboard_enhancement_flags())
         );
     }
+}
+
+fn host_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
 /// Raise a desktop notification for terminals that show one (iTerm2, etc.).
@@ -198,8 +271,25 @@ pub(crate) fn emit_notification(msg: &str) {
 /// 2. **OSC 52** — a terminal escape; covers terminals that bridge it and setups
 ///    where no clipboard tool is installed. Harmless if unsupported.
 pub(crate) fn emit_clipboard(text: &str) {
-    let _ = system_clipboard_copy(text);
+    clipboard::copy_native(text);
+    emit_clipboard_escape(text);
+}
 
+pub(crate) fn emit_clipboard_to(text: &str, completion: std::sync::Arc<clipboard::Completion>) {
+    clipboard::copy_native_to(text, completion);
+    emit_clipboard_escape(text);
+}
+
+pub(crate) fn emit_clipboard_tracked_to(
+    text: &str,
+    completion: std::sync::Arc<clipboard::Completion>,
+    on_success: impl FnOnce() + Send + 'static,
+) {
+    clipboard::copy_native_with_confirmation(text, completion, on_success);
+    emit_clipboard_escape(text);
+}
+
+fn emit_clipboard_escape(text: &str) {
     use std::io::Write;
     let b64 = base64_encode(text.as_bytes());
     let mut out = std::io::stdout().lock();
@@ -391,6 +481,7 @@ fn play_sound_file(path: &Path) {
 }
 
 /// Pipe `text` into the first available OS clipboard command.
+#[cfg(not(unix))]
 fn system_clipboard_copy(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -417,10 +508,15 @@ fn system_clipboard_copy(text: &str) -> std::io::Result<()> {
             continue; // tool not installed — try the next
         };
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+            if stdin.write_all(text.as_bytes()).is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                continue;
+            }
         }
-        let _ = child.wait();
-        return Ok(());
+        if child.wait().is_ok_and(|status| status.success()) {
+            return Ok(());
+        }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -576,11 +672,10 @@ fn retry_control_probe<T>(
 fn report_server_version(running: String) -> Result<()> {
     let binary = env!("CARGO_PKG_VERSION");
     if running != binary {
-        eprintln!(
+        return Err(anyhow!(
             "luvus v{binary} installed, but the running server is v{running} — \
              run `luvus server restart` to load it (your session is saved and restored)."
-        );
-        thread::sleep(Duration::from_millis(2000));
+        ));
     }
     Ok(())
 }
@@ -611,10 +706,127 @@ fn open_cwd_workspace() {
 /// Remote bridge role (docs/18 RA-1), run *on the remote host* by ssh. Ensure a
 /// server is up, then pump this process's stdin/stdout to/from the local socket
 /// so the `luvus --remote` client on the other end of the ssh pipe drives it.
-fn remote_client_bridge() -> Result<()> {
+fn remote_client_bridge(args: &[String]) -> Result<()> {
     let sock = persist::client_socket_path();
-    ensure_server_ready(&sock)?;
+    match args {
+        [] => ensure_server_ready(&sock)?,
+        [mode] if mode == "--existing-only" => ensure_server_existing(&sock)?,
+        [mode] if mode == "--start-if-missing" => ensure_server_start_if_missing(&sock)?,
+        _ => return Err(anyhow!("invalid remote client bridge mode")),
+    }
     ipc::client::remote_bridge(&sock)
+}
+
+/// Validate an already-running selected server without starting, stopping, or
+/// recycling it. Persistent saved-machine links use this path so a reconnect
+/// never gains foreground repair authority.
+fn ensure_server_existing(_sock: &Path) -> Result<()> {
+    let _running = retry_control_probe(
+        SERVER_CONTROL_TIMEOUT,
+        SERVER_RECOVERY_TIMEOUT,
+        server_version_with_timeout,
+    )
+    .context("selected remote Luvus session is not responding")?;
+    Ok(())
+}
+
+/// Start an absent selected server, but never recycle an existing one. This is
+/// reserved for an explicit foreground onboarding/enable operation.
+fn ensure_server_start_if_missing(sock: &Path) -> Result<()> {
+    if retry_control_probe(
+        SERVER_CONTROL_TIMEOUT,
+        SERVER_RECOVERY_TIMEOUT,
+        server_version_with_timeout,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    match ipc::transport::connect_timeout(sock, SERVER_RECOVERY_TIMEOUT) {
+        Ok(_) => Err(anyhow!(
+            "selected remote Luvus session is present but not responding; no restart was attempted"
+        )),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Err(anyhow!(
+            "selected remote Luvus session endpoint is busy; no restart was attempted"
+        )),
+        Err(error)
+            if remote_endpoint_is_missing(&error)
+                || remote_endpoint_is_stale(&error, persist::ServerPidFile::read()) =>
+        {
+            spawn_server()?;
+            wait_for_socket(sock)?;
+            let _running = retry_control_probe(
+                SERVER_CONTROL_TIMEOUT,
+                SERVER_RECOVERY_TIMEOUT,
+                server_version_with_timeout,
+            )
+            .context("new remote Luvus session did not become responsive")?;
+            Ok(())
+        }
+        Err(error) => Err(error).context(
+            "selected remote Luvus session endpoint could not be accessed; no server was started",
+        ),
+    }
+}
+
+fn remote_endpoint_is_missing(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+}
+
+/// A refused socket with no live recorded server is left over from a stopped,
+/// crashed, or rebooted server. A live server keeps its PID file, so a busy
+/// listener that refuses a connection is still never replaced; the new
+/// server's startup lock reclaims only a socket nothing is listening on.
+fn remote_endpoint_is_stale(error: &io::Error, live_server: Option<u32>) -> bool {
+    error.kind() == io::ErrorKind::ConnectionRefused && live_server.is_none()
+}
+
+/// Read-only capability probe used before a saved machine is enabled. It does
+/// not start a server, read a session, or mutate the remote installation.
+fn remote_client_info(args: &[String]) -> Result<()> {
+    let binary = args
+        .first()
+        .filter(|path| Path::new(path).is_absolute())
+        .cloned()
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap_or_default()
+                .display()
+                .to_string()
+        });
+    println!(
+        "{}",
+        serde_json::json!({
+            "protocol_version": ipc::protocol::PROTOCOL_VERSION,
+            "machine_endpoint_version": machine::MACHINE_ENDPOINT_VERSION,
+            "capabilities": [machine::MACHINE_ENDPOINT_CAPABILITY],
+            "version": env!("CARGO_PKG_VERSION"),
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "binary": binary,
+        })
+    );
+    Ok(())
+}
+
+/// Attach through one previously validated profile. Unlike legacy `--remote`,
+/// this path never searches a remote PATH and never accepts arbitrary SSH
+/// options; OpenSSH configuration owns keys, ports, and jump hosts.
+pub(crate) fn remote_attach_profile(
+    destination: &str,
+    binary: &str,
+    session_name: Option<&str>,
+) -> Result<()> {
+    let mut command = machine::ssh_command(destination, true);
+    let mut remote_args = Vec::new();
+    if let Some(name) = session_name {
+        session::validate_name(name).map_err(anyhow::Error::msg)?;
+        remote_args.extend(["--session", name]);
+    }
+    remote_args.push("remote-client-bridge");
+    machine::command::append(&mut command, binary, &remote_args)?;
+    let (result, _) = remote_attach_attempt(command);
+    result
 }
 
 /// `luvus attach <id>` (docs/18 WA-2): focus + zoom the pane (one round-trip via
@@ -669,6 +881,7 @@ fn remote_attach(args: &[String]) -> Result<()> {
 
 fn remote_attach_attempt(mut cmd: Command) -> (Result<()>, Option<std::process::ExitStatus>) {
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()); // stderr inherited so ssh can prompt for auth
+    platform::no_window(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("failed to launch ssh: {e}"));
@@ -782,67 +995,82 @@ fn server_running(sock: &Path) -> bool {
     ipc::transport::endpoint_exists(sock, Duration::from_millis(50))
 }
 
+#[cfg(unix)]
 fn spawn_server() -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = Command::new(exe);
-    cmd.arg("server")
-        // The selector was already resolved into LUVUS_SESSION. A parent pane's
-        // injected API socket must not leak into a newly spawned server.
+    session::spawn_session_server(session::active_name().as_deref()).map_err(anyhow::Error::msg)
+}
+
+#[cfg(windows)]
+fn spawn_server() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("server")
         .env_remove("LUVUS_SOCKET_PATH")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // Detach so the server survives the client exiting.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — no console, own group.
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
-    }
-    cmd.spawn()?;
+        .stderr(Stdio::null())
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — preserve Windows launch.
+        .creation_flags(0x0000_0008 | 0x0000_0200);
+    command.spawn()?;
     Ok(())
 }
 
 fn wait_for_socket(sock: &Path) -> Result<()> {
-    for _ in 0..100 {
+    wait_for_socket_with_timeout(sock, Duration::from_secs(5))
+}
+
+/// Bound startup readiness without stopping a server that may still restore.
+fn wait_for_socket_with_timeout(sock: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
         if server_running(sock) {
+            #[cfg(unix)]
+            if server_version_with_timeout(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100)),
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+            #[cfg(windows)]
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50)),
+        );
     }
-    Err(anyhow!("luvus server did not start in time"))
+    Err(anyhow!(
+        "luvus server did not become ready in time; it may still be starting, retry when ready"
+    ))
 }
 
 /// `luvus server <start|stop|restart|status>` — manage the background server.
 /// Bare `luvus server` (no subcommand) is the internal headless role that
-/// `spawn_server` launches via setsid; users go through the subcommands.
+/// `spawn_server` launches via the detached launcher; users use subcommands.
 fn server_cmd(args: &[String]) -> Result<()> {
     let Some(command) = args.get(2).map(String::as_str) else {
         return ipc::server::run(); // internal role: run the server in the foreground
     };
     let context = i18n::cli::Context::configured();
-    match command {
-        "start" => server_start(context),
-        "stop" => server_stop(context),
-        "restart" => server_restart(context),
-        "status" => server_status(context),
-        "update-manifest" => update_manifest(context),
+    let options = &args[3..];
+    match (command, options) {
+        ("start", []) => server_start(context),
+        ("stop", []) => server_stop(context),
+        ("restart", []) => server_restart(context),
+        ("restart", [flag]) if flag == "--all" => server_restart_all(context),
+        ("status", []) => server_status(context),
+        ("update-manifest", []) => update_manifest(context),
         other => {
-            eprintln!("{}: {other}", context.text("unknown server command"));
+            eprintln!("{}: {}", context.text("unknown server command"), other.0);
             eprintln!(
                 "{}",
                 i18n::cli::help(
-                    "usage: luvus server <start|stop|restart|status|update-manifest>",
+                    "usage: luvus server <start|stop|restart [--all]|status|update-manifest>",
                     context.language(),
                 )
             );
@@ -952,6 +1180,8 @@ fn update_manifest(context: i18n::cli::Context) -> Result<()> {
 fn server_start(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
     if server_running(&sock) {
+        #[cfg(unix)]
+        wait_for_socket(&sock)?;
         print_server_card(context, context.text("running"), None, &sock);
         return Ok(());
     }
@@ -1001,6 +1231,58 @@ fn server_restart(context: i18n::cli::Context) -> Result<()> {
         &sock,
     );
     Ok(())
+}
+
+/// Restart every server that was running when the command began. Stopped
+/// namespaces remain stopped. The selected session is deliberately last so a
+/// command launched from one of its panes updates every sibling first.
+fn server_restart_all(context: i18n::cli::Context) -> Result<()> {
+    let current = session::display_name();
+    let sessions = restart_all_targets(&current, session::list_sessions()?);
+    if sessions.is_empty() {
+        let sock = persist::client_socket_path();
+        print_server_card(
+            context,
+            context.text("no luvus server running"),
+            None,
+            &sock,
+        );
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    for info in sessions {
+        let selected = (!info.default).then_some(info.name.as_str());
+        let restarted = if info.name == current {
+            session::restart_session_via_helper(selected)
+        } else {
+            session::restart_session(selected)
+        };
+        match restarted {
+            Ok(restarted) => print_server_card_for(
+                context,
+                context.text("restarted"),
+                Some(env!("CARGO_PKG_VERSION")),
+                &session::client_socket_path_for(selected),
+                &restarted.name,
+            ),
+            Err(error) => errors.push(format!("{}: {error}", info.name)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errors.join("; ")))
+    }
+}
+
+fn restart_all_targets(
+    current: &str,
+    mut sessions: Vec<session::SessionInfo>,
+) -> Vec<session::SessionInfo> {
+    sessions.retain(|info| info.running);
+    sessions.sort_by_key(|info| info.name == current);
+    sessions
 }
 
 /// Poll (bounded) until the server releases its socket, so `stop`/`restart`
@@ -1058,11 +1340,21 @@ fn print_server_card(
     socket: &Path,
 ) {
     let session = session::display_name();
+    print_server_card_for(context, state, version, socket, &session);
+}
+
+fn print_server_card_for(
+    context: i18n::cli::Context,
+    state: &str,
+    version: Option<&str>,
+    socket: &Path,
+    session: &str,
+) {
     let socket = socket.display().to_string();
     let version = version.map(|value| format!("v{value}"));
     let mut rows = vec![
         (context.text("status"), state),
-        (context.text("session"), session.as_str()),
+        (context.text("session"), session),
     ];
     if let Some(version) = version.as_deref() {
         rows.push((context.text("version"), version));
@@ -1073,10 +1365,14 @@ fn print_server_card(
 
 fn print_detached_status(context: i18n::cli::Context) {
     let session = session::display_name();
+    print_detached_status_for(context, &session);
+}
+
+fn print_detached_status_for(context: i18n::cli::Context, session: &str) {
     let runtime = format!("{} + {}", context.text("server"), context.text("panes"));
     let rows = [
         (context.text("status"), context.text("detached")),
-        (context.text("session"), session.as_str()),
+        (context.text("session"), session),
         (runtime.as_str(), context.text("running")),
     ];
     cli::print_status_card("Luvus session", &rows);
@@ -1279,6 +1575,11 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     };
     app.events = events.clone();
     app.set_color_mode(ipc::protocol::truecolor_supported());
+    // This process owns the terminal here, so measure cells once at startup the
+    // way an attaching client reports them after its handshake. Without this a
+    // local session that never resizes would split on the fallback aspect.
+    let (cell_width_px, cell_height_px) = ipc::protocol::local_cell_pixels();
+    app.set_client_cell_pixels(cell_width_px, cell_height_px);
     let pending = if app.config.theme == "terminal" {
         let probe = terminal::theme_probe::probe();
         if let Some(colors) = probe.colors.as_ref() {
@@ -1297,6 +1598,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         EnableFocusChange,
         crossterm::terminal::SetTitle(window_title())
     );
+    #[cfg(windows)]
+    let _windows_input_mode = terminal::host_input::enable_input_mode();
     push_key_protocol();
     {
         let tx = tx.clone();
@@ -1319,6 +1622,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(ev) => {
                 app.handle_event(ev); // --local redraws every loop, so ignore the dirty bool
+                flush_local_commander_clipboard(&mut app);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1326,6 +1630,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         // Coalesce any queued events before drawing.
         while let Ok(ev) = rx.try_recv() {
             app.handle_event(ev);
+            flush_local_commander_clipboard(&mut app);
         }
         // Parked `wait.output` deadlines lapse on the tick (docs/81).
         app.tick_output_waits(Instant::now());
@@ -1365,7 +1670,13 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
             crate::platform::open_url(&url);
         }
         if let Some(text) = app.pending_clipboard.take() {
-            emit_clipboard(&text);
+            let notify = tx.clone();
+            emit_clipboard_tracked_to(&text, clipboard::local_completion(), move || {
+                let _ = notify.send(AppEvent::LocalClipboardSucceeded);
+            });
+        }
+        if let Some(notification) = clipboard::take_notification() {
+            emit_notification(notification);
         }
         app.tick_toast(Instant::now());
         app.tick_copy_highlight(Instant::now());
@@ -1374,7 +1685,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         // A forced redraw (resize / regained focus) wipes the terminal so the next
         // draw repaints every cell, healing damage ratatui's own diff can't see.
         if std::mem::take(&mut app.force_redraw) {
-            terminal.clear()?;
+            clear_local_fullscreen(terminal)?;
         }
         // Don't touch the cursor here — ratatui shows + positions it once per
         // draw. A per-frame `Hide` flickered it on any activity.
@@ -1388,6 +1699,30 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     let detached = app.detach_requested;
     app.finish_session_persistence();
     Ok(detached)
+}
+
+/// Invalidate the fullscreen display without a synchronous cursor query.
+/// `Terminal::clear` queries the cursor, competing with the already-running
+/// input thread for the reply. The next draw owns cursor positioning anyway.
+fn clear_local_fullscreen<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+) -> std::result::Result<(), B::Error> {
+    terminal.backend_mut().clear()?;
+    // Reset both buffers while keeping the current-buffer index unchanged.
+    // Otherwise an unchanged cell could be skipped after the physical clear.
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    Ok(())
+}
+
+fn flush_local_commander_clipboard(app: &mut App) {
+    if let Some(text) = app
+        .commander
+        .as_mut()
+        .and_then(|commander| commander.pending_clipboard.take())
+    {
+        emit_clipboard(&text);
+    }
 }
 
 /// Clean up a just-bound Unix socket before a local startup aborts. The caller
@@ -1411,32 +1746,7 @@ fn remove_unbound_socket(path: &Path) -> std::io::Result<()> {
 fn input_loop(tx: Sender<AppEvent>, pending: Vec<Event>) {
     #[cfg(windows)]
     {
-        let mut decoder = crate::terminal::host_input::HostInputDecoder::default();
-        for event in pending {
-            if !send_decoded_input(&tx, decoder.push(event)) {
-                return;
-            }
-        }
-        loop {
-            if let Some(timeout) = decoder.wait_timeout() {
-                match poll_event(timeout) {
-                    Ok(false) => {
-                        if !send_decoded_input(&tx, decoder.flush_expired()) {
-                            break;
-                        }
-                        continue;
-                    }
-                    Ok(true) => {}
-                    Err(_) => break,
-                }
-            }
-            let Ok(event) = read_event() else {
-                break;
-            };
-            if !send_decoded_input(&tx, decoder.push(event)) {
-                break;
-            }
-        }
+        crate::terminal::host_input::run_input_loop(pending, |event| send_input_event(&tx, event));
     }
 
     #[cfg(not(windows))]
@@ -1458,22 +1768,21 @@ fn send_input_event(tx: &Sender<AppEvent>, event: Event) -> bool {
     app_event(event).is_none_or(|event| tx.send(event).is_ok())
 }
 
-#[cfg(windows)]
-fn send_decoded_input(
-    tx: &Sender<AppEvent>,
-    decoded: crate::terminal::host_input::DecodedEvents,
-) -> bool {
-    let mut connected = true;
-    decoded.for_each(|event| {
-        if connected {
-            connected = send_input_event(tx, event);
-        }
-    });
-    connected
+fn app_event(event: Event) -> Option<AppEvent> {
+    app_event_with_image(event, || {
+        crate::platform::clipboard_image()
+            .and_then(|png| crate::clipboard_image::stage_png(&png).ok())
+    })
 }
 
-fn app_event(event: Event) -> Option<AppEvent> {
+fn app_event_with_image(
+    event: Event,
+    image: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Option<AppEvent> {
     match crate::terminal::host_key::normalize_platform_modifiers(event) {
+        Event::Key(k) if crate::clipboard_image::is_image_paste_key(&k) => {
+            image().map(AppEvent::PasteImage).or(Some(AppEvent::Key(k)))
+        }
         Event::Key(k) => Some(AppEvent::Key(k)),
         Event::Mouse(m) => Some(AppEvent::Mouse(m)),
         Event::Resize(_, _) => Some(AppEvent::Resize),
@@ -1490,12 +1799,111 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    #[test]
+    fn local_fullscreen_clear_repaints_unchanged_cells() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        let draw = |frame: &mut ratatui::Frame| {
+            frame.render_widget(ratatui::widgets::Paragraph::new("unchanged"), frame.area());
+        };
+        terminal.draw(draw).unwrap();
+        let expected = terminal.backend().buffer().clone();
+        clear_local_fullscreen(&mut terminal).unwrap();
+        assert_ne!(terminal.backend().buffer(), &expected);
+        terminal.draw(draw).unwrap();
+        assert_eq!(terminal.backend().buffer(), &expected);
+    }
+
+    #[test]
+    fn host_keyboard_protocol_requests_only_crossterm_lossless_flags() {
+        let flags = host_keyboard_enhancement_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
+
+    #[test]
+    fn stale_server_version_fails_before_binary_attach() {
+        let error = report_server_version("0.13.4".to_string()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("running server is v0.13.4"));
+        assert!(message.contains("luvus server restart"));
+    }
+
+    #[test]
+    fn matching_server_version_allows_binary_attach() {
+        report_server_version(env!("CARGO_PKG_VERSION").to_string()).unwrap();
+    }
+    #[test]
+    fn nested_interactive_launch_requires_opt_in() {
+        let _env = crate::persist::test_env("nested-launch");
+        std::env::set_var("LUVUS_ENV", "1");
+
+        let error = ensure_interactive_launch_allowed().unwrap_err();
+        assert!(error.to_string().contains("allow_nested"));
+
+        crate::config::save(&crate::config::Config {
+            allow_nested: true,
+            ..Default::default()
+        });
+        assert!(ensure_interactive_launch_allowed().is_ok());
+    }
+
+    #[test]
+    fn restart_all_targets_only_running_sessions_and_puts_selected_last() {
+        let info = |name: &str, running: bool| session::SessionInfo {
+            name: name.to_string(),
+            default: name == session::DEFAULT_SESSION_NAME,
+            running,
+            socket_path: String::new(),
+            session_dir: String::new(),
+            endpoint: session::SessionEndpoint {
+                transport: "test",
+                address: String::new(),
+            },
+        };
+        let targets = restart_all_targets(
+            "alpha",
+            vec![
+                info(session::DEFAULT_SESSION_NAME, true),
+                info("alpha", true),
+                info("stopped", false),
+                info("beta", true),
+            ],
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>(),
+            [session::DEFAULT_SESSION_NAME, "beta", "alpha"]
+        );
+    }
 
     #[test]
     fn send_server_stop_reports_absent_when_no_sockets() {
         let _env = crate::persist::test_env("stop-absent");
         crate::persist::ensure_session_dir();
         assert!(!send_server_stop().expect("absent server is not an error"));
+    }
+
+    #[test]
+    fn local_image_paste_uses_a_staged_path_and_falls_back_to_the_key() {
+        let key = ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('v'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        );
+        let path = std::path::PathBuf::from("clipboard-images/example.png");
+        assert!(matches!(
+            app_event_with_image(Event::Key(key), || Some(path.clone())),
+            Some(AppEvent::PasteImage(staged)) if staged == path
+        ));
+        assert!(matches!(
+            app_event_with_image(Event::Key(key), || None),
+            Some(AppEvent::Key(fallback)) if fallback == key
+        ));
     }
 
     #[test]
@@ -1541,6 +1949,28 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn startup_wait_rejects_bound_endpoints_without_an_app_response() {
+        let _env = crate::persist::test_env("startup-mute-accept");
+        crate::persist::ensure_session_dir();
+        let client = crate::persist::client_socket_path();
+        let api = crate::persist::socket_path();
+        let _client_listener = crate::ipc::transport::bind(&client).unwrap();
+        let _api_listener = crate::ipc::transport::bind(&api).unwrap();
+        let started = Instant::now();
+        let result = wait_for_socket_with_timeout(&client, Duration::from_millis(120));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("did not become ready"));
+        assert!(
+            server_running(&client),
+            "readiness timeout must not stop the server"
+        );
+    }
+
     #[test]
     fn control_probe_retries_with_a_longer_deadline_before_recovery() {
         let ordinary = Duration::from_millis(25);
@@ -1557,6 +1987,36 @@ mod tests {
 
         assert_eq!(result.expect("recovery probe succeeds"), "0.13.1");
         assert_eq!(attempts, vec![ordinary, recovery]);
+    }
+
+    #[test]
+    fn remote_start_if_missing_rejects_non_missing_endpoint_errors() {
+        assert!(remote_endpoint_is_missing(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(
+                !remote_endpoint_is_missing(&io::Error::from(kind)),
+                "{kind:?} must not authorize starting a server"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_start_if_missing_replaces_only_a_dead_servers_socket() {
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        assert!(remote_endpoint_is_stale(&refused, None));
+        assert!(
+            !remote_endpoint_is_stale(&refused, Some(4242)),
+            "a live server that refuses a connection is busy, not gone"
+        );
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::TimedOut] {
+            assert!(!remote_endpoint_is_stale(&io::Error::from(kind), None));
+        }
     }
 
     #[test]
@@ -2005,6 +2465,9 @@ mod tests {
     /// every draw path — catches panics and layout regressions without a tty.
     #[test]
     fn renders_chrome() {
+        // Default config keeps the runtime-status bar (`tab n/m`); a user's
+        // `bars.off` must not make this integration test depend on $LUVUS_HOME.
+        let _env = crate::persist::test_env("renders-chrome");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
         // Give the shell a moment to emit its prompt into the grid.
@@ -2030,18 +2493,18 @@ mod tests {
         assert!(text.contains("NORMAL"), "status mode missing");
     }
 
-    /// Naming a pane (via `pane name` / `agent name`) shows the name on the pane's
-    /// title strip in place of its cwd path, so a named pane is visibly renamed.
+    /// Naming a pane (via `pane name` / `agent name`) uses the same visible title
+    /// identity in a lone-pane header as it does on a split-pane border.
     #[test]
     fn naming_a_pane_renames_its_title() {
+        let _env = crate::persist::test_env("named-lone-pane-title");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
         thread::sleep(Duration::from_millis(120));
-        // Pane titles only render when a tab has more than one (bordered) pane.
-        app.dispatch("pane.split", &serde_json::Value::Object(Default::default()))
-            .unwrap();
         let pane = app.layout().focus;
         app.agent_names.insert("apisvc".into(), pane);
+        app.config.layout.show_titles = true;
+        app.config.layout.pane_title_path = false;
 
         let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
@@ -2054,22 +2517,22 @@ mod tests {
             .collect();
         assert!(
             text.contains("apisvc"),
-            "a named pane's title should show its name"
+            "a named lone pane's title should show its name"
         );
     }
 
-    /// With the `pane_title_path` setting on, a named pane's title appends its cwd
-    /// path after the name; off (default) it shows just the name.
+    /// The shared path setting applies to the same named title in lone and split
+    /// layouts; off (default) leaves only the pane identity.
     #[test]
     fn pane_title_path_setting_appends_the_path() {
         let _env = crate::persist::test_env("pane-title-path");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
         thread::sleep(Duration::from_millis(120));
-        app.dispatch("pane.split", &serde_json::Value::Object(Default::default()))
-            .unwrap();
         let pane = app.layout().focus;
+        app.panes.get_mut(&pane).unwrap().cwd = PathBuf::from("shared-title-cwd-probe");
         app.agent_names.insert("svcx".into(), pane);
+        app.config.layout.show_titles = true;
 
         let render = |app: &mut App| -> String {
             let mut term = Terminal::new(TestBackend::new(110, 32)).unwrap();
@@ -2088,16 +2551,75 @@ mod tests {
         let off = render(&mut app);
         assert!(off.contains("svcx"), "named pane shows its name");
         assert!(
-            !off.contains("svcx  "),
+            !off.contains("svcx · shared-title-cwd-probe"),
             "default title is the name alone, without the path"
         );
 
-        // Setting on: the path follows the name.
+        // Setting on: the path follows the name in the lone-pane header.
         app.config.layout.pane_title_path = true;
         let on = render(&mut app);
         assert!(
-            on.contains("svcx  "),
+            on.contains("svcx · shared-title-cwd-probe"),
             "with pane_title_path on, the title appends the path after the name"
+        );
+
+        // Splitting changes only the title's container, not its resolved text.
+        app.dispatch("pane.split", &serde_json::Value::Object(Default::default()))
+            .unwrap();
+        let split = render(&mut app);
+        assert!(
+            split.contains("svcx · shared-title-cwd-probe"),
+            "split panes use the same title resolver"
+        );
+    }
+
+    /// An unnamed pane remains identifiable, while disabling pane titles also
+    /// reclaims the lone header row for terminal content.
+    #[test]
+    fn unnamed_lone_pane_title_uses_id_and_honors_visibility() {
+        let _env = crate::persist::test_env("unnamed-lone-pane-title");
+        let (tx, _rx) = mpsc::channel::<AppEvent>();
+        let mut app = App::new(80, 24, tx).expect("spawn pane");
+        thread::sleep(Duration::from_millis(120));
+        let pane = app.layout().focus;
+        let fallback = format!("p{}", pane.0);
+        app.config.layout.pane_title_path = false;
+
+        let render = |app: &mut App| -> String {
+            let mut term = Terminal::new(TestBackend::new(110, 32)).unwrap();
+            term.draw(|f| ui::render(f, app)).unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        app.config.layout.show_titles = true;
+        let shown = render(&mut app);
+        let shown_height = app
+            .pane_content_rects
+            .iter()
+            .find_map(|(id, rect)| (*id == pane).then_some(rect.height))
+            .expect("focused pane content geometry");
+        assert!(
+            shown.contains(&fallback),
+            "unnamed pane shows its stable ID"
+        );
+
+        app.config.layout.show_titles = false;
+        let hidden = render(&mut app);
+        let hidden_height = app
+            .pane_content_rects
+            .iter()
+            .find_map(|(id, rect)| (*id == pane).then_some(rect.height))
+            .expect("focused pane content geometry");
+        assert!(!hidden.contains(&fallback), "hidden title is not rendered");
+        assert_eq!(
+            hidden_height,
+            shown_height + 1,
+            "hiding a lone title returns its row to terminal content"
         );
     }
 
@@ -2357,11 +2879,32 @@ mod tests {
         };
 
         // Right-click the first workspace → its context menu opens.
+        app.workspaces[0].branch = Some("feature/demo".into());
         render(&mut app);
         let row = ws_row(&app);
         mouse(&mut app, MouseButton::Right, row.x + 1, row.y);
         assert!(app.ws_menu.is_some(), "right-click opens the menu");
         render(&mut app); // populates item rects
+
+        // The copy rows live one level down. Hovering the Quick Actions row opens
+        // its submenu, which lists Copy Path then Copy Branch.
+        let parent = item_rect(&app, WsMenuItem::QuickActions);
+        app.hover = Some((parent.x + 1, parent.y));
+        render(&mut app);
+        let quick: Vec<WsMenuItem> = app
+            .ws_menu
+            .as_ref()
+            .expect("menu open")
+            .quick_rects
+            .iter()
+            .map(|(item, _)| *item)
+            .collect();
+        assert_eq!(
+            quick,
+            vec![WsMenuItem::CopyPath, WsMenuItem::CopyBranch],
+            "Quick Actions lists Copy Path then Copy Branch"
+        );
+        app.hover = None;
 
         // Pick Rename → the modal opens pre-filled with the current label.
         let rn = item_rect(&app, WsMenuItem::Rename);

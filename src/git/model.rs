@@ -194,6 +194,10 @@ pub struct Worktree {
     pub branch: Option<String>,
     pub head: String,
     pub is_main: bool,
+    /// A bare entry (`git worktree list` reports the bare repo itself as the
+    /// first "worktree"). It has no working files, so it can't be opened as a
+    /// workspace — kept in the list so `is_main` stays true to git's ordering.
+    pub bare: bool,
 }
 
 /// A workspace's worktree grouping. All checkouts of one repo share a `common_dir`
@@ -201,17 +205,12 @@ pub struct Worktree {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorktreeMembership {
     pub common_dir: std::path::PathBuf,
+    /// Captured when this workspace opened, so deletion cannot follow a new
+    /// checkout that later appears at the same path.
+    pub directory_identity: Option<crate::platform::DirectoryIdentity>,
     /// True when this checkout is a **linked worktree** rather than the repo's
     /// main working tree. Resolved once when the membership is built (it needs
     /// path canonicalization), so readers on the app loop stay allocation- and
     /// syscall-free.
     pub linked: bool,
-}
-
-/// Git metadata for one repository root, resolved off the app loop.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GitRootInfo {
-    pub root: std::path::PathBuf,
-    pub branch: Option<String>,
-    pub worktree: Option<WorktreeMembership>,
 }

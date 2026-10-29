@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://luvus.dev/protocol/uhp/v1/request.schema.json",
   "title": "Luvus Universal Harness Protocol request",
+  "$comment": "agent.prompt preserves target/text/strict/wait/until/timeout_s and accepts an optional terminal_id fence. strict defaults false and requires positive live composer evidence; agents without a detector reject in strict mode. No-wait returns queue admission immediately. wait=true requires a new working or blocked transition before matching until, bounded by timeout_s (default 300). until and timeout_s require wait=true. agent.wait remains a current-state matcher.",
   "type": "object",
   "additionalProperties": false,
   "required": ["id", "method", "params"],
@@ -14,10 +15,11 @@
         "uhp.capabilities", "uhp.stats", "uhp.token.create", "uhp.token.list", "uhp.token.revoke",
         "ping", "server.stop", "server.reload_config", "server.agent_manifests", "server.reload_agent_manifests", "config.get", "config.patch",
         "host.capabilities", "host.info", "host.doctor", "host.update.check", "host.update.install", "session.snapshot", "session.list", "session.status", "session.start", "session.stop", "session.restart", "session.delete", "skill.status", "skill.enable", "skill.disable", "integration.status", "integration.install", "integration.uninstall", "events.subscribe", "events.wait", "wait.output",
+        "machine.list", "machine.get", "machine.status", "machine.sessions", "machine.add", "machine.rename", "machine.enable", "machine.disable", "machine.remove",
         "workspace.list", "workspace.get", "workspace.new", "workspace.open", "workspace.focus", "workspace.rename", "workspace.pin", "workspace.move", "workspace.move_block", "workspace.report_metadata", "workspace.close",
         "node.list", "node.new", "node.open", "node.focus", "node.rename", "node.pin", "node.close",
         "tab.list", "tab.get", "tab.new", "tab.focus", "tab.move", "tab.swap", "tab.rename", "tab.close",
-        "pane.list", "pane.get", "pane.current", "pane.layout", "pane.neighbor", "pane.edges", "pane.split", "pane.move", "pane.swap", "pane.focus", "pane.focus_direction", "pane.resize", "pane.zoom", "pane.rename", "pane.run", "pane.send_input", "pane.read", "pane.status", "pane.processes", "pane.report_session", "pane.report_event", "pane.close", "attach.pane",
+        "pane.list", "pane.get", "pane.current", "pane.layout", "pane.neighbor", "pane.edges", "pane.split", "pane.move", "pane.swap", "pane.transpose", "pane.focus", "pane.focus_direction", "pane.resize", "pane.zoom", "pane.rename", "pane.run", "pane.send_input", "pane.read", "pane.status", "pane.processes", "pane.report_session", "pane.release_session", "pane.report_event", "pane.close", "attach.pane",
         "layout.export", "layout.apply", "layout.set_split_ratio",
         "agent.list", "agent.get", "agent.explain", "agent.report", "agent.release", "agent.start", "agent.prompt", "agent.wait", "agent.name", "agent.fork", "agent.send", "agent.keys", "agent.read", "agent.sessions", "agent.resume",
         "search", "search.capabilities", "search.query", "search.activate",
@@ -26,19 +28,73 @@
         "mission.snapshot", "mission.refresh", "mission.open",
         "diff.refresh", "diff.list", "diff.open", "diff.get", "diff.navigate", "diff.note.add", "diff.note.apply", "diff.note.list", "diff.note.edit", "diff.note.resolve", "diff.note.reopen", "diff.note.remove", "diff.note.send",
         "worktree.list", "worktree.create", "worktree.open", "worktree.remove",
-        "task.add", "task.list", "task.get", "task.claim", "task.next", "task.start", "task.heartbeat", "task.update", "task.done", "task.merge", "task.release", "task.delete",
+        "task.add", "task.list", "task.get", "task.claim", "task.next", "task.start", "task.heartbeat", "task.update", "task.done", "task.retry", "task.merge", "task.release", "task.delete",
         "automation.create", "automation.list", "automation.get", "automation.update", "automation.enable", "automation.disable", "automation.rebind", "automation.delete", "automation.run", "automation.history", "automation.preview", "automation.health",
         "lease.acquire", "lease.list", "lease.release",
-        "module.list", "module.info", "module.link", "module.unlink", "module.uninstall", "module.enable", "module.disable", "module.action.list", "module.action.invoke", "module.pane.open", "module.pane.focus", "module.pane.close", "module.config_dir", "module.settings.list", "module.settings.get", "module.settings.set", "module.log.list",
+        "module.list", "module.info", "module.link", "module.update", "module.unlink", "module.uninstall", "module.enable", "module.disable", "module.action.list", "module.action.invoke", "module.pane.open", "module.pane.focus", "module.pane.close", "module.config_dir", "module.settings.list", "module.settings.get", "module.settings.set", "module.log.list",
         "theme.list", "theme.path", "theme.use", "theme.reload", "manifest.reload",
-        "ui.sidebar", "ui.dock.push", "ui.dock.list", "ui.dock.move", "ui.bar.push", "ui.bar.list", "ui.bar.move", "ui.bar.remove", "ui.notification.push", "ui.notification.clear", "ui.toast",
-        "terminal.backend.inventory", "terminal.backend.snapshot", "terminal.backend.validate", "terminal.backend.processes", "terminal.backend.capture", "terminal.backend.observe", "terminal.backend.control", "terminal.backend.type_literal", "terminal.backend.submit_text", "terminal.backend.send_key", "terminal.backend.set_title", "terminal.backend.notify", "terminal.backend.create", "terminal.backend.close", "terminal.backend.wait_change", "terminal.backend.wait_output", "terminal.backend.events.subscribe"
+        "ui.sidebar", "ui.agent_title.push", "ui.agent_title.clear", "ui.dock.push", "ui.dock.list", "ui.dock.move", "ui.bar.push", "ui.bar.list", "ui.bar.move", "ui.bar.remove", "ui.notification.push", "ui.notification.clear", "ui.toast",
+        "terminal.backend.inventory", "terminal.backend.snapshot", "terminal.backend.validate", "terminal.backend.processes", "terminal.backend.capture", "terminal.backend.observe", "terminal.backend.control", "terminal.backend.type_literal", "terminal.backend.paste_text", "terminal.backend.submit_text", "terminal.backend.send_key", "terminal.backend.set_title", "terminal.backend.notify", "terminal.backend.create", "terminal.backend.close", "terminal.backend.wait_change", "terminal.backend.wait_output", "terminal.backend.events.subscribe"
       ]
     },
     "params": { "type": "object" }
   },
   "$defs": {
     "emptyParams": { "type": "object", "additionalProperties": false, "maxProperties": 0 },
+    "moduleUpdateParams": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "path", "source", "expected_root", "expected_source"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "expected_root": { "type": "string", "minLength": 1 },
+        "expected_source": { "type": "string", "minLength": 1 },
+        "expected_ref": { "type": ["string", "null"], "minLength": 1 },
+        "git_ref": { "type": ["string", "null"], "minLength": 1 }
+      }
+    },
+    "paneTransposeParams": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "pane": { "oneOf": [{ "type": "string", "pattern": "^0*(?:[0-9]{1,9}|[1-3][0-9]{9}|4[01][0-9]{8}|42[0-8][0-9]{7}|429[0-3][0-9]{6}|4294[0-8][0-9]{5}|42949[0-5][0-9]{4}|429496[0-6][0-9]{3}|4294967[01][0-9]{2}|42949672[0-8][0-9]|429496729[0-5])$" }, { "type": "integer", "minimum": 0, "maximum": 4294967295 }, { "type": "null" }] },
+        "if_revision": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "paneListParams": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "all_tabs": { "type": "boolean", "default": true } }
+    },
+    "machineIdParams": {
+      "type": "object", "additionalProperties": false, "required": ["id"],
+      "properties": { "id": { "type": "string", "minLength": 1, "maxLength": 48, "pattern": "^[a-z0-9][a-z0-9._-]*$" } }
+    },
+    "machineMutationParams": {
+      "type": "object", "additionalProperties": false, "required": ["id", "if_revision"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 48, "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+        "if_revision": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "machineRenameParams": {
+      "type": "object", "additionalProperties": false, "required": ["id", "label", "if_revision"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 48, "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "if_revision": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "machineAddParams": {
+      "type": "object", "additionalProperties": false, "required": ["id", "host", "if_revision"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 48, "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+        "host": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^-\\s][^\\s]*$" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "remote_binary": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?:/[A-Za-z0-9/_.+-]+|[A-Za-z]:[\\\\/][A-Za-z0-9\\\\/_.+-]+)$" },
+        "enabled": { "type": "boolean" },
+        "if_revision": { "type": "integer", "minimum": 0 }
+      }
+    },
     "tokenCreateParams": {
       "type": "object", "additionalProperties": false, "required": ["scopes"],
       "properties": {
@@ -85,10 +141,39 @@
         { "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F\\uD800-\\uDFFF]$" }
       ]
     },
-    "agentKeysParams": {
-      "type": "object", "additionalProperties": false, "required": ["target", "keys"],
+    "agentPromptParams": {
+      "type": "object", "additionalProperties": false, "required": ["target", "text"],
       "properties": {
         "target": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 262144 },
+        "strict": { "type": "boolean" },
+        "terminal_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "wait": { "type": "boolean" },
+        "until": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "enum": ["idle", "working", "blocked", "done"] } },
+        "timeout_s": { "type": "number", "minimum": 0, "maximum": 3600 }
+      },
+      "if": { "anyOf": [{ "required": ["until"] }, { "required": ["timeout_s"] }] },
+      "then": { "required": ["wait"], "properties": { "wait": { "const": true } } }
+    },
+    "agentSendParams": {
+      "type": "object", "additionalProperties": false, "required": ["target", "text"],
+      "properties": {
+        "target": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "text": { "type": "string", "minLength": 1 },
+        "strict": { "type": "boolean" },
+        "terminal_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
+      }
+    },
+    "agentKeysParams": {
+      "type": "object", "additionalProperties": false, "required": ["target", "keys"],
+      "dependentRequired": {
+        "if_content_revision": ["terminal_id"],
+        "terminal_id": ["if_content_revision"]
+      },
+      "properties": {
+        "target": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "if_content_revision": { "type": "integer", "minimum": 0 },
+        "terminal_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
         "keys": {
           "type": "array", "minItems": 1,
           "items": { "$ref": "#/$defs/agentKey" }
@@ -144,7 +229,63 @@
             "cost": { "type": ["number", "null"], "minimum": 0, "maximum": 1000000000000 },
             "updated_at": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
           }
-        }
+        },
+        "reporter_pid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "evidence": {
+          "type": "object", "additionalProperties": false, "required": ["cwd", "prompt"],
+          "properties": {
+            "cwd": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "prompt": { "type": "string", "maxLength": 16384 }
+          }
+        },
+        "dry_run": { "type": "boolean" }
+      },
+      "allOf": [
+        { "if": { "required": ["evidence"] }, "then": { "not": { "anyOf": [ { "required": ["pane"] }, { "required": ["reporter_pid"] } ] } } },
+        { "if": { "required": ["dry_run"], "properties": { "dry_run": { "const": true } } }, "then": { "required": ["evidence"] } }
+      ]
+    },
+    "paneReleaseSessionParams": {
+      "type": "object", "additionalProperties": false, "required": ["agent", "session_id"],
+      "properties": {
+        "pane": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "integer", "minimum": 0 }] },
+        "agent": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "session_id": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9._:/-]+$" }
+      }
+    },
+    "taskAddParams": {
+      "type": "object", "additionalProperties": false, "required": ["title"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "$comment": "Consumers must enforce a 256-byte UTF-8 limit." },
+        "prompt": { "type": "string", "$comment": "Consumers must enforce a 32768-byte UTF-8 limit." },
+        "paths": { "type": "array", "items": { "type": "string" } },
+        "deps": { "type": "array", "items": { "type": "string" } },
+        "gate": { "type": "string" },
+        "workspace_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "pane": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "integer", "minimum": 0 }] }
+      }
+    },
+    "taskUpdateParams": {
+      "type": "object", "additionalProperties": false, "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "prompt": { "type": ["string", "null"], "$comment": "Consumers must enforce a 32768-byte UTF-8 limit." },
+        "status": { "enum": ["queued", "claimed", "running", "blocked", "review", "done", "failed"] },
+        "output": { "type": "string" },
+        "note": { "type": "string" }
+      }
+    },
+    "taskRetryParams": {
+      "type": "object", "additionalProperties": false, "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "worktreeRemoveParams": {
+      "type": "object", "additionalProperties": false, "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "force": { "type": "boolean" }
       }
     },
     "taskStartParams": {
@@ -154,7 +295,8 @@
         "branch": { "type": "string", "minLength": 1, "maxLength": 255 },
         "agent": { "type": "string", "minLength": 1, "maxLength": 4096 },
         "mode": { "enum": ["worktree", "workspace"] },
-        "workspace_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+        "workspace_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "focus": { "type": "boolean" }
       },
       "allOf": [
         { "if": { "properties": { "mode": { "const": "workspace" } }, "required": ["mode"] },
@@ -282,8 +424,24 @@
     }
   },
   "allOf": [
+    { "if": { "properties": { "method": { "const": "pane.transpose" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/paneTransposeParams" } } } },
+    { "if": { "properties": { "method": { "const": "module.update" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/moduleUpdateParams" } } } },
     { "if": { "properties": { "method": { "enum": ["host.capabilities", "host.info", "host.doctor", "host.update.check", "skill.status", "integration.status", "uhp.capabilities", "uhp.stats", "uhp.token.list", "session.list"] } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/emptyParams" } } } },
+    { "if": { "properties": { "method": { "const": "machine.list" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/emptyParams" } } } },
+    { "if": { "properties": { "method": { "const": "pane.list" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/paneListParams" } } } },
+    { "if": { "properties": { "method": { "enum": ["machine.get", "machine.status", "machine.sessions"] } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/machineIdParams" } } } },
+    { "if": { "properties": { "method": { "const": "machine.add" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/machineAddParams" } } } },
+    { "if": { "properties": { "method": { "const": "machine.rename" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/machineRenameParams" } } } },
+    { "if": { "properties": { "method": { "enum": ["machine.enable", "machine.disable", "machine.remove"] } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/machineMutationParams" } } } },
     { "if": { "properties": { "method": { "const": "uhp.token.create" } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/tokenCreateParams" } } } },
     { "if": { "properties": { "method": { "const": "uhp.token.revoke" } } },
@@ -296,6 +454,10 @@
       "then": { "properties": { "params": { "$ref": "#/$defs/agentWaitParams" } } } },
     { "if": { "properties": { "method": { "const": "agent.keys" } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/agentKeysParams" } } } },
+    { "if": { "properties": { "method": { "const": "agent.prompt" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/agentPromptParams" } } } },
+    { "if": { "properties": { "method": { "const": "agent.send" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/agentSendParams" } } } },
     { "if": { "properties": { "method": { "enum": ["mission.snapshot", "mission.refresh"] } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/missionQueryParams" } } } },
     { "if": { "properties": { "method": { "enum": ["session.status", "session.start", "session.stop", "session.restart"] } } },
@@ -308,6 +470,16 @@
       "then": { "properties": { "params": { "$ref": "#/$defs/integrationChangeParams" } } } },
     { "if": { "properties": { "method": { "const": "pane.report_session" } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/paneReportSessionParams" } } } },
+    { "if": { "properties": { "method": { "const": "pane.release_session" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/paneReleaseSessionParams" } } } },
+    { "if": { "properties": { "method": { "const": "task.add" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/taskAddParams" } } } },
+    { "if": { "properties": { "method": { "const": "task.update" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/taskUpdateParams" } } } },
+    { "if": { "properties": { "method": { "const": "task.retry" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/taskRetryParams" } } } },
+    { "if": { "properties": { "method": { "const": "worktree.remove" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/worktreeRemoveParams" } } } },
     { "if": { "properties": { "method": { "const": "task.start" } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/taskStartParams" } } } },
     { "if": { "properties": { "method": { "const": "task.next" } } },
@@ -346,6 +518,8 @@
       "then": { "properties": { "params": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/methods/control.schema.json" } } } },
     { "if": { "properties": { "method": { "const": "terminal.backend.type_literal" } } },
       "then": { "properties": { "params": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/methods/type-literal.schema.json" } } } },
+    { "if": { "properties": { "method": { "const": "terminal.backend.paste_text" } } },
+      "then": { "properties": { "params": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/methods/paste-text.schema.json" } } } },
     { "if": { "properties": { "method": { "const": "terminal.backend.submit_text" } } },
       "then": { "properties": { "params": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/methods/submit-text.schema.json" } } } },
     { "if": { "properties": { "method": { "const": "terminal.backend.send_key" } } },

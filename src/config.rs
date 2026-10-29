@@ -16,6 +16,16 @@ use crate::app::{SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
 
 const CONFIG_VERSION: u32 = 2;
 
+/// Commander admission for an agent that is working but has a ready prompt.
+/// This never changes the agent's own permission or approval policy.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommanderWorkingPolicy {
+    Ask,
+    #[default]
+    AutoSend,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     #[serde(default)]
@@ -41,6 +51,15 @@ pub struct Config {
     pub layout: LayoutConfig,
     #[serde(default)]
     pub notifications: NotifyConfig,
+    /// Session persistence policy. Pane screens remain enabled by default for
+    /// backward-compatible instant restore; users can retain layout and agent
+    /// resume metadata without writing terminal content to disk.
+    #[serde(default)]
+    pub session: SessionConfig,
+    /// Allow launching an interactive Luvus client from a Luvus pane.
+    /// Disabled by default because nested clients compete for terminal input.
+    #[serde(default)]
+    pub allow_nested: bool,
     /// Check `luvus.dev/latest.json` in the background for a newer release and
     /// show an indicator by the version number. A single periodic `curl`/`wget`
     /// GET; on by default, toggled in Settings → General. Notify-only — luvus
@@ -61,6 +80,8 @@ pub struct Config {
     /// (`--permission-mode bypassPermissions`), so switching it on is deliberate.
     #[serde(default)]
     pub resume_launch_flags: bool,
+    #[serde(default)]
+    pub commander_working_policy: CommanderWorkingPolicy,
     /// Show only live agents in the AGENTS dock. Missing values retain the
     /// historical All default so resumable sessions never appear lost after an
     /// upgrade. The visible All / Active control updates this preference.
@@ -104,10 +125,50 @@ pub struct Config {
     /// or restart. This set keeps an off dock off; re-placing it clears the flag.
     #[serde(default)]
     pub docks_off: Vec<String>,
+    /// Worktree creation backend. The built-in Git provider remains the default;
+    /// third-party tools integrate through a selected module provider.
+    #[serde(default)]
+    pub worktree: WorktreeConfig,
     /// Luvus Bar placement groups. Dynamic content is never persisted here;
     /// only presentation preferences survive a restart.
     #[serde(default)]
     pub bars: BarConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SessionConfig {
+    /// Persist each pane's visible terminal screen in `session.json` so it can
+    /// be replayed immediately while the restored PTY starts.
+    #[serde(default = "yes")]
+    pub persist_pane_screen: bool,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            persist_pane_screen: true,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeConfig {
+    /// `git` (default) or the canonical id of an enabled module whose manifest
+    /// declares `[worktree_provider]`.
+    #[serde(default = "default_worktree_provider")]
+    pub provider: String,
+}
+
+fn default_worktree_provider() -> String {
+    "git".to_string()
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_worktree_provider(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -207,15 +268,15 @@ pub struct LayoutConfig {
     pub row_gap: u16,
     #[serde(default = "yes")]
     pub show_titles: bool,
-    /// When a pane is named (`pane name` / `agent name`), also show its cwd path
-    /// after the name in the title strip. Off by default: a named pane shows just
-    /// its name, an unnamed pane its path (the original behavior).
+    /// Show a pane's live cwd after its explicit name or `p<ID>` fallback in the
+    /// title. This applies equally to lone-pane headers and split-pane borders.
     #[serde(default)]
     pub pane_title_path: bool,
-    /// In the AGENTS sidebar, show each agent's live session title (the OSC title
-    /// it sets, e.g. "Ship the desktop release…") in place of the `wsname · =<id>`
-    /// meta line. Off by default; falls back to the meta line when an agent set no
-    /// useful title.
+    /// In the AGENTS sidebar, show each agent's session title in place of the
+    /// `wsname · =<id>` meta line (live) or the project folder (resumable).
+    /// OSC title wins when the agent set one; otherwise a module-provided title
+    /// from `ui.agent_title.push`. Off by default. Luvus pane aliases are never
+    /// used as a title.
     #[serde(default)]
     pub agent_title: bool,
     /// Show the cwd line beneath each WORKSPACES entry. On by default to retain
@@ -291,12 +352,14 @@ pub struct LayoutConfig {
     /// client's viewport. `0` disables mobile presentation entirely.
     #[serde(default = "default_mobile_width", alias = "compact_width")]
     pub mobile_width: u16,
-    /// What luvus forwards to a pane for **Shift/Alt+Enter** ("new line, don't
-    /// submit"). A keyword from [`SHIFT_ENTER_CHOICES`]; default `esc-cr`
-    /// (`ESC CR`, the sequence Claude Code's `/terminal-setup` installs). Exposed
-    /// because agents/terminals disagree on which byte sequence they treat as a
-    /// newline — notably some Windows agents want a bare `LF` where macOS wants
-    /// `ESC CR`. Set once, applied to every pane's keystroke encoding.
+    /// What luvus forwards to a pane for modified Enter when the child has not
+    /// negotiated the Kitty keyboard protocol. A keyword from
+    /// [`SHIFT_ENTER_CHOICES`]; default `esc-cr` (`ESC CR`, the sequence Claude
+    /// Code's `/terminal-setup` installs). Kitty modes preserve the real
+    /// modifiers instead, so Shift+Enter and Alt+Enter remain distinct. Exposed
+    /// because agents/terminals disagree on which legacy byte sequence they
+    /// treat as a newline — notably some Windows agents want a bare `LF` where
+    /// macOS wants `ESC CR`. Set once, applied to every pane's key encoding.
     #[serde(default = "default_shift_enter")]
     pub shift_enter: String,
 }
@@ -313,12 +376,13 @@ fn default_shift_enter() -> String {
     SHIFT_ENTER_CHOICES[0].0.to_string()
 }
 
-/// Ordered choices for what Shift/Alt+Enter sends to a pane: `(keyword, label,
+/// Ordered choices for the legacy modified-Enter fallback: `(keyword, label,
 /// bytes)`. The keyword is the stable `config.layout.shift_enter` value; the
 /// label is shown in the Settings chooser; the bytes are what `encode_key`
-/// forwards. `ESC CR` leads because it is what agent CLIs expect out of the box
-/// (Claude Code's `/terminal-setup`). The others cover agents/terminals that
-/// bind a plain `LF` or the CSI-u modified-Enter form instead.
+/// forwards when no Kitty keyboard mode is active. `ESC CR` leads because it is
+/// what agent CLIs expect out of the box (Claude Code's `/terminal-setup`). The
+/// others cover agents/terminals that bind a plain `LF` or the CSI-u Shift+Enter
+/// form instead.
 pub const SHIFT_ENTER_CHOICES: &[(&str, &str, &[u8])] = &[
     ("esc-cr", "ESC CR (default)", b"\x1b\r"),
     ("lf", "LF (newline)", b"\n"),
@@ -327,7 +391,7 @@ pub const SHIFT_ENTER_CHOICES: &[(&str, &str, &[u8])] = &[
 ];
 
 /// Left + right sidebar layout (docs/29). Serialized under `sidebars`.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SidebarsConfig {
     #[serde(default = "SideConfig::left_default")]
     pub left: SideConfig,
@@ -340,7 +404,7 @@ pub struct SidebarsConfig {
 }
 
 /// One sidebar's persisted state: shown/hidden, width, and its ordered dock ids.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SideConfig {
     #[serde(default = "yes")]
     pub visible: bool,
@@ -471,8 +535,11 @@ impl Default for Config {
             sidebars: None,
             layout: LayoutConfig::default(),
             notifications: NotifyConfig::default(),
+            session: SessionConfig::default(),
+            allow_nested: false,
             check_updates: true,
             resume_launch_flags: false,
+            commander_working_policy: CommanderWorkingPolicy::AutoSend,
             agents_active_only: false,
             agents_this_workspace: false,
             keybindings: std::collections::HashMap::new(),
@@ -481,6 +548,7 @@ impl Default for Config {
             mission_pricing: std::collections::HashMap::new(),
             mission_budget: None,
             docks_off: Vec::new(),
+            worktree: WorktreeConfig::default(),
             bars: BarConfig::default(),
         }
     }
@@ -861,18 +929,32 @@ mod tests {
     #[test]
     fn defaults_and_roundtrip() {
         let c = Config::default();
+        assert!(!c.allow_nested);
+        assert_eq!(c.commander_working_policy, CommanderWorkingPolicy::AutoSend);
         assert_eq!(c.theme, "quattro-rally");
         assert!(c.layout.show_titles);
         assert!(c.layout.workspace_paths);
         assert!(c.layout.agent_paths);
+        assert!(c.session.persist_pane_screen);
         assert_eq!(c.layout.col_gap, 1);
         assert_eq!(c.layout.mobile_width, crate::app::MOBILE_WIDTH);
         // Empty object → all defaults (forward/back compat).
         let from_empty: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(from_empty.theme, "quattro-rally");
+        assert!(!from_empty.allow_nested);
+        assert_eq!(
+            from_empty.commander_working_policy,
+            CommanderWorkingPolicy::AutoSend
+        );
+        let ask: Config = serde_json::from_str(r#"{"commander_working_policy":"ask"}"#).unwrap();
+        assert_eq!(ask.commander_working_policy, CommanderWorkingPolicy::Ask);
         assert_eq!(from_empty.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
         assert!(from_empty.layout.workspace_paths);
         assert!(from_empty.layout.agent_paths);
+        assert!(
+            from_empty.session.persist_pane_screen,
+            "existing configs retain instant pane-screen restore"
+        );
         assert!(
             from_empty.direct_keybindings.is_empty(),
             "existing configs do not gain input-stealing direct shortcuts"
@@ -891,6 +973,25 @@ mod tests {
             "old configs gain the default runtime bar"
         );
         assert!(from_empty.bars.top_right.is_empty());
+        assert_eq!(from_empty.worktree, WorktreeConfig::default());
+        let module_provider: Config =
+            serde_json::from_str(r#"{"worktree":{"provider":"example.provider"}}"#).unwrap();
+        assert_eq!(module_provider.worktree.provider, "example.provider");
+        let forward: Config = serde_json::from_str(
+            r#"{"worktree":{"provider":"future-provider","future_option":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(forward.worktree.provider, "future-provider");
+        let private: Config =
+            serde_json::from_str(r#"{"session":{"persist_pane_screen":false}}"#).unwrap();
+        assert!(!private.session.persist_pane_screen);
+        let private_json = serde_json::to_string(&private).unwrap();
+        assert!(
+            !serde_json::from_str::<Config>(&private_json)
+                .unwrap()
+                .session
+                .persist_pane_screen
+        );
         // Round-trip preserves values.
         // Scrollback defaults to a per-pane 10 MiB budget. The legacy line
         // field remains only so old config can migrate safely.
@@ -954,6 +1055,15 @@ mod tests {
         assert!(back.notifications.sound_on_done);
         assert!(!back.notifications.sound_on_blocked);
         assert_eq!(back.notifications.sound_style, crate::sound::STYLE_RETRO);
+        // Nested clients are opt-in and survive serialization.
+        let mut nested = c2.clone();
+        nested.allow_nested = true;
+        let nested_json = serde_json::to_string(&nested).unwrap();
+        assert!(
+            serde_json::from_str::<Config>(&nested_json)
+                .unwrap()
+                .allow_nested
+        );
 
         // Configs written before sound styles existed retain the original cue.
         let old: Config = serde_json::from_str(

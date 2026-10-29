@@ -4,7 +4,7 @@
   "type":"object",
   "properties":{
     "id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._:-]+$"},
-    "action":{"enum":["type_literal","submit_text","send_key"]},
+    "action":{"enum":["type_literal","paste_text","paste_image","submit_text","send_key","upload_start","upload_chunk","upload_finish","upload_cancel","set_viewport"]},
     "params":{"type":"object"}
   },
   "required":["id","action","params"],
@@ -18,6 +18,42 @@
     },
     {
       "properties":{
+        "action":{"const":"paste_text"},
+        "params":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":262144}},"required":["text"],"additionalProperties":false}
+      }
+    },
+    {
+      "properties":{
+        "action":{"const":"paste_image"},
+        "params":{"type":"object","properties":{"png_base64":{"type":"string","minLength":4,"maxLength":218456,"pattern":"^[A-Za-z0-9+/]+={0,2}$"}},"required":["png_base64"],"additionalProperties":false}
+      }
+    },
+    {
+      "properties":{
+        "action":{"const":"upload_start"},
+        "params":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":255},"size":{"type":"integer","minimum":1,"maximum":33554432}},"required":["name","size"],"additionalProperties":false}
+      }
+    },
+    {
+      "properties":{
+        "action":{"const":"upload_chunk"},
+        "params":{"type":"object","properties":{"upload_id":{"type":"string","pattern":"^[0-9a-f]{32}$"},"offset":{"type":"integer","minimum":0,"maximum":33554432},"data_base64":{"type":"string","minLength":4,"maxLength":218456,"pattern":"^[A-Za-z0-9+/]+={0,2}$"}},"required":["upload_id","offset","data_base64"],"additionalProperties":false}
+      }
+    },
+    {
+      "properties":{
+        "action":{"enum":["upload_finish","upload_cancel"]},
+        "params":{"type":"object","properties":{"upload_id":{"type":"string","pattern":"^[0-9a-f]{32}$"}},"required":["upload_id"],"additionalProperties":false}
+      }
+    },
+    {
+      "properties":{
+        "action":{"const":"set_viewport"},
+        "params":{"type":"object","properties":{"cols":{"type":"integer","minimum":2,"maximum":500},"rows":{"type":"integer","minimum":2,"maximum":300}},"required":["cols","rows"],"additionalProperties":false}
+      }
+    },
+    {
+      "properties":{
         "action":{"const":"submit_text"},
         "params":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":262144}},"required":["text"],"additionalProperties":false}
       }
@@ -25,7 +61,7 @@
     {
       "properties":{
         "action":{"const":"send_key"},
-        "params":{"type":"object","properties":{"key":{"enum":["enter","escape","tab","backtab","up","down","left","right","home","end","backspace","delete","pageup","pagedown","ctrl-c","ctrl-d","ctrl-u","ctrl-w","space","digit-0","digit-1","digit-2","digit-3","digit-4","digit-5","digit-6","digit-7","digit-8","digit-9"]}},"required":["key"],"additionalProperties":false}
+        "params":{"type":"object","properties":{"key":{"enum":["enter","escape","tab","backtab","up","down","left","right","home","end","backspace","delete","pageup","pagedown","ctrl-c","ctrl-d","ctrl-k","ctrl-u","ctrl-w","alt-d","space","digit-0","digit-1","digit-2","digit-3","digit-4","digit-5","digit-6","digit-7","digit-8","digit-9","ctrl-a","ctrl-b","ctrl-e","ctrl-f","ctrl-g","ctrl-h","ctrl-i","ctrl-j","ctrl-l","ctrl-m","ctrl-n","ctrl-o","ctrl-p","ctrl-q","ctrl-r","ctrl-s","ctrl-t","ctrl-v","ctrl-x","ctrl-y","ctrl-z","ctrl-space","ctrl-shift-a","ctrl-shift-b","ctrl-shift-c","ctrl-shift-d","ctrl-shift-e","ctrl-shift-f","ctrl-shift-g","ctrl-shift-h","ctrl-shift-i","ctrl-shift-j","ctrl-shift-k","ctrl-shift-l","ctrl-shift-m","ctrl-shift-n","ctrl-shift-o","ctrl-shift-p","ctrl-shift-q","ctrl-shift-r","ctrl-shift-s","ctrl-shift-t","ctrl-shift-u","ctrl-shift-v","ctrl-shift-w","ctrl-shift-x","ctrl-shift-y","ctrl-shift-z","ctrl-shift-space","ctrl-enter","ctrl-tab","ctrl-up","ctrl-down","ctrl-left","ctrl-right","ctrl-home","ctrl-end","ctrl-pageup","ctrl-pagedown","shift-enter","shift-tab","shift-up","shift-down","shift-left","shift-right","shift-home","shift-end","shift-pageup","shift-pagedown","ctrl-shift-enter","ctrl-shift-tab","ctrl-shift-up","ctrl-shift-down","ctrl-shift-left","ctrl-shift-right","ctrl-shift-home","ctrl-shift-end","ctrl-shift-pageup","ctrl-shift-pagedown"]}},"required":["key"],"additionalProperties":false}
       }
     }
   ]

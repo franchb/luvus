@@ -22,19 +22,21 @@ use crate::event::AppEvent;
 use crate::ids::PaneId;
 use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::TerminalRuntime;
+use crate::terminal::keyboard::KeyboardProtocol;
 use crate::terminal::vt::{create_engine, VtEngine, VtEngineKind};
 
 pub(crate) mod input;
 mod io;
 mod reaper;
 pub(crate) use input::InputSender;
+pub(crate) use reaper::spawn_helper_reaped;
 
 /// Keep each pane's read working set small. Unix amortizes synchronization by
 /// draining several of these chunks under one bounded engine lock.
 const PTY_READ_BUFFER_BYTES: usize = 8 * 1024;
 
 #[cfg(test)]
-use reaper::child_poll_finished;
+use reaper::child_poll_status;
 use reaper::register_child_reaper;
 #[cfg(all(test, unix))]
 use reaper::CHILD_REAPER_STARTS;
@@ -72,6 +74,23 @@ fn write_input_action(writer: &mut dyn Write, action: InputAction) -> std::io::R
     writer.flush()
 }
 
+/// Pane keyboard modes that jointly determine PTY key encoding. DECCKM is
+/// independent from the negotiated legacy/Kitty keyboard protocol.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KeyEncodingModes {
+    pub application_cursor: bool,
+    pub protocol: KeyboardProtocol,
+}
+
+impl KeyEncodingModes {
+    pub(crate) fn from_engine(engine: &dyn VtEngine) -> Self {
+        Self {
+            application_cursor: engine.application_cursor(),
+            protocol: engine.keyboard_protocol(),
+        }
+    }
+}
+
 /// A pane app's mouse-tracking state (all four DECSET-derived flags in one
 /// read): whether it reports at all, whether it wants press-and-move (1002) or
 /// any-motion (1003) events, and whether reports use the SGR encoding.
@@ -107,6 +126,9 @@ pub struct Pane {
     /// exactly matches the screen snapshot it serialized.
     content_revision: Arc<AtomicU64>,
     observed_title_generation: AtomicU64,
+    /// The session title last announced to event subscribers, so a title that
+    /// only animates its leading icon is not re-announced unchanged.
+    published_title: Mutex<Option<String>>,
     #[cfg(windows)]
     history_maintenance_pending: AtomicBool,
     /// `PtyData` coalescing: set by the reader when it announces new output,
@@ -473,6 +495,7 @@ impl Pane {
             terminal_runtime: Arc::new(Mutex::new(Some(terminal_runtime))),
             content_revision,
             observed_title_generation: AtomicU64::new(0),
+            published_title: Mutex::new(None),
             #[cfg(windows)]
             history_maintenance_pending: AtomicBool::new(true),
             master: Arc::new(Mutex::new(Some(pair.master))),
@@ -664,7 +687,6 @@ impl Pane {
                 }
                 *master.lock().unwrap_or_else(|p| p.into_inner()) = Some(pair.master);
                 let ready_tx = tx.clone();
-                register_child_reaper(id, child, child_exited, tx.clone());
                 *terminal_runtime
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
@@ -672,6 +694,9 @@ impl Pane {
                     id,
                     cwd: spawned_cwd,
                 });
+                // A fast child must not publish its reaped status before the
+                // app registers this deferred pane's backend identity.
+                register_child_reaper(id, child, child_exited, tx.clone());
             })
         };
         drop(worker);
@@ -683,6 +708,7 @@ impl Pane {
             terminal_runtime,
             content_revision,
             observed_title_generation: AtomicU64::new(0),
+            published_title: Mutex::new(None),
             #[cfg(windows)]
             history_maintenance_pending: AtomicBool::new(true),
             master,
@@ -751,6 +777,65 @@ impl Pane {
         self.observed_title_generation
             .swap(generation, Ordering::AcqRel)
             != generation
+    }
+
+    /// Record `title` as the session title announced to event subscribers.
+    /// Returns whether it differs from the last one announced.
+    pub(crate) fn note_published_title(&self, title: &Option<String>) -> bool {
+        let Ok(mut published) = self.published_title.lock() else {
+            return true;
+        };
+        if *published == *title {
+            return false;
+        }
+        published.clone_from(title);
+        true
+    }
+
+    pub(crate) fn take_pending_clipboard(&self) -> Option<String> {
+        self.engine.lock().ok()?.take_pending_clipboard()
+    }
+
+    pub(crate) fn take_pending_program_status(
+        &self,
+    ) -> Option<crate::terminal::program_status::ProgramStatusStore> {
+        // Called on every output wake; skip the engine lock unless a report,
+        // reset, or prompt marker actually changed the records.
+        if !self.input_tx.program_status_pending() {
+            return None;
+        }
+        self.engine.lock().ok()?.take_pending_program_status()
+    }
+
+    pub(crate) fn program_status_revision(&self) -> u64 {
+        self.engine
+            .lock()
+            .map(|engine| engine.program_status_revision())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn program_status_process_exited_through(&self, boundary: u64) {
+        if let Ok(mut engine) = self.engine.lock() {
+            engine.program_status_process_exited_through(boundary);
+        }
+    }
+
+    pub(crate) fn program_status_process_exited(&self) {
+        if let Ok(mut engine) = self.engine.lock() {
+            engine.program_status_process_exited();
+        }
+    }
+
+    /// Swap in a test engine together with the sender it reports through.
+    #[cfg(test)]
+    pub(crate) fn replace_engine_for_test(
+        &mut self,
+        engine: Arc<Mutex<dyn crate::terminal::vt::VtEngine>>,
+    ) {
+        if let Some(sender) = engine.lock().unwrap().response_sender_for_test() {
+            self.input_tx = sender;
+        }
+        self.engine = engine;
     }
 
     #[cfg(test)]
@@ -832,6 +917,12 @@ impl Pane {
         self.content_revision.load(Ordering::Acquire)
     }
 
+    /// Record that the captured text changed without new child output, as
+    /// after a reflow, so revision-driven readers take a fresh capture.
+    pub fn note_reflow(&self) {
+        self.content_revision.fetch_add(1, Ordering::Release);
+    }
+
     pub fn content_revision_handle(&self) -> Arc<AtomicU64> {
         self.content_revision.clone()
     }
@@ -907,10 +998,22 @@ impl Pane {
     /// row index, history length, total row count, and text from one consistent
     /// terminal snapshot.
     pub fn for_each_retained_row(&self, f: &mut dyn FnMut(usize, usize, usize, &str)) {
+        self.try_for_each_retained_row(&mut |index, history, row_count, line| {
+            f(index, history, row_count, line);
+            std::ops::ControlFlow::Continue(())
+        });
+    }
+
+    /// Visit retained rows under one engine lock and stop before formatting the
+    /// next row when the callback breaks.
+    pub fn try_for_each_retained_row(
+        &self,
+        f: &mut dyn FnMut(usize, usize, usize, &str) -> std::ops::ControlFlow<()>,
+    ) {
         if let Ok(engine) = self.engine.lock() {
             let history = engine.history_len();
             let row_count = engine.retained_row_count();
-            engine.for_each_retained_row(&mut |index, line| f(index, history, row_count, line));
+            engine.try_for_each_retained_row(&mut |index, line| f(index, history, row_count, line));
         }
     }
 
@@ -998,22 +1101,12 @@ impl Pane {
         self.engine.lock().map(|e| e.alt_screen()).unwrap_or(false)
     }
 
-    /// Whether the child enabled application cursor mode (DECCKM). When it has,
-    /// the key encoder sends SS3 (`ESC O` + letter) cursor-key codes so apps
-    /// like `less` that are strict about the mode recognize the keys.
-    pub fn application_cursor(&self) -> bool {
-        self.engine
-            .lock()
-            .map(|e| e.application_cursor())
-            .unwrap_or(false)
-    }
-
     /// Input modes read together under one engine lock.
-    pub fn key_encoding_modes(&self) -> (bool, bool) {
+    pub fn key_encoding_modes(&self) -> KeyEncodingModes {
         self.engine
             .lock()
-            .map(|e| (e.application_cursor(), e.disambiguate_escape_codes()))
-            .unwrap_or((false, false))
+            .map(|e| KeyEncodingModes::from_engine(&*e))
+            .unwrap_or_default()
     }
 
     /// `(mouse_report, sgr)` — whether the child tracks the mouse, and whether
@@ -1149,6 +1242,14 @@ fn apply_pane_env(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+    // A persistent Luvus server may have been started through an SSH bridge.
+    // Its panes own fresh local PTYs, so inheriting the bridge's connection
+    // identity makes terminal applications misclassify those PTYs as SSH
+    // terminals long after the originating connection is gone. Keep
+    // SSH_AUTH_SOCK: forwarded agent access is still useful inside panes.
+    for key in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+        cmd.env_remove(key);
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("LUVUS_ENV", "1");
     cmd.env("LUVUS_PANE_ID", id.0.to_string());
@@ -1201,7 +1302,7 @@ fn read_loop(
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => {
-                let _ = tx.send(AppEvent::PtyExit(id));
+                let _ = tx.send(AppEvent::PtyIoClosed(id));
                 break;
             }
             Ok(n) => {
@@ -1357,11 +1458,12 @@ mod reap_tests {
                 !remaining.is_zero(),
                 "natural child exit never woke the reaper"
             );
-            // The PTY actor may publish PtyExit before the child waiter. Keep
+            // The PTY actor may publish PtyIoClosed before the child waiter. Keep
             // waiting until the reaper sets child_exited, which is the behavior
             // this blocked-signal regression is proving.
             match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(50))) {
-                Ok(AppEvent::PtyExit(exited)) if exited == id => {}
+                Ok(AppEvent::PtyIoClosed(exited) | AppEvent::PtyReaped(exited, _))
+                    if exited == id => {}
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(error) => panic!("natural child exit never woke the reaper: {error}"),
             }
@@ -1651,8 +1753,10 @@ mod reap_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        child_poll_finished, path_with_server_binary, wrap_paste, write_input_action, InputAction,
+        apply_pane_env, child_poll_status, path_with_server_binary, wrap_paste, write_input_action,
+        CommandBuilder, InputAction, PaneId,
     };
+    use std::ffi::OsStr;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -1702,13 +1806,43 @@ mod tests {
 
     #[test]
     fn reaper_retries_child_poll_errors() {
-        assert!(!child_poll_finished(Ok(None)));
-        assert!(!child_poll_finished(Err(std::io::Error::other(
-            "temporary poll failure"
-        ))));
-        assert!(child_poll_finished(Ok(Some(
-            portable_pty::ExitStatus::with_exit_code(0)
-        ))));
+        assert!(child_poll_status(Ok(None)).is_none());
+        assert!(child_poll_status(Err(std::io::Error::other("temporary poll failure"))).is_none());
+        assert_eq!(
+            child_poll_status(Ok(Some(portable_pty::ExitStatus::with_exit_code(0))))
+                .map(|status| status.exit_code()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn pane_env_drops_ssh_terminal_identity_but_keeps_agent_forwarding() {
+        let mut command = CommandBuilder::new("shell");
+        let extra_env = [
+            (
+                "SSH_CONNECTION".to_string(),
+                "client connection".to_string(),
+            ),
+            ("SSH_CLIENT".to_string(), "client identity".to_string()),
+            ("SSH_TTY".to_string(), "windows-pty".to_string()),
+            ("SSH_AUTH_SOCK".to_string(), "forwarded-agent".to_string()),
+        ];
+
+        apply_pane_env(
+            &mut command,
+            PaneId(1),
+            std::path::Path::new("."),
+            &extra_env,
+        );
+
+        for key in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+            assert_eq!(command.get_env(key), None, "{key} must not reach panes");
+        }
+        assert_eq!(
+            command.get_env("SSH_AUTH_SOCK"),
+            Some(OsStr::new("forwarded-agent")),
+            "SSH agent forwarding remains available"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 name: luvus
-description: "Control Luvus through its local CLI and UHP. Use only for a line beginning with `=target message`, an explicit request naming Luvus, a request to delegate to a named live Luvus agent or pane, or an explicit Luvus operation involving sessions, workspaces, tabs, panes, agents, files, Git, DIFF, worktrees, tasks, leases, modules, themes, Luvus Bar, configuration, UI, integrations, or Luvus UHP. Do not use for ordinary coding, file edits, Git operations, tests, task planning, generic agent work, or parallelization unless the user explicitly connects the request to Luvus. Being inside Luvus does not trigger this skill by itself. Inside Luvus use the inherited session; outside use the installed production Luvus command and configured session."
+description: "Control Luvus through its local CLI and UHP. Use only for a line beginning with `=target message`, an explicit request naming Luvus, a request to delegate to a named live Luvus agent or pane, or an explicit Luvus operation involving sessions, machines, workspaces, tabs, panes, agents, files, Git, DIFF, worktrees, tasks, leases, modules, themes, Luvus Bar, configuration, UI, integrations, or Luvus UHP. Do not use for ordinary coding, file edits, Git operations, tests, task planning, generic agent work, or parallelization unless the user explicitly connects the request to Luvus. Being inside Luvus does not trigger this skill by itself. Inside Luvus use the inherited session; outside use the installed production Luvus command and configured session."
 ---
 
 # Luvus
@@ -70,6 +70,8 @@ Use the installed production Luvus client:
 - Preserve an explicitly configured `LUVUS_HOME` or `LUVUS_SOCKET_PATH`.
   Preserve `LUVUS_SESSION` too. When the user explicitly names a server
   session, pass `--session <name>` directly to every related Luvus command.
+  If that selects another server, Luvus discards the inherited pane id because
+  pane identities are scoped to their issuing session.
   Do not list sessions first, and do not silently fall back to `default`.
   Otherwise let the installed release binary use its production default at
   `$HOME/.luvus/luvus.sock`.
@@ -105,11 +107,47 @@ luvus session delete <name>
 luvus --session <name> pane list
 ```
 
+`pane list` discovers pane IDs across all workspaces and tabs in that session
+without changing focus. Add `--current-tab` to limit the result to the active tab.
+
 `session attach` launches or attaches the TUI. Never run it merely to test
 whether a session exists. `session stop` ends every pane in that named server.
 Before deletion, list sessions once, require the exact stopped name, and obtain
 clear authorization. Never delete `default` and never substitute workspace
 commands for server-session commands.
+
+### Manage saved SSH machines
+
+A saved machine is an SSH profile owned by the selected local named session and
+selecting one remote named session. It is not a workspace, and opening remote
+workspaces must not create more profiles or sessions. Switching local named
+sessions reloads that session's independent workspace tree and machine catalog.
+
+The session control in the TUI header always manages the owner-local named
+session, even while a remote machine workspace is active. Do not interpret it
+as a machine-session selector or claim that local session switching changes a
+saved machine's remote-session preference.
+
+Use read-only inspection before proposing a change:
+
+```sh
+luvus machine list
+luvus machine show <id>
+luvus machine status <id>
+luvus machine sessions <id>
+```
+
+`machine status` verifies the already-running selected server and its workspace
+projection; it does not install or start anything. `machine add` and `machine
+enable` are foreground mutations that may contact the host and start an absent
+selected server. Never pass passwords or keys as CLI data. Use the user's
+OpenSSH destination or config alias, and use `--install` only when the user
+explicitly authorizes that operation. Select a non-default remote session with
+`machine add ... --session <name>`.
+
+Machine UHP methods are absent unless the user explicitly starts `uhp access
+--machines`; mutations additionally require `--control`. Do not infer machine
+authority from ordinary session UHP access.
 
 ## Use the fast command path
 
@@ -218,8 +256,9 @@ luvus pane split <anchor-pane-id> --no-focus
 luvus agent start reviewer --kind codex --pane <new-pane-id> --timeout 30
 ```
 
-Omit `--down` for a right-side split and add it to the split or anchored start
-for a split below. Never combine `--anchor` and `--pane`.
+Omit direction flags to split along the longer side of the anchor pane. Pass
+`--right` or `--down` on the split or anchored start to force a direction.
+Never combine `--anchor` and `--pane`.
 
 Send work with `agent send`, not raw pane text and Enter:
 
@@ -239,6 +278,28 @@ luvus agent send reviewer "Review the diff. When done, run: luvus agent send lea
 After a no-wait handoff, end the turn. The report-back message starts a fresh
 turn. An external terminal has no caller pane, so do not invent one.
 
+With `--wait`, `agent prompt` (also `agent send`) requires a new `working` or
+`blocked` transition before the requested `--until` state can complete the wait.
+An unchanged status, title flicker, or quiet output alone cannot complete it.
+`observed_state` records the first active transition; `status` is the current state.
+The absolute `--timeout` covers both stages (default 300 seconds). Timeout returns
+`matched:false`, `evidence:"timeout"`, and a null `observed_state` if no transition
+was seen. Pane or terminal exit returns `agent_not_running` with `pane`, `queued`,
+`submitted`, `observed_state`, `reason:"pane_closed"`, `baseline_revision`, and
+`content_revision` under `error.data`. Timeout and pane exit during a wait use CLI
+exit code 2. Cancellation, timeout, and exit release pending wait ownership.
+Without `--wait`, the immediate `submitted:true`, `evidence:"queued"` response is
+unchanged and omits `observed_state`. Submission still means queue admission;
+state transitions do not confirm consumption of the prompt text. Do not resend
+automatically after a timeout or lost response because queued input may execute.
+For `agent.send` and `agent.prompt`, detected blocked prompt evidence returns
+`agent_not_ready` and queues no input. Claude and Codex also require positive
+evidence of their live input composers. Use `--strict` (UHP `strict:true`) to
+require positive composer evidence for any agent; agents without a detector
+then return `agent_not_ready`. Without strict mode, other agents retain their
+legacy Unknown-evidence fallback. Read the visible screen before deciding
+whether an explicit `agent keys` action is authorized.
+
 When waiting was requested, keep it bounded and read a bounded result:
 
 ```sh
@@ -246,9 +307,10 @@ luvus agent send reviewer "Review the diff" --wait --timeout 300
 luvus agent read reviewer --lines 120
 ```
 
-Treat `idle`, `done`, `working`, and `blocked` as ready once the requested agent
-identity is recognized. `unknown` is not proof of completion, but it does not
-undo a matching identity. When `agent start` returns `ready: true`, accept its
+For `agent start` identity, treat `idle`, `done`, `working`, and `blocked` as
+recognized states; they do not by themselves prove prompt readiness. `unknown`
+is not proof of completion, but it does not undo a matching identity. When
+`agent start` returns `ready: true`, accept its
 name, pane, and kind without another status lookup. Use `wait agent-status` for
 a requested lifecycle transition after work is sent, not for startup identity.
 Repeat `--status` or pass a comma-separated set when any of several terminal
@@ -265,6 +327,28 @@ For a blocked agent:
 `agent keys` accepts only a recognized agent pane and a non-empty list of known
 key names. It validates the entire list before queuing one ordered action; any
 invalid entry sends nothing, and a closed target returns `send_failed`.
+
+For UHP interactions that must match the inspected screen, use `agent.read`
+with `source:"visible"` and pass its `content_revision` as `if_content_revision`
+together with its `terminal_id` in `agent.keys` params. A `visible` read is the
+live screen, not the pane's scrollback viewport, so it stays valid while someone
+is scrolled back through an earlier turn. The revision is a
+non-negative integer; the terminal ID is exactly 32 lowercase hex characters.
+Both fields are optional as a pair; a one-sided or malformed pair is
+`invalid_request`. A deferred pane has `terminal_id:null` and cannot be fenced.
+An unavailable read snapshot has empty text and null coordinates.
+
+The server checks the pair and queues keys under the same engine lock used to
+capture the text. `content_revision_conflict` means no keys were queued: re-read
+and reassess the authorized action, never retry the same pair. Generic response
+`revision` / request `if_revision` are global event coordinates, not the pane's
+content counter. Without the pair, behavior is unchanged. Older servers omit the
+coordinates or reject the new fields; omit the pair only when legacy unfenced
+admission is acceptable. These are UHP params, not CLI flags.
+
+The fence covers queue admission only. Already queued input and child-side
+changes not yet observed remain outside it. Cursor/SGR output can make a pair
+stale even if the dialog text looks unchanged.
 
 ## Control panes, tabs, and workspaces
 
@@ -292,10 +376,10 @@ luvus workspace unpin <workspace-index>
 
 Closing the final project does not stop the client or leave it without a shell.
 Luvus immediately creates a neutral workspace and terminal at the user's home
-directory. Its displayed path follows the focused pane's live cwd. An empty
-`workspace list` is therefore an exceptional restore or spawn failure, not proof
-that the server is offline. Use `workspace open <path>` when the user named a
-specific project.
+directory. Its sidebar path remains the stored home root while `terminal_cwd`
+follows the focused pane. An empty `workspace list` is therefore an exceptional
+restore or spawn failure, not proof that the server is offline. Use
+`workspace open <path>` when the user named a specific project.
 
 From a managed pane, use `LUVUS_PANE_ID` as the caller or split anchor. From an
 external terminal, select an explicit pane returned by live state.
@@ -317,10 +401,21 @@ luvus agent get <target>
 luvus agent fork <target> [--name <alias>] [--no-focus]
 ```
 
-Native forks currently support Claude, Grok, Codex, Pi, and OMP. Report
+Native forks currently support Claude, Grok, Codex, Kilo Code, Pi, and OMP. Report
 `unsupported_agent`, `session_unknown`, or `spawn_failed` exactly when returned.
 Do not approximate a failed fork with `pane split`, `agent start`, or `resume`,
 because those paths do not guarantee an independent copy of the conversation.
+
+Transpose a split only after resolving its pane ID:
+
+```sh
+luvus pane transpose <pane-id>
+```
+
+This toggles only the split immediately containing that pane, preserving focus,
+zoom, ratios, and live terminals. A single-pane tab returns `changed:false`.
+After a lost response, inspect the layout before retrying: this toggle is not
+idempotent, and transposing twice restores the original.
 
 Move an existing pane only after resolving its id and listing the destination
 tabs in that pane's workspace. Tab numbers are 1-based:
@@ -369,7 +464,9 @@ surface:
   resolving, removing, applying, or sending a review note. Removing a note and
   sending feedback to an agent require explicit authorization.
 - List worktrees before creating, opening, or removing one. Removal requires
-  explicit authorization and an exact path.
+  explicit authorization and an exact path. If removal returns
+  `worktree_in_use`, report its panes, tasks, and leases. Never retry with
+  `--force` unless the user explicitly authorizes stopping that listed work.
 - Inspect task and lease ownership, dependencies, gates, assignees, and path
   leases before claiming, starting, updating, completing, releasing, deleting,
   or merging. `task merge` is serialized into
@@ -382,6 +479,23 @@ surface:
   retrying. Leases coordinate declared paths but do not sandbox a shared
   checkout. `task release` requeues an
   active task and releases its path leases; it does not stop the worker pane.
+  Use `task start ... --no-focus` when staging a worker should preserve the
+  operator's current workspace, tab, pane focus, and zoom state.
+  `task retry <id>` is the explicit fresh-attempt operation for `done`,
+  `failed`, `review`, or `blocked` work. It preserves the old pane, worktree,
+  branch, output, and notes. Inspect dependents first because retry is rejected
+  after a dependent task leaves the queue. An automation-owned task creates a
+  new immutable run from the original run snapshot.
+  `task add --prompt <text>` or `--prompt-file <path>` stores a detailed worker
+  briefing; `task update` may replace it only while a manual task is still
+  queued and unassigned. Inspect the stored prompt before starting the worker.
+  A task is bound to the selected workspace's project when it is created.
+  Commands inside a Luvus pane supply that workspace automatically. Outside a
+  pane, pass `--workspace-id` when multiple repositories or multiple non-Git
+  projects are open. The sole focused Git project remains unambiguous beside a
+  non-Git launch-directory workspace. `task next` stays inside that project,
+  and leases collide only inside the same project, including across its Git
+  worktrees.
   Report work progress only with `task update --note`. `task heartbeat
   --context-used <0..1>` means the fraction of the model context window already
   consumed, never task-completion progress; `0.6` means 60% consumed. Omit the
@@ -419,7 +533,11 @@ surface:
   workspace scope (the default) or explicit all-workspace scope to inspect
   data without changing the UI,
   `mission.refresh` for an explicit usage refresh, and `mission.open` only to
-  change the visible tab.
+  change the visible tab. Keep the `refresh_id` from `mission.refresh` and read
+  `mission.snapshot` until `refresh.completed_id` reaches it in the same
+  `server_generation`. `usage:null` is unknown, not zero; use `usage_status`
+  and `summary.usage_coverage` to explain partial results. `scope:"all"` stays
+  inside the selected named session.
 - Agent detection is built into Luvus. `luvus integration install` manages
   optional native session-resume hooks and must not be used merely to make an
   agent appear in the sidebar. Install or remove an integration only when the
@@ -427,11 +545,24 @@ surface:
 - For Antigravity CLI, `luvus integration install antigravity` adds exact
   conversation identity for restore. It is session-only; native screen
   detection remains authoritative for agent state.
-- For OpenCode, `luvus integration install opencode` adds exact TUI-local root
-  session ownership and structured usage. Without it, usage stays unavailable.
+- For OpenCode, `luvus integration install opencode` detects V1 or V2 and adds
+  exact TUI-local root session ownership through the matching integration
+  contract.
+  `opencode2` is a compatibility alias for the canonical `opencode` agent.
+  Never infer V2 session IDs from its live database.
+- For Devin, `luvus integration install devin` adds one session-start hook
+  that reports only the exact session ID for restart resume. Detection remains
+  native. Do not infer session IDs from its private database;
+  `luvus agent resume <id>` cannot find Devin sessions, so without the
+  integration bind a pane with `luvus pane report --agent devin --session
+  <id>` when the exact id is known.
 - For Hermes, `luvus integration install hermes` adds exact per-pane session
   ownership for restart resume. Detection remains native, but Luvus does not
   scan Hermes's private history store.
+- For Letta Code, `luvus integration install letta` adds one quiet session-start
+  hook that reports only the exact conversation ID. Detection remains native.
+  Luvus does not inspect Letta memory, credentials, conversations, or cloud
+  state, and does not advertise native fork or scheduled automation for Letta.
 - Subscribe to events only for a live monitoring request. Stop when its
   condition is satisfied and never retain an unbounded stream.
 

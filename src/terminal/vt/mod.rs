@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use ratatui::style::{Color, Modifier};
 
 use crate::terminal::appearance::PaneAppearance;
+use crate::terminal::keyboard::KeyboardProtocol;
 use crate::terminal::pty::InputSender;
 
 /// Internal continuation marker used by [`VtEngine::visible_rows_aligned`].
@@ -19,14 +20,14 @@ use crate::terminal::pty::InputSender;
 /// a wide glyph without being confused with an actual space between words.
 pub(crate) const ALIGNED_WIDE_CELL: char = '\0';
 
-const MAX_TERMINAL_HYPERLINK_URI_BYTES: usize = 4_096;
+pub(crate) const MAX_TERMINAL_HYPERLINK_URI_BYTES: usize = 4_096;
 const MAX_TERMINAL_HYPERLINK_ID_BYTES: usize = 256;
 
 /// One OSC 8 hyperlink retained by the terminal engine.
 ///
 /// The URI is engine-neutral and its spans use visible grid coordinates. This
-/// metadata is materialized only for deliberate text/link gestures, never for
-/// ordinary rendering or agent detection.
+/// metadata remains sparse. Rendering projects only validated visible spans;
+/// agent detection continues to consume plain text without link metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalHyperlink {
     id: String,
@@ -246,6 +247,8 @@ pub struct RenderCell {
     pub mods: Modifier,
 }
 
+pub type LinkedCellVisitor<'a> = dyn FnMut(u16, u16, &str, RenderCell, Option<&str>) + 'a;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cursor {
     pub x: u16,
@@ -275,6 +278,16 @@ pub struct DamageCell {
 pub struct DamageRow {
     pub row: u16,
     pub cells: Vec<DamageCell>,
+    /// Sparse OSC 8 links present in this damaged row. Spans are terminal-grid
+    /// columns with an exclusive end and never contain control characters.
+    pub hyperlinks: Vec<DamageHyperlink>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DamageHyperlink {
+    pub start: u16,
+    pub end: u16,
+    pub uri: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,6 +360,19 @@ pub struct RetainedRowLayout {
     has_text: bool,
 }
 
+/// Terminal-only evidence for Claude's live composer.
+///
+/// A full-width divider typed inside a multiline prompt has the same terminal
+/// geometry as a stale compact composer. Keep that case explicit so callers
+/// can require a trusted Claude lifecycle signal instead of guessing from
+/// visible text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaudeComposerEvidence {
+    Absent,
+    Ready,
+    Ambiguous,
+}
+
 impl RetainedRowLayout {
     pub(crate) fn new(whitespace: Vec<bool>, has_text: bool) -> Self {
         Self {
@@ -402,11 +428,23 @@ pub trait VtEngine: Send {
     /// scrollback, unrelated terminal content, or an incomplete layout.
     fn codex_composer_region(&self) -> Option<CodexComposerRegion>;
 
+    /// Inspect Claude's live input bounded by composer rails, not a menu choice.
+    fn claude_composer_evidence(&self) -> ClaudeComposerEvidence;
+
+    /// Inspect OpenCode's live input box around the cursor.
+    fn opencode_composer_ready(&self) -> bool;
+
     /// Visit every visible cell as `(row, col, symbol, style)`. `symbol` is the
     /// cell's full grapheme cluster (base char + any combining/VS16/ZWJ chars),
     /// so emoji and accented text render whole. Wide-char spacer cells are
     /// skipped by the implementation.
     fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, &str, RenderCell));
+
+    /// Visit visible cells together with their OSC 8 target, when present.
+    /// Engines without hyperlink metadata inherit the allocation-free fallback.
+    fn for_each_linked_cell(&self, f: &mut LinkedCellVisitor<'_>) {
+        self.for_each_cell(&mut |row, col, symbol, style| f(row, col, symbol, style, None));
+    }
 
     /// Capture owned visible rows affected since the last acknowledged render.
     /// Implementations may conservatively return [`DamageKind::Full`].
@@ -434,15 +472,35 @@ pub trait VtEngine: Send {
         self.detection_text(n)
     }
 
-    /// Every visible row as normalized plain text. Wide-character spacer cells
-    /// are omitted, so callers must not use string indexes as terminal columns.
+    /// Every row of the **live** screen as normalized plain text, independent
+    /// of the user's scroll position — the same frame [`Self::detection_text`]
+    /// reads, returned row by row. Wide-character spacer cells are omitted, so
+    /// callers must not use string indexes as terminal columns.
+    ///
+    /// Plain text describes what the program is painting *now*; there is no
+    /// viewport-relative sibling on purpose. Scrollback preserves old prompts,
+    /// composers, and dialogs, so a read that followed the user's scroll
+    /// position would describe a frame that is no longer on the terminal while
+    /// the `content_revision` it is fenced against keeps advancing (docs/07,
+    /// #395). Rendering and column-addressed text use
+    /// [`Self::visible_rows_aligned`] and `for_each_cell`, which are
+    /// viewport-relative because they draw what the user is looking at.
+    fn screen_rows(&self) -> Vec<String>;
+
+    /// Every row the user is currently looking at, as normalized plain text —
+    /// [`Self::screen_rows`] read through the scrollback viewport, so a scrolled
+    /// pane returns history. Tests assert viewport behavior with it; production
+    /// code reads the live screen or renders through
+    /// [`Self::visible_rows_aligned`].
+    #[cfg(test)]
     fn visible_rows(&self) -> Vec<String>;
 
-    /// Like [`Self::visible_rows`], but every terminal column contributes exactly
-    /// one `char`. A wide glyph's continuation cell is represented by
+    /// Every row the user is currently looking at, with every terminal column
+    /// contributing exactly one `char`. Unlike [`Self::screen_rows`] this follows
+    /// the scrollback viewport, so a scrolled pane reports history. A wide glyph's continuation cell is represented by
     /// [`ALIGNED_WIDE_CELL`], so callers can preserve both cell coordinates and
     /// the distinction between a continuation and an actual space. Use this
-    /// (never `visible_rows`) when a screen column must address text — e.g. the
+    /// when a screen column must address text — e.g. the
     /// token under a double-click, or the link under a `Ctrl`-hover.
     fn visible_rows_aligned(&self) -> AlignedRows;
 
@@ -464,6 +522,42 @@ pub trait VtEngine: Send {
     /// mutable titles must override this for hidden-pane presentation.
     fn title_generation(&self) -> u64 {
         0
+    }
+
+    /// Text queued by the child via OSC 52 store since the last take.
+    fn take_pending_clipboard(&mut self) -> Option<String> {
+        None
+    }
+
+    /// Coalesced bounded OSC 7501 metadata snapshot, only when changed.
+    fn take_pending_program_status(
+        &mut self,
+    ) -> Option<crate::terminal::program_status::ProgramStatusStore> {
+        None
+    }
+
+    /// Current OSC authority without consuming a pending metadata snapshot.
+    /// Prompt admission uses this to reject blocked state even before detection.
+    fn program_status_state(&self) -> Option<crate::ui::theme::State> {
+        None
+    }
+
+    /// Revision observed at the first absent producer process scan.
+    fn program_status_revision(&self) -> u64 {
+        0
+    }
+
+    /// Clear only transient reports belonging to the absent producer boundary.
+    fn program_status_process_exited_through(&mut self, _boundary: u64) {}
+
+    /// Clear transient terminal metadata after an attached process exit.
+    fn program_status_process_exited(&mut self) {}
+
+    /// The sender this engine answers through, so a test that swaps a pane's
+    /// engine can keep the pane's lock-free status gate wired to it.
+    #[cfg(test)]
+    fn response_sender_for_test(&self) -> Option<InputSender> {
+        None
     }
 
     /// Scroll the viewport `delta` lines through scrollback: **positive scrolls
@@ -504,7 +598,19 @@ pub trait VtEngine: Send {
 
     /// Visit retained rows oldest-first using one reusable line buffer. The
     /// callback must not retain the borrowed text after it returns.
-    fn for_each_retained_row(&self, f: &mut dyn FnMut(usize, &str));
+    fn for_each_retained_row(&self, f: &mut dyn FnMut(usize, &str)) {
+        self.try_for_each_retained_row(&mut |index, line| {
+            f(index, line);
+            std::ops::ControlFlow::Continue(())
+        });
+    }
+
+    /// Visit retained rows as above, allowing the callback to stop before the
+    /// engine formats any remaining rows.
+    fn try_for_each_retained_row(
+        &self,
+        f: &mut dyn FnMut(usize, &str) -> std::ops::ControlFlow<()>,
+    );
 
     /// Extract an inclusive linear retained-row selection using terminal cell
     /// coordinates. Implementations must preserve complete wide glyphs and
@@ -541,10 +647,10 @@ pub trait VtEngine: Send {
     /// and mouse modes, this lets the input layer leave pager keys alone.
     fn application_cursor(&self) -> bool;
 
-    /// Whether the child requested unambiguous CSI-u encoding for control keys.
-    /// Input encoding must honor this for chords whose legacy byte loses the
-    /// original key identity, such as Ctrl+/ versus Ctrl+7.
-    fn disambiguate_escape_codes(&self) -> bool;
+    /// The negotiated Kitty keyboard protocol. Zero Kitty flags are projected
+    /// as [`KeyboardProtocol::Legacy`]; all five currently defined flags are
+    /// retained, including flags whose input event data Luvus does not yet model.
+    fn keyboard_protocol(&self) -> KeyboardProtocol;
 
     /// Whether the child also requested **drag/motion tracking** (1002/1003) —
     /// press-and-move events are forwarded only then, so a click-only (1000)
@@ -593,7 +699,7 @@ mod tests {
         );
         let mut engine = engine.lock().expect("engine lock");
         engine.advance(b"hi");
-        assert_eq!(engine.visible_rows()[0].trim_end(), "hi");
+        assert_eq!(engine.screen_rows()[0].trim_end(), "hi");
         assert_eq!(engine.cursor().x, 2);
     }
 }

@@ -31,12 +31,19 @@ CLI commands map to these methods. Session lifecycle and theme acquisition are
 local helpers: theme files are validated and installed client-side, then only a
 bounded registry reload is sent to the selected server.
 
+When `uhp.capabilities` is called through a paired Access gateway, the result
+adds `access.mode`, `access.allowed_methods`, and gateway-specific
+`access.limits` (`connections`, `requests_per_minute`). The owner method catalog
+and contracts are preserved; the owner endpoint omits `access`. Use the
+intersection of supported and allowed methods when enabling a client action.
+See [effective permissions](/docs/uhp/remote-access/#effective-permissions).
+
 ## Wire format
 
 One request per connection, newline-terminated, and one JSON reply:
 
 ```json
-→ {"id":"1","method":"pane.split","params":{"down":true}}
+→ {"id":"1","method":"pane.split","params":{"direction":"auto"}}
 ← {"id":"1","result":{"type":"ok","pane":"7"}}
 ```
 
@@ -75,40 +82,102 @@ Luvus release number.
 | Family | Methods |
 |---|---|
 | host / sessions | `host.capabilities` · `host.info` · `host.doctor` · `host.update.check` · `host.update.install` · `session.list` · `session.status` · `session.start` · `session.stop` · `session.restart` · `session.delete` · `skill.status` · `skill.enable` · `skill.disable` · `integration.status` · `integration.install` · `integration.uninstall` |
+| machines (`uhp access --machines` only) | `machine.list` · `machine.get` · `machine.status` · `machine.sessions` · `machine.add` · `machine.rename` · `machine.enable` · `machine.disable` · `machine.remove` |
 | discovery / config | `uhp.capabilities` · `uhp.stats` · `uhp.token.create` · `uhp.token.list` · `uhp.token.revoke` · `config.get` · `config.patch` · `server.reload_config` · `server.agent_manifests` · `server.reload_agent_manifests` |
 | workspaces | `workspace.list` · `workspace.get` · `workspace.open` · `workspace.focus` · `workspace.rename` · `workspace.pin` · `workspace.move` · `workspace.move_block` · `workspace.report_metadata` · `workspace.close` |
 | tabs | `tab.list` · `tab.get` · `tab.new` · `tab.focus` · `tab.move` · `tab.swap` · `tab.rename` · `tab.close` |
 | runtime and agents | `session.snapshot` · `agent.start` · `agent.prompt` · `agent.wait` · `events.subscribe` |
-| panes | `pane.list` · `pane.get` · `pane.current` · `pane.layout` · `pane.neighbor` · `pane.edges` · `pane.split` · `pane.move` · `pane.swap` · `pane.focus` · `pane.focus_direction` · `pane.resize` · `pane.zoom` · `pane.rename` · `pane.run` · `pane.send_input` · `pane.read` · `pane.status` · `pane.processes` · `pane.close` · `attach.pane` |
+| panes | `pane.list` · `pane.get` · `pane.current` · `pane.layout` · `pane.neighbor` · `pane.edges` · `pane.split` · `pane.move` · `pane.swap` · `pane.transpose` · `pane.focus` · `pane.focus_direction` · `pane.resize` · `pane.zoom` · `pane.rename` · `pane.run` · `pane.send_input` · `pane.read` · `pane.status` · `pane.processes` · `pane.close` · `attach.pane` |
 | layouts | `layout.export` · `layout.apply` · `layout.set_split_ratio` |
-| agents | `agent.list` · `agent.get` · `agent.explain` · `agent.report` · `agent.release` · `agent.start` · `agent.prompt` · `agent.wait` · `agent.name` · `agent.fork` · `agent.send` · `agent.keys` · `agent.read` · `agent.sessions` · `agent.resume` · `pane.report_session` · `pane.report_event` |
+| agents | `agent.list` · `agent.get` · `agent.explain` · `agent.report` · `agent.release` · `agent.start` · `agent.prompt` · `agent.wait` · `agent.name` · `agent.fork` · `agent.send` · `agent.keys` · `agent.read` · `agent.sessions` · `agent.resume` · `pane.report_session` · `pane.release_session` · `pane.report_event` |
 | search | `search` · `search.capabilities` · `search.query` · `search.activate` |
 | files | `files.tree` · `files.open` · `files.reveal` · `files.refresh` |
 | git | `git.status` · `git.branches` · `git.log` · `git.open` |
 | mission control | `mission.snapshot` · `mission.refresh` · `mission.open` |
 | diff | `diff.refresh` · `diff.list` · `diff.open` · `diff.get` · `diff.navigate` · `diff.note.add` · `diff.note.apply` · `diff.note.list` · `diff.note.edit` · `diff.note.resolve` · `diff.note.reopen` · `diff.note.remove` · `diff.note.send` |
-| terminal | `terminal.backend.inventory` · `terminal.backend.snapshot` · `terminal.backend.validate` · `terminal.backend.processes` · `terminal.backend.capture` · `terminal.backend.observe` · `terminal.backend.control` · `terminal.backend.type_literal` · `terminal.backend.submit_text` · `terminal.backend.send_key` · `terminal.backend.set_title` · `terminal.backend.notify` · `terminal.backend.create` · `terminal.backend.close` · `terminal.backend.wait_change` · `terminal.backend.wait_output` · `terminal.backend.events.subscribe` |
+| terminal | `terminal.backend.inventory` · `terminal.backend.snapshot` · `terminal.backend.validate` · `terminal.backend.processes` · `terminal.backend.capture` · `terminal.backend.observe` · `terminal.backend.control` · `terminal.backend.type_literal` · `terminal.backend.paste_text` · `terminal.backend.submit_text` · `terminal.backend.send_key` · `terminal.backend.set_title` · `terminal.backend.notify` · `terminal.backend.create` · `terminal.backend.close` · `terminal.backend.wait_change` · `terminal.backend.wait_output` · `terminal.backend.events.subscribe` |
 | worktrees | `worktree.list` · `worktree.create` · `worktree.open` · `worktree.remove` |
-| orchestration | `task.add` · `task.list` · `task.get` · `task.claim` · `task.next` · `task.start` · `task.heartbeat` · `task.update` · `task.done` · `task.merge` · `task.release` · `lease.acquire` · `lease.list` · `lease.release` |
+| orchestration | `task.add` · `task.list` · `task.get` · `task.claim` · `task.next` · `task.start` · `task.heartbeat` · `task.update` · `task.done` · `task.retry` · `task.merge` · `task.release` · `lease.acquire` · `lease.list` · `lease.release` |
 | agent automation | `automation.create` · `automation.list` · `automation.get` · `automation.update` · `automation.enable` · `automation.disable` · `automation.rebind` · `automation.delete` · `automation.run` · `automation.history` · `automation.preview` · `automation.health` |
-| modules | `module.list` · `module.info` · `module.link` · `module.unlink` · `module.enable` · `module.disable` · `module.action.list` · `module.action.invoke` · `module.pane.open` · `module.pane.focus` · `module.pane.close` · `module.config_dir` · `module.settings.list` · `module.settings.get` · `module.settings.set` · `module.log.list` |
+| modules | `module.list` · `module.info` · `module.link` · `module.update` · `module.unlink` · `module.enable` · `module.disable` · `module.action.list` · `module.action.invoke` · `module.pane.open` · `module.pane.focus` · `module.pane.close` · `module.config_dir` · `module.settings.list` · `module.settings.get` · `module.settings.set` · `module.log.list` |
 | themes | `theme.list` · `theme.path` · `theme.use` · `theme.reload` |
-| ui / server | `ui.sidebar` · `ui.dock.push` · `ui.dock.list` · `ui.dock.move` · `ui.bar.push` · `ui.bar.list` · `ui.bar.move` · `ui.bar.remove` · `ui.notification.push` · `ui.notification.clear` · `ui.toast` · `ping` · `server.stop` · `events.subscribe` · `events.wait` |
+| ui / server | `ui.sidebar` · `ui.agent_title.push` · `ui.agent_title.clear` · `ui.dock.push` · `ui.dock.list` · `ui.dock.move` · `ui.bar.push` · `ui.bar.list` · `ui.bar.move` · `ui.bar.remove` · `ui.notification.push` · `ui.notification.clear` · `ui.toast` · `ping` · `server.stop` · `events.subscribe` · `events.wait` |
+
+`module.info` and `module.action.list` include an optional action `commander`
+declaration when present. It is discovery metadata for the TUI's
+`$` picker; `module.action.invoke` retains its existing input contract.
+
+`module.update` is an `extensions`-scope mutation that adopts an already
+approved and built managed checkout; it does not download or run builds. The
+CLI `luvus module update <id> [--ref REF] [--yes]` performs those local steps.
+Raw callers supply `id`, `path`, `source` (`original-spec@commit`),
+`expected_root`, and `expected_source` from `module.info`, plus nullable
+`expected_ref` (the old `git_ref`) and `git_ref` (the new selection). The
+replacement must have the same module ID and original source spec, a separate
+managed checkout, and an unchanged old identity fence. Success returns
+`{"type":"module","id":"canonical-id"}`. Stale/invalid replacements fail
+without changing registry or runtime state. Settings and enabled state survive;
+startup/UI refresh uses a new publisher credential. See
+[Updating modules](/docs/extend/using-modules/#updating) for live-pane and pinning
+behavior. `module.info.git_ref` is nullable; older installations default to null.
 
 Parameter shapes mirror the CLI flags (`luvus task add --paths x` →
 `{"paths": ["x"]}`). For CLI commands, an omitted pane uses
-`$LUVUS_PANE_ID` when available; a raw API request with no pane uses the
-currently focused pane. Methods with a focus default also treat an explicit
-`null` pane as omitted. A well-formed explicit ID that does not name a live
-pane fails with `not_found`; malformed or out-of-range IDs fail with
-`invalid_request` before any mutation. Pane IDs accept an unsigned 32-bit JSON
-integer or its decimal string form.
+`$LUVUS_PANE_ID` when available. Except for the project-scoped task methods
+described below, a raw API request with no pane uses the currently focused
+pane. Methods with a focus default also treat an explicit `null` pane as
+omitted. A well-formed explicit ID that does not name a live pane fails with
+`not_found`; malformed or out-of-range IDs fail with `invalid_request` before
+any mutation. Pane IDs accept an unsigned 32-bit JSON integer or its decimal
+string form.
+
+Machine methods are an opt-in access-gateway surface, not methods of the
+selected session server. `machine.list` takes `{}`. `machine.get`,
+`machine.status`, and `machine.sessions` take `{id}`. `machine.add` takes
+`{id, host, if_revision, label?, preferred_session?, remote_binary?, enabled?}`.
+`preferred_session` selects the remote named session and defaults to `default`.
+Rename takes
+`{id, label, if_revision}`; enable, disable, and remove take
+`{id, if_revision}`. Read projections omit SSH destinations and executable
+paths, but include `automatic_provisioning` so a client can distinguish a
+managed binary from an explicit path. Control methods are advertised only by
+`luvus uhp access --machines --control`.
+
+`machine.add` and `machine.enable` validate remote compatibility but never
+install through UHP. A saved `automatic_provisioning:true` is provenance, not
+installation authority. If a binary is missing or incompatible, run foreground
+CLI setup and approve its default-No prompt, or pass `--install` explicitly for
+that operation. Installation never restarts a running remote server.
+`machine.status` and all background reconnects remain read-only. Use
+`enabled:false` to save without contacting the host.
+
+`task.add` accepts a short `title` and an optional multiline `prompt` containing
+the detailed worker briefing. `task.get`, `task.list`, and task events return
+that prompt for manual tasks; automation-generated task projections continue to
+hide their private stored briefing. A queued, unassigned manual task can replace
+or clear its prompt through `task.update` with a string or `null`; prompt edits
+fail closed after the task starts. Capability limits publish the exact UTF-8
+byte budgets as `task_title_bytes` and `task_prompt_bytes`.
+
+`task.add` binds the task to the selected workspace's project and returns a
+`project` object containing its preferred `workspace_id` and durable root.
+Include `workspace_id` when project selection is ambiguous. The sole focused
+Git project remains implicitly selectable beside a non-Git launch-directory
+workspace. A request originating inside a Luvus pane may instead include its
+stable `pane` id. `task.next` filters the ready queue to that project, and path
+leases collide only between tasks in the same project. Git worktrees share the
+repository common directory, so they still coordinate with each other while
+unrelated repositories do not.
 
 For `task.heartbeat`, the canonical UHP `context` field is the fraction of the
 model context window already consumed. `0.6` means 60% of that window has been
 used, not 60% task progress. Send work progress through the `note` field of
-`task.update` and omit the heartbeat when context-window usage is unknown. The
-CLI exposes the same field as the clearer `--context-used` flag.
+`task.update` and omit the heartbeat when context-window usage is unknown.
+Notes may contain ordinary LF line breaks; other terminal control characters
+are rejected. Manual worker launch passes the complete briefing directly to the
+agent process instead of typing it through the shell, so stored prompt and note
+line breaks remain intact. The CLI exposes the same field as the clearer
+`--context-used` flag.
 
 `pane.report_session` binds an exact built-in agent session to its owning pane.
 The identity-only form remains compatible with existing integrations:
@@ -127,21 +196,91 @@ pane owns that exact session.
 {"id":"usage","method":"pane.report_session","params":{"pane":"9","agent":"opencode","session_id":"ses_123","usage":{"model":"anthropic/claude-sonnet-4","tokens_in":1200,"tokens_out":340,"cache_read":800,"cache_write":40,"cost":0.42,"updated_at":1788330000000}}}
 ```
 
+A reporter may add `reporter_pid`, its own process ID. The session then binds
+only if that process runs inside the named pane, and otherwise fails with
+`reporter_outside_pane`. If the server cannot check it (the pane has not
+started its process, or the platform cannot read process trees), the report
+fails with `reporter_unverified` and binds nothing. The result's `verified` is `true` when the binding was
+proven, by `reporter_pid` or by `evidence`; an older server omits it. Codex uses this because its shared background server
+runs every session's hooks with the environment of whichever pane first
+started it.
+
+A reporter that cannot name a trustworthy pane can describe the session
+instead with `evidence`: its absolute working directory and the prompt just
+submitted. The session binds to the one pane running that agent in that
+directory whose screen shows the prompt (the first 80 characters, whitespace
+collapsed, and at least 4 characters). No match fails with `not_found`, and
+several fail with `conflict`. With `dry_run: true`, nothing is bound and the
+result reports the match, so a caller can check several servers first:
+
+```json
+{"id":"probe","method":"pane.report_session","params":{"agent":"codex","session_id":"019a4f3e-7c21-7d10-b2c5-9f3e8a1d4c77","evidence":{"cwd":"/work/app","prompt":"Fix the login redirect"},"dry_run":true}}
+```
+
+```json
+{"id":"probe","result":{"type":"session_match","pane":"9","matches":1,"server_generation":"4a1901e79c0122b31e6525b40b362c55"}}
+```
+
+`evidence` cannot be combined with `pane` or `reporter_pid`.
+
+`pane.release_session` removes only an exact `{pane, agent, session_id}`
+binding. Repeating an already completed release is harmless. A delayed release
+for an older session fails with `ownership_conflict` instead of clearing the
+newer owner:
+
+```json
+{"id":"release","method":"pane.release_session","params":{"pane":"9","agent":"opencode","session_id":"ses_123"}}
+```
+
 `agent.list` rows identify their workspace three ways. `workspace` is a 0-based
 position that changes when workspaces are reordered or an earlier one closes,
 `workspace_name` is the user-editable label, and `workspace_id` is the stable id
 also published by `workspace.list` and `workspace.get`. Filter or correlate on
 `workspace_id` when the result has to survive those changes.
 
+`agent.list` rows and the `agent.get` result include `agent_session_title`, the
+same live session title that `session.snapshot` reports for that pane. It is a
+single line of at most 160 characters, or `null` when no title is available.
+It is display text only: `name` is the presentation label (backend label, then
+operator alias) and `session` is the agent's native session ID, and neither
+changes. Titles can repeat and change at any time, so keep targeting agents by
+pane ID, `terminal_id`, or alias. Servers older than this field omit it; treat
+a missing field like `null`.
+
 `task.start` and `task.next` with `start: true` accept `mode: "worktree"` or
 `mode: "workspace"`; omitted mode means worktree. Either mode may include a
 stable `workspace_id`; worktree mode creates its branch from that workspace's
-repository, while workspace mode creates a dedicated branchless task tab there.
-`branch` is valid only in worktree mode, and `task.merge` returns
-`merge_unavailable` for a workspace worker.
+repository using the configured `worktree.provider`, while workspace mode
+creates a dedicated branchless task tab there. The same provider is used by
+`worktree.create`, TUI creation, and explicit `worktree.remove`. A non-`git`
+value is the canonical id of an enabled module declaring `[worktree_provider]`;
+creation always uses its fixed `command`, while explicit removal uses its
+optional `remove_command` and otherwise falls back to Git. Provider selection is
+host configuration, not a per-request executable or command parameter. Internal
+rollback and task merge remain Git-backed. The workspace must belong to
+the task's recorded project. `branch` is valid
+only in worktree mode, and `task.merge` returns
+`merge_unavailable` for a workspace worker. `task.start` also accepts
+`focus: false` to create and start the worker without changing the operator's
+current workspace, tab, pane focus, or zoom state.
+
+`worktree.remove` accepts an exact `path` and optional boolean `force`. Without
+force, Luvus returns `worktree_in_use` before deletion when the worktree owns a
+working or blocked agent pane, an unfinished bound task, or a related lease.
+The error names the blockers so callers can finish or release the work first.
+`force: true` explicitly bypasses that guard, stops panes in the removed
+workspace, and should be used only after the operator confirms the destructive
+cleanup.
+
+`task.retry` accepts `{"id":"t1"}` for terminal `done`, `failed`, `review`, or
+`blocked` work. Manual tasks return to `queued` with an incremented `attempt`
+and bounded `previous_attempts`. Automation-owned tasks return a new
+`automation_run` whose `retry_of` points to the preserved original record.
+Retrying from `review` or `blocked` finishes the superseded source run as
+`cancelled` so it cannot block the retry.
 
 ```json
-{"id":"1","method":"task.start","params":{"id":"t3","mode":"workspace","workspace_id":"workspace_example","agent":"codex"}}
+{"id":"1","method":"task.start","params":{"id":"t3","mode":"workspace","workspace_id":"workspace_example","agent":"codex","focus":false}}
 ```
 
 ## Agent automation
@@ -274,7 +413,26 @@ not change focus:
 logical area. Headless clients therefore receive deterministic geometry that
 does not depend on the latest attached terminal size. `pane.edges` reports
 which outer edges the pane touches. Directional queries use the same geometric
-selection as the TUI.
+selection as the TUI. `pane.split` takes optional `direction`: omitted or `"auto"` splits the longer
+physical side of the target pane using the last interactive client size. Cell
+pixels come from the display client when the host reports them; otherwise Luvus
+uses a documented 2:1 cell height/width. With no painted client it splits side
+by side. `"right"` and `"down"` force a direction (`"stack"` is an alias for
+`"down"`). Older servers reject `"auto"` and treat an omitted direction as
+right, so callers that want the server default should omit the field.
+
+`pane.split` also accepts optional `cwd`: a non-empty absolute path of at most
+4096 bytes that names an existing directory. Invalid values return
+`invalid_request` before creating a pane or workspace. Omitted or `null` values
+keep the existing starting-directory behavior. An explicit `cwd` overrides
+`layout.new_pane_to_workspace_root`; if the directory disappears before spawning,
+Luvus retries the target workspace root and then the home directory.
+
+`direction` is now validated: any other value, or a non-string, returns
+`invalid_request`. Earlier servers silently treated an unrecognized value as
+`"right"`, so a caller that sent something like `"vertical"` used to get a
+side-by-side split and now gets an error. Send `"right"` explicitly, or omit the
+field, to keep that behavior.
 
 `layout.export` returns the complete binary split tree and focused pane.
 `layout.apply` accepts that tree plus an optional focus. It succeeds only when
@@ -289,6 +447,15 @@ steps and a ratio from 0 to 1. The live layout clamps the result to preserve the
 minimum pane size. `pane.resize` takes `direction` and `cells`; `pane.swap`
 requires both panes to be in the same tab. `pane.focus_direction` changes focus,
 while `pane.neighbor` only inspects it.
+
+`pane.transpose` accepts `{pane?}` (or `{pane?, if_revision?}` at the wire
+boundary) and returns `{type:"pane_transpose", pane, changed}`. It toggles only
+the split immediately containing that pane, preserving ratios, leaf order,
+focus, zoom, and live terminals. An omitted/null pane selects the focused pane;
+an explicit ID resolves across workspaces and tabs. A single-pane tab returns
+`changed:false`. Dashboard or missing targets return `not_found`. A successful
+change emits `pane.transposed` with `{pane}`. This toggle is not idempotent:
+after a lost response, inspect `pane.layout` instead of retrying blindly.
 
 `workspace.move_block` takes a unique, bounded `workspaces` array and a final
 zero-based `to` position. All indices are validated before anything changes,
@@ -377,6 +544,31 @@ It includes the current event sequence, so a consumer can subscribe first and
 reconcile later events without a snapshot race. Neither method reads terminal
 text or starts a process.
 
+Every snapshot terminal row includes `pane_id` and nullable `agent_name`.
+The boolean `is_agent` distinguishes detected or bound agents from plain shells,
+independently of whether the agent is working, idle, or waiting.
+It also includes nullable `agent_session_title`: the bounded, single-line title
+used by the AGENTS sidebar for a live agent pane (OSC title first, then a
+module-provided pane or session title). It is `null` when no title is available
+or the pane is not an agent. Native `kind:"view"` rows omit it.
+OSC and module title changes emit `agent.title_changed`. An OSC event is sent
+only when `agent_session_title` itself changes, so an agent that animates a
+leading status icon in its terminal title does not repeat an unchanged title.
+OSC events carry `pane` and nullable `title` so clients can update that row
+directly; module
+title events have no per-pane payload and require a snapshot refresh. Neither
+requires polling terminal output.
+`agent_name` is the operator alias set by `agent.name` or `pane.rename`; a terminal-backend title
+does not mask it. This differs from the presentation name in `agent.get` and
+`agent.list`, which prefer a backend title. Clearing an alias returns JSON
+`null`; native `kind:"view"` rows omit `agent_name`. Workspace and tab indices
+remain 1-based in this snapshot (agent-list workspace indices are 0-based).
+`agent.name` changes aliases without emitting an event or advancing
+`event_sequence`. `pane.rename` updates the same alias map, emits `pane.renamed`,
+and advances the sequence, including when clearing a name. Refresh snapshots to
+observe aliases; the sequence is not an alias ETag because `agent.name` is silent.
+Older servers may omit the field; retain pane-ID display as a fallback.
+
 `pane.processes` returns the already-cached executable names from Luvus's shared
 off-loop process scan. Full argument vectors are never exposed because they can
 contain prompts, credentials, or tokens. `scan:"unavailable"` is uncertainty,
@@ -398,6 +590,19 @@ owner renews with another report or calls `agent.release`. This lets unfamiliar
 agents integrate immediately without weakening process-based fallback detection
 or leaving stale state after an adapter crashes.
 
+A program can also report its own state from inside the pane with OSC 7501
+(see [Program status](/docs/uhp/terminal/#program-status)). Those panes report
+`state_source: "program_status"` with `state_confidence: "authoritative"`, and
+`agent.explain` adds a `program_status` array of the raw records (`id`, `state`
+including `error`, `kind`, `progress`, `app`, `effective_app`, `title`,
+`message`), or `null` when the pane has none. An active `agent.report` lease
+still wins over OSC 7501. `agent.list` also lists such panes, so each row
+carries `is_agent` (whether the pane is a native or manifest agent) and
+`display_agent` (the label Luvus draws; an `app` that matches an agent id or
+identity string is shown as `program`). `agent` remains the trusted
+process-derived identity; target agent methods by that, never by
+`display_agent`. Older servers omit both fields.
+
 The normative schemas and fixtures live under `protocol/uhp/v1` and are
 embedded in packaged binaries. Print that exact contract with `luvus uhp schema`.
 
@@ -417,16 +622,122 @@ the pane, queues the launch as one submitted shell action, reserves the unique
 name, and waits for manifest-driven detection without composing separate UHP
 requests.
 
-`agent.prompt` takes `target`, `text`, optional `wait` (default `false`),
+`agent.prompt` takes `target`, `text`, optional `strict` (default `false`),
+optional `terminal_id` (the current PTY lifetime),
+optional `wait` (default `false`),
 optional `until`, and optional `timeout_s`. `until` and `timeout_s` require
-`wait:true`. Paste and Enter are one PTY queue action. With `wait:true`, the
-response is held until a requested state has post-submission evidence. Luvus
-accepts a detected Working transition or a newer output revision followed by a
-short quiet window, so a fast turn cannot disappear between detector ticks. A
-timeout returns `submitted:true`, `matched:false`, and `evidence:"timeout"`.
-Never resend that prompt automatically because it may already have executed.
-Only one waiting prompt may own a pane at a time. A conflicting call returns
-`agent_prompt_busy` before Luvus queues its text.
+`wait:true`. Paste and Enter remain one PTY queue action. Without `wait`, the
+response remains immediate: `submitted:true`, `matched:false`, `evidence:"queued"`,
+with no `observed_state` field. Submission means queue admission, not confirmation
+that the agent consumed the prompt text.
+
+For a client holding a pane ID across a restart, pass the `terminal_id` from
+`agent.read` or `agent.list` with either `agent.prompt` or `agent.send`:
+
+```json
+{"id":"prompt","method":"agent.prompt","params":{"target":"8","text":"continue","terminal_id":"0123456789abcdef0123456789abcdef"}}
+```
+
+The server validates the ID after resolving the target and before queuing text
+or Enter. A different or unavailable PTY returns `content_revision_conflict`
+with expected and actual terminal IDs; malformed IDs and unknown fields return
+`invalid_request`. Omitting the fence keeps the existing behavior. This fence
+protects terminal identity, not the visible screen revision; `agent.keys` still
+uses its paired revision and terminal fence for inspected key interactions.
+`uhp.capabilities.concurrency.agent_prompt_terminal_id` advertises support.
+Older servers may ignore unknown fields on `agent.send`, so clients requiring
+the fence must verify this capability before calling it; do not treat a queued
+legacy response as proof that the fence was enforced.
+
+Before either prompt method queues input, Luvus rejects detected startup,
+sign-in, selection, and approval screens with `agent_not_ready`. Claude,
+Codex, and OpenCode also require positive evidence of their live input
+composers, so an unrecognised screen cannot receive a prompt. Pass
+`strict:true` to either
+`agent.prompt` or `agent.send` to require positive composer evidence for any
+agent; an agent without a detector returns `agent_not_ready`. The default for
+other agents remains permissive on Unknown evidence. Rejection queues neither
+text nor Enter. Read the visible agent output and use `agent.keys` only when an
+explicit interaction is intended.
+An OpenCode theme that hides the composer's lower edge cannot establish this
+evidence and remains `agent_not_ready`.
+
+For explicit key interactions, `agent.read` adds `content_revision` (the pane's
+PTY output counter) and `terminal_id` (32 lowercase hexadecimal characters for
+that PTY lifetime) alongside `text`. Text and coordinates are captured under the
+same engine lock for both `source:"visible"` and recent output. `source:"visible"`
+returns the **live** screen: it reports what the agent is painting now and never
+follows the pane's scrollback position, so a read taken while someone is scrolled
+back into an earlier turn still describes the frame the fenced keys will land on. A deferred pane
+without a runtime has `terminal_id:null`; an unavailable engine snapshot returns
+empty text and null coordinates. These fields are additive: legacy results stay
+valid. The response's generic `revision` is a global event sequence and is not
+this pane counter.
+
+`agent.keys` still requires only `target` and a non-empty `keys` array. UHP callers
+may optionally supply **both** `if_content_revision` (a non-negative integer)
+and `terminal_id` from the read they inspected:
+
+```json
+{"id":"inspect","method":"agent.read","params":{"target":"reviewer","source":"visible"}}
+{"id":"answer","method":"agent.keys","params":{"target":"reviewer","keys":["enter"],"if_content_revision":12,"terminal_id":"0123456789abcdef0123456789abcdef"}}
+```
+
+The example coordinates must be replaced with the actual read result. Supplying
+only one field, malformed coordinates, an unknown parameter, or any invalid key
+returns `invalid_request` without queuing input. The complete key list validates
+before the fence comparison. Plain shells still return `agent_not_ready`.
+
+For a fenced request, the server holds the existing engine lock while comparing
+identity and content revision and admitting the entire key batch. A stale
+revision, different terminal lifetime, missing runtime, or unavailable engine
+returns `content_revision_conflict` with expected/actual values (or an explicit
+unavailable actual value), and queues no bytes. A matching fence still reports
+`send_failed` if the writer rejects admission.
+
+On conflict, re-read the visible screen and reassess the intended action; never
+retry the same pair. Without the pair, admission is unchanged. Older servers omit
+the read coordinates or reject the unknown parameters; use the legacy unfenced
+request only when that compatibility behavior is acceptable for the authorized
+action. The pair is a UHP parameter option, not a new CLI flag.
+
+This is an **admission-only** fence: it does not cancel already queued input or
+cover child-side changes the server has not observed. Cursor, SGR, and other PTY
+output can increment the counter without changing visible dialog text; a conflict
+still requires a fresh read. Generic `if_revision` cannot replace this fence:
+it tracks unrelated global events and is checked before dispatch without the
+engine lock. The prompt guard introduced in #320 routes explicit interactions
+to `agent.keys`; this opt-in fence binds those interactions to the inspected
+terminal snapshot.
+
+With `wait:true`, a **new** `working` or `blocked` transition must be observed
+before a requested `until` state can complete the wait. An already active state,
+unchanged metadata, title flicker, and output settling alone do not qualify.
+`observed_state` identifies the first active transition, `status` is the current
+state, and `evidence:"state_transition"` explains a matched result. Transitions
+are captured on the app loop even when working and settling happen between
+workflow ticks. State evidence is not a native per-prompt turn identifier.
+
+The absolute `timeout_s` deadline (default 300 seconds) covers both observing the
+transition and reaching `until` (default `idle`, `done`, or `blocked`). Repeated
+`until` entries remain accepted. Timeout returns `submitted:true`, `matched:false`,
+`evidence:"timeout"`, and `observed_state` (null when no active transition was seen).
+Agents without detectable state transitions therefore time out. The standalone
+`agent.wait` retains its current-state matching and status-set semantics.
+
+Pane or terminal exit while a prompt wait is pending returns `agent_not_running`.
+Its `error.data` retains `pane`, `queued:true`, `submitted:true`, `observed_state`,
+`reason:"pane_closed"`, `baseline_revision`, and `content_revision`. CLI exit codes
+remain 0 for a matched wait or no-wait queue admission, 1 for request errors, and
+2 for timeouts or pane exit during a wait.
+
+Only one waiting prompt may own a pane. A conflicting waiting request returns
+`agent_prompt_busy` before input is queued. No-wait requests retain their existing
+behavior and do not acquire wait ownership. Cancellation, timeout, and exit release
+that ownership without resending or retracting queued input. Never resend a prompt
+automatically after a timeout or lost response because it may already have executed.
+Older wait responses omit `observed_state` and can report `output_settled`; callers
+requiring the new transition gate should check the response shape.
 
 ## Search
 
@@ -501,13 +812,32 @@ It deliberately omits native session IDs and blocked-output snippets. It does
 not open Mission Control or change focus.
 
 `mission.refresh` schedules one demand-driven usage scan. It performs no
-continuous polling; call `mission.snapshot` again to read the updated cache.
+continuous polling. Its `refresh_id` is a decimal string; call
+`mission.snapshot` again until the snapshot has the same `server_generation`
+under `refresh` and its numeric `refresh.completed_id` is at least that ID.
+Discard a ticket after a
+server restart. Refresh requests for different scopes are queued rather than
+replacing each other. A snapshot remains a read-only cache projection and never
+starts a scan itself.
 Both methods accept `scope:"workspace"` (default) or `scope:"all"`, plus an
 optional zero-based `workspace` or stable `workspace_id`.
+`all` covers every workspace in the **selected named session**, not other named
+sessions.
+
+Each row retains `usage:null` when counters are unknown, with `usage_status`
+explaining why: `not_refreshed`, `refreshing`, `unbound` (no exact native session
+identity), `unsupported` (no native reader), or `unavailable` (a scan found no
+usable structured counters). `available` means `usage` contains measured
+counters. An integration can provide counters even for an agent without a native
+reader. Agent `state` is independent of usage; `working` does not guarantee a
+usage record. `summary.usage_coverage` reports available and priced rows and
+whether token and cost totals cover every row. Totals are known subtotals when
+coverage is incomplete. Burn rate stays `null` until two complete, comparable
+refreshes exist; zero is not substituted for missing measurements.
 
 ```json
 → {"id":"m1","method":"mission.snapshot","params":{"scope":"all"}}
-← {"id":"m1","result":{"type":"mission_snapshot","scope":"all","refreshing":false,"summary":{"agents":0,"tokens":0,"cost_usd":0.0,"burn_usd_per_hour":0.0},"automation":{"summary":{"definitions":0,"enabled":0,"scheduled":0,"running":0,"review":0,"failed":0,"next_run_at":null},"rows":[]},"rows":[]}}
+← {"id":"m1","result":{"type":"mission_snapshot","scope":"all","refreshing":false,"refresh":{"server_generation":"example-generation","completed_id":"0","completed_at":null},"summary":{"agents":0,"tokens":0,"cost_usd":0.0,"burn_usd_per_hour":null,"usage_coverage":{"available":0,"priced":0,"total":0,"tokens_complete":true,"cost_complete":true}},"automation":{"summary":{"definitions":0,"enabled":0,"scheduled":0,"running":0,"review":0,"failed":0,"next_run_at":null},"rows":[]},"rows":[]}}
 ```
 
 `mission.open` opens Mission Control in the active workspace. Pass a zero-based
@@ -516,8 +846,8 @@ The dashboard is reused when it is already open.
 
 | Method | Params | Result |
 |---|---|---|
-| `mission.snapshot` | `{scope?, workspace?}` or `{scope?, workspace_id?}` | `{type:"mission_snapshot", summary, rows, refreshing}` |
-| `mission.refresh` | `{scope?, workspace?}` or `{scope?, workspace_id?}` | `{type:"mission_refresh", refreshing:true}` |
+| `mission.snapshot` | `{scope?, workspace?}` or `{scope?, workspace_id?}` | `{type:"mission_snapshot", summary, rows, refresh, refreshing}` |
+| `mission.refresh` | `{scope?, workspace?}` or `{scope?, workspace_id?}` | `{type:"mission_refresh", refresh_id, server_generation, refreshing:true}` |
 | `mission.open` | `{workspace?}` or `{workspace_id?}` | `{type:"ok", mission:true}` |
 
 The CLI equivalent is `luvus mission open [<workspace>]`. This is a write
@@ -596,8 +926,14 @@ tabs return `invalid_request` without renaming another tab.
 
 ## Pane history metrics
 
-`pane.list` (for the active tab) and `pane.status` (for any resolved pane) add
-read-only history fields to their existing result rows:
+`pane.list` lists panes across every workspace and tab in the selected named
+session by default, without changing focus. Pass `{"all_tabs":false}` to limit
+the result to the active tab. The CLI follows the same default and accepts
+`luvus pane list --current-tab` for the narrow view. Each row includes a
+zero-based `workspace`, stable `workspace_id`, one-based `tab`, and stable
+`tab_id`; the boolean `focused` is true only for the globally focused pane.
+`all_tabs` must be a boolean. `pane.status` resolves any known pane. Both
+methods include read-only history fields in their result rows:
 
 ```json
 {
@@ -663,8 +999,10 @@ when false, the current workspace, tab, pane focus, and zoom state are preserved
 Unsupported agents return `unsupported_agent`; a supported agent whose session
 ID cannot be resolved returns `session_unknown`; and PTY launch failure returns
 `spawn_failed`. Codex requires a hook-reported or Luvus-resumed exact session
-identity and never falls back to the newest rollout in the workspace. Validation
-completes before a new pane is spawned.
+identity and never falls back to the newest rollout in the workspace. Kilo Code
+also requires an exact session identity because Luvus does not scan or guess
+sessions from Kilo's current database. Validation completes before a new pane
+is spawned.
 
 ## Files
 
@@ -835,25 +1173,66 @@ rendering.
 | Method | Params | Result |
 |---|---|---|
 | `ui.sidebar` | `{side?: "left"\|"right", width?: int, visible?: bool}` | `{width, visible}` for that side |
+| `ui.agent_title.push` | `{owner?, module_token?, titles: Title[]}` | `{type:"ok", changed}` |
+| `ui.agent_title.clear` | `{owner?, module_token?, pane?, agent?, session_id?}` | `{type:"ok", changed}` |
 | `ui.dock.push` | `{id, title?, placement?: "left"\|"right", rows: Row[]}` | `{type:"ok"}` |
 | `ui.dock.list` | `{}` | `{docks: [{id, side}]}` |
 | `ui.dock.move` | `{id, side: "left"\|"right"}` | `{type:"ok"}` |
 
+`ui.agent_title.push` lets a module supply AGENTS sidebar session titles without
+Luvus parsing any agent's native store. Each `Title` is:
+
+```json
+{ "pane": "3", "agent": "pi", "session_id": "01a0…", "title": "Ship desktop" }
+```
+
+A row needs `pane` and/or `agent`+`session_id`. `agent` must name a built-in
+Luvus adapter. Empty `title` clears that key. Live rows still prefer an OSC title; otherwise they use a pane title, then a
+session title. Resumable All/history rows use the session title. Luvus pane
+aliases (`=name`) are never used as titles. Module commands include their owner
+and per-server `module_token` automatically. Luvus accepts a module owner only
+with that token, so one module cannot publish or clear another module's titles.
+`clear` with no filters drops every title owned by the authenticated module.
+Direct local control-API calls may omit both fields; those calls can mutate only
+unowned titles, and an unfiltered clear is a no-op. Luvus clears an owner's
+titles when that module is disabled, unlinked, or uninstalled, and a disabled
+module cannot publish. A module's token stays valid for as long as it remains
+registered on that server, so toggling a module does not strand a module process
+that is still running; the token is dropped on unlink or uninstall. The CLI
+wrappers are `luvus ui agent-title push|clear` (`push` also
+reads `--titles` from stdin). Raw local API clients acting for a module must pass
+the injected `LUVUS_MODULE_TOKEN` as `module_token`; module scripts calling the
+CLI do not handle it themselves.
+
 A `Row` is:
 
 ```json
-{ "text": string,
+{ "text"?:  string,
   "dot":    "idle" | "working" | "blocked" | "done",
+  "tone":   "normal" | "muted" | "accent" | "success" | "warning" | "error",
+  "spans":  [ {"text": string, "tone"?: string} ],
   "action": string,
   "value":  string,
   "menu":   [ {"title": string, "action": string,
                "value"?: string, "destructive"?: bool} ] }
 ```
 
-Only `text` is required. The first `push` mounts the dock into `placement`
+A row needs `text`, or `spans` with at least one non-empty span; everything
+else is optional. The first `push` mounts the dock into `placement`
 (default left); later pushes refresh its rows. A row's `action` is a module
 action id run when the row is **left-clicked**, with `value` handed to it as
 `LUVUS_MODULE_ROW_VALUE` so one action can serve every row.
+
+`tone` colors the row text with a [Luvus Bar tone](#luvus-bar), resolved
+through the active theme. `spans` draws the row from segments instead of
+`text`, left to right, each in its own `tone` or else the row's. A row with
+neither keeps the default row color, which is not the same as `normal`. An
+unknown tone name falls back to the default color rather than failing the
+push. A span with no `text` is dropped, so a malformed list falls back to
+`text`. `text` is the plain string a click hands to the action as
+`LUVUS_MODULE_ROW_TEXT`. A row that sends `spans` and no `text` gets `text`
+from the spans joined in order, so a spans-only row still names itself to its
+action. A row with neither renders empty and hands its action an empty string.
 
 `menu` gives the row a **right-click** menu. Each entry runs an action id, an
 entry with an empty `action` is a divider, and `destructive` tints the label. An
@@ -911,7 +1290,10 @@ Tones are `normal`, `muted`, `accent`, `success`, `warning`, and `error`.
 States are `blocked`, `working`, `done`, `idle`, and `unknown`. An action must
 belong to the widget's enabled module. Clicks expose
 `LUVUS_MODULE_BAR_ID`, `LUVUS_MODULE_BAR_SEGMENT`, and optional
-`LUVUS_MODULE_BAR_VALUE` to that action.
+`LUVUS_MODULE_BAR_VALUE` to that action. Every segment shape accepts an
+`action` and a string `value` except `progress`, whose `value` is the numeric
+fill: a `progress` segment can be clickable, but its click carries no
+`LUVUS_MODULE_BAR_VALUE`.
 
 Limits are intentionally small: 16 segments and 256 display columns per
 widget, 16 live widgets per module, 64 live widgets globally, and 30 updates per
@@ -973,5 +1355,6 @@ subscribe-first snapshot reconciliation.
   directory. Windows uses a local-only named pipe with an owner/System DACL and
   same-user server validation. Access equals command execution as your user. See the
   [security model](/docs/explanation/security/).
-- `ping` returns the server's version and selected session name, useful for
-  health checks, upgrade detection, and routing verification.
+- `ping` returns the server version, binary-client protocol version, and selected
+  session name, useful for health checks, upgrade detection, and routing
+  verification.

@@ -7,6 +7,12 @@ These examples use UHP 1.0 through the selected Luvus session. Start with
 read-only discovery, use stable IDs returned by the server, and reconcile state
 before retrying any mutation whose response was lost.
 
+For a paired Access connection, inspect `result.access.allowed_methods` in the
+`uhp.capabilities` response before enabling a supported UI action. Keep
+`result.methods` as the server capability catalog; `access.mode` and
+`access.limits` describe this endpoint. Missing `access` on an older gateway
+must not be treated as unrestricted authority.
+
 ## Choose a connection path
 
 | Need | Use |
@@ -28,6 +34,15 @@ Do not hardcode `~/.luvus/luvus.sock`. Named sessions, Windows named pipes, and
 long Unix paths use different discovered endpoints.
 
 ## Send a one-shot request
+
+For a fleet display, request `session.snapshot` and retain each row's `pane_id`
+for routing. A named terminal row includes
+`{"pane_id":"7","kind":"terminal","agent_name":"reviewer"}` (other fields
+omitted here). Clearing the operator alias yields `agent_name:null`; native
+view rows omit it. Backend titles do not override this alias field. Refresh
+snapshots after naming: `agent.name` emits no event and does not advance
+`event_sequence`, while `pane.rename` updates the same map, emits `pane.renamed`,
+and advances the sequence, including when clearing a name.
 
 `uhp proxy` reads one LF-terminated request from standard input, forwards it to
 the selected profile, prints one response, and exits:
@@ -111,8 +126,14 @@ For a narrower read:
 ```
 
 Mission Control reads do not open or focus its tab. `mission.refresh` schedules
-one bounded refresh; call `mission.snapshot` again after completion rather than
-polling continuously.
+one bounded refresh and returns a `refresh_id`. Read `mission.snapshot` again
+after the worker completes; its `refresh.server_generation` must match the
+refresh response and its numeric `refresh.completed_id` must be at least your
+requested ID. Use bounded client-side retries, not continuous server polling.
+Rows with `usage:null` carry `usage_status` so callers can distinguish an
+unrefreshed cache from a missing session identity, unsupported reader, or
+unavailable counters. Summary totals are known subtotals when coverage is
+incomplete. `scope:"all"` does not cross named-session boundaries.
 
 ## Start and prompt an agent atomically
 
@@ -181,9 +202,9 @@ bounded capture request:
 ```
 
 Use `terminal.backend.submit_text` for one atomic paste-and-Enter action.
-`type_literal` never adds Enter, while `send_key` sends one documented logical
-key. A stale generation, replaced terminal, or moved route is rejected before
-input is queued.
+`type_literal` never adds Enter, `paste_text` preserves bracketed-paste semantics
+without adding Enter, and `send_key` sends one documented logical key. A stale
+generation, replaced terminal, or moved route is rejected before input is queued.
 
 For an interactive client, open `terminal.backend.control` on the discovered
 native endpoint and keep the connection open after its acknowledgment:
@@ -191,6 +212,7 @@ native endpoint and keep the connection open after its acknowledgment:
 ```json
 {"id":"control-1","method":"terminal.backend.control","params":{"server_generation":"<generation>","terminal_id":"<terminal-id>","pane_id":"7","mode":"visible","lines":80,"ansi":true}}
 {"id":"input-1","action":"type_literal","params":{"text":"cargo test"}}
+{"id":"paste-1","action":"paste_text","params":{"text":"first line\nsecond line"}}
 {"id":"input-2","action":"send_key","params":{"key":"enter"}}
 ```
 
@@ -258,6 +280,27 @@ pairing code, or token, and never put them in logs.
 With `--no-expiry`, the pairing response uses `expires_on_close:true`. The
 client token remains valid only while that access command is running; Ctrl-C
 closes the gateway and revokes its bounded upstream authority.
+
+## Manage owner-local machines
+
+Machine methods exist only on an access gateway started with `--machines`.
+List profiles first and retain the returned catalog revision:
+
+```json
+{"id":"machines-1","method":"machine.list","params":{},"auth":"<token>"}
+```
+
+Every catalog mutation requires that revision. This example records a disabled
+profile, so it performs no SSH connection:
+
+```json
+{"id":"machine-add-1","method":"machine.add","params":{"id":"build","host":"buildbox","enabled":false,"if_revision":0},"auth":"<token>"}
+```
+
+Re-read `machine.list` before retrying if the response is lost. Profile reads
+omit the SSH destination and negotiated executable path. Session and terminal
+methods remain scoped to their selected Luvus server; machine access does not
+silently redirect an ordinary UHP request.
 
 ## Retry rules
 

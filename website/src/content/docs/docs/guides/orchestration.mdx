@@ -34,7 +34,8 @@ then finish as `merged` or return to `blocked` on conflict. Only one task
 integrates at a time. An interrupted integration restores its prior `done` or
 `blocked` state after restart. Branch-backed dependents wait for `merged`, so
 they never start before their dependency is available in the integration
-history. The ledger lives in `~/.luvus/orch.json`, separate from your session.
+history. Each named server session owns its own `orch.json` ledger inside that
+session's Luvus directory.
 
 Automation definitions and bounded run history live in the selected server
 session's `automations.json`. The detached server owns their deadlines, so
@@ -51,13 +52,36 @@ instead of sending its prompt to a restored or unrelated pane.
 For schedule syntax, access profiles, missed-run policies, UHP requests, and a
 copyable example, see [Agent Automation](/docs/guides/automation/).
 
+Every new task is bound to the project of the selected workspace. Git
+worktrees from one repository share a project identity, while unrelated
+repositories have independent task queues and path leases. `task next` only
+selects work from its workspace's project, so changing the focused workspace
+cannot launch an older task in the wrong repository. Commands run inside a
+Luvus pane infer its workspace. Callers outside a pane must pass
+`--workspace-id` when multiple repositories or multiple non-Git projects are
+open; use `luvus workspace list` to discover the stable id. When the focused
+workspace belongs to the session's only Git repository, an incidental non-Git
+launch-directory workspace does not make that repository ambiguous. Legacy
+tasks use the same rule when acquiring project metadata.
+
 `task start` validates the task's path lease before it creates a worktree or
 workspace worker pane. If another task already holds an overlapping path, start
 returns `lease_conflict` and leaves the queued task untouched. After a server
 restart, leases follow workers that were restored to new pane IDs; leases with
 no live task owner are discarded so stale reservations cannot block the queue.
-If older persisted state contains two already-running workers with overlapping
-paths, Luvus keeps the existing holder and marks the unprotected task blocked.
+Overlapping paths conflict only inside the same project. If older persisted
+state contains two already-running workers with overlapping paths, Luvus keeps
+the existing holder and marks the unprotected task blocked.
+
+When an agent is selected, Luvus queues a short private-runner command and Enter
+as one submission before it marks the task running. The runner reloads the
+claimed task and passes its complete briefing directly to the agent process, so
+long or multiline prompts never cross the shell's terminal-input line buffer.
+A queue failure closes the new pane and leaves the task unclaimed without
+closing any pre-existing worker. Any workspace, worktree, or branch created only
+for that failed attempt is removed, and the previous workspace selection is
+restored. Multiline prompts and progress notes remain structured in both task
+storage and the briefing delivered to the agent.
 
 ## The board
 
@@ -113,16 +137,18 @@ before an action is chosen.
 | `q` | close the board without stopping tasks or workers |
 
 The form starts on a compact **Task · Automation** choice. The active board view
-selects its matching type by default. Task shows Title, Paths, Deps, Gate, and a
-`Manual`/`Now` Start choice; Prompt and Agent appear only for `Now`. Automation
+selects its matching type by default. Task shows Title, Paths, Deps, Gate, a
+`Manual`/`Now` Start choice, and a three-row Prompt editor; Agent appears only
+for `Now`. Automation
 hides concrete dependencies and owns a registry-backed Agent, an explicit
 `Run in` choice for an isolated Worktree or the existing Workspace, an `Access`
 choice (`Read only`, `Workspace`, or `Full access`), `Once later`,
 `Hourly`, `Daily`, or `Weekly`, and Schedule, followed by a three-row Prompt editor. Use
 `Tab` to switch between Task and Automation, Down or Up to move between fields,
 Left/Right to change the selected Agent, Run in, Access, or Start value, and
-`Shift+Enter` to add a new line to the Automation prompt. Plain `Enter` creates
-the automation. Agent
+`Shift+Enter` to add a new line to either prompt. Plain `Enter` creates the task
+or automation. Pasted task prompts preserve line breaks, and long titles scroll
+horizontally with the active cursor instead of hiding the end. Agent
 choices come from the built-in adapters that declare at least one reviewed
 unattended launch profile. A selected agent/access combination that is not supported
 is rejected before Luvus creates a task, worktree, lease, or pane. Task and Automation
@@ -154,7 +180,8 @@ Automation definition.
 Say you want an auth module and an API layer that depends on it:
 
 1. `a` → Title `OAuth token module`, Paths `src/auth/**`, Gate
-   `cargo test auth`, `⏎`.
+   `cargo test auth`, Prompt `Implement the token parser and cover rollback
+   behavior`, `⏎`.
 2. `a` → Title `API layer`, Paths `src/api/**`, Deps `t1`, `⏎`.
 3. Select `t1` and press `s`. luvus creates a worktree on branch `luvus/t1`,
    opens a pane in it, and takes you there. Run your agent in that pane (or
@@ -178,12 +205,20 @@ can run the whole loop itself:
 
 ```sh
 # create + inspect
-luvus task add "OAuth module" --paths "src/auth/**" --gate "cargo test auth"
-luvus task list · get t1 · update t1 --status running --note "learning: …"
+luvus task add "OAuth module" \
+  --prompt "Implement the token parser and cover rollback behavior." \
+  --paths "src/auth/**" --gate "cargo test auth" \
+  --workspace-id workspace_example
+luvus task list · get t1
+luvus task update t1 --prompt-file ./task-brief.md # editable until the task starts
+luvus task update t1 --status running --note "learning: …"
 
 # start workers (worktree remains the default)
 luvus task start t1 --agent "claude"
-luvus task next --start --agent "claude"   # claim + start the next ready task
+luvus task next --start --agent "claude" --workspace-id workspace_example
+
+# stage a worker without leaving the workspace, tab, or pane you are viewing
+luvus task start t3 --agent "codex" --workspace-id workspace_example --no-focus
 
 # run directly in an existing checkout (no branch or merge step)
 luvus task start t2 --mode workspace --agent "codex"
@@ -192,6 +227,10 @@ luvus task start t2 --mode workspace --agent "codex"
 luvus task heartbeat t1 --context-used 0.6 # 60% of the model context window is used
 luvus task done t1                          # runs the quality gate
 luvus task merge t1
+
+# retry without deleting the previous pane, branch, worktree, or result
+luvus task retry t1
+luvus task start t1 --agent "claude"        # worktree attempt 2 uses a new branch
 
 # leases (usually automatic via task start)
 luvus lease acquire "src/auth/**" --task t1
@@ -211,6 +250,10 @@ luvus automation run a1 --idempotency-key manual-review-1
 luvus events
 ```
 
+For an unregistered agent, `--agent` accepts an executable followed by quoted
+arguments. Luvus parses that argv directly; shell pipelines and redirections are
+not evaluated. The task briefing is always appended as the final argument.
+
 Inside a luvus pane, commands default to the calling pane via
 `$LUVUS_PANE_ID`, so a worker agent can `luvus task heartbeat` itself.
 `--context-used` is the fraction of the model's context window already consumed:
@@ -226,7 +269,7 @@ entries remain available after it.
 Events on the bus: `task.added` · `task.claimed` · `task.started` ·
 `task.ready` · `task.gate_running` · `task.gate_passed` · `task.gate_failed` ·
 `task.needs_compaction` · `task.done` · `task.merge_started` · `task.merged` ·
-`task.merge_conflict` · `task.merge_failed` · `task.released` ·
+`task.merge_conflict` · `task.merge_failed` · `task.released` · `task.retried` ·
 `lease.acquired` · `lease.released` · `automation.created` ·
 `automation.updated` · `automation.enabled` · `automation.disabled` ·
 `automation.rebound` ·
@@ -236,6 +279,31 @@ Events on the bus: `task.added` · `task.claimed` · `task.started` ·
 `automation.run_failed`.
 
 ## The safety model
+
+`task retry <id>` accepts terminal `done`, `failed`, `review`, and `blocked`
+tasks. It archives a bounded attempt summary, releases leases, detaches the old
+worker, and queues a fresh attempt without closing the pane or deleting its
+branch, worktree, output, or notes. A retry is rejected once a dependent task
+has started, and `merging` or `merged` tasks remain immutable. Worktree retries
+use `luvus/<task-id>-retry-<attempt>` by default. Retrying an automation-owned
+task creates a new automation run from the original run's captured contract
+while preserving the original records. Retrying from `review` or `blocked`
+finishes the superseded run as cancelled without closing its worker pane.
+
+The top-level `branch`, `worktree`, `attempt_started_at`, and
+`attempt_finished_at` always describe the current attempt. On a newly queued
+retry, `attempt_started_at` appears when the attempt starts and
+`attempt_finished_at` when it finishes. `branch` and `worktree` receive values
+only when a worktree is assigned; workspace mode has no branch. The superseded
+attempt remains available as the final `previous_attempts` entry, including
+its branch, worktree, start time, and finish time. A `task.retried` event tells
+event-stream consumers to refresh that task; the event itself carries only its
+ID and new attempt number.
+
+Releasing or retrying a task while its quality gate is running cancels the
+contained gate process tree and invalidates that run's ownership. Luvus waits
+for cancellation to settle before accepting another gate for the same task, so
+the commands cannot overlap and a late result cannot complete newer work.
 
 - **Only armed agent automations spawn unattended.** Manual tasks still start
   only when you press `s` or run `task start`. Every automation stores one
@@ -280,4 +348,6 @@ Events on the bus: `task.added` · `task.claimed` · `task.started` ·
 | Scheduled worker still needs attention | ORCH marks the automation task `blocked` and records the detected prompt. Resolve it in the visible pane; Luvus does not approve unknown requests automatically. |
 
 Clean up a finished worker with `luvus worktree remove <path>` (the branch is
-kept).
+kept). Luvus refuses removal while a working or blocked agent pane, unfinished
+task, or lease still owns that worktree. Use `--force` only after explicitly
+confirming that those panes may be stopped and their worktree removed.

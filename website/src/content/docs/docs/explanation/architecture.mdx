@@ -62,6 +62,22 @@ snapshot, PTY tree, and orchestration ledger. Stopped names consume no CPU or
 memory. Shared preferences, detection manifests, skills, and module installs
 remain at the Luvus root.
 
+On Unix, automatic server startup uses a short-lived detached launcher. It exits
+before the client attaches, so the server is no longer a descendant of the
+client that started it. Slow startup and restoration may continue after a
+client's bounded readiness wait expires. Startup reports success only after the
+app loop answers a control request. A readiness timeout reports an error and
+leaves a bound server running so it can finish restoring; managed startup still
+cleans up failed launches that have not bound an endpoint. Closing the client or
+terminating its ordinary process tree leaves the server and PTYs running.
+Explicit server stop/restart and termination signals still work.
+Windows retains its existing detached-process launch behavior.
+
+This is not protection against a supervisor that adopts orphaned processes as a
+subreaper, kills an entire cgroup/job, or explicitly targets the server. Such an
+environment needs supervisor-managed service ownership. Bare `luvus server`
+remains a foreground role, and `--local` remains monolithic.
+
 ## One event loop, pure state
 
 All state mutation happens on a single thread, driven by one event loop. Slow
@@ -122,11 +138,12 @@ Scrolling updates the reported offset without traversing retained rows. The
 reported byte fields remain allocation estimates, not process RSS or an exact
 byte-enforced history limit.
 
-Ordinary pane output schedules CWD and workspace-branch inspection for its tab,
-including split siblings needed for safe rehoming. Attach, restore, and topology
-changes retain full invalidation. Process-identity demand remains independent
-and shares the OS process snapshot when deadlines coincide. This reduces
-unrelated Git probes; it does not eliminate platform-wide process enumeration.
+Ordinary pane output schedules CWD inspection for the changed pane and branch
+inspection for its owning workspace. Attach, restore, and topology changes
+retain full invalidation. Process-identity demand remains independent and
+shares the OS process snapshot when deadlines coincide. This avoids probing
+quiet split siblings and unrelated Git roots; it does not eliminate
+platform-wide process enumeration.
 
 ## And the numbers
 

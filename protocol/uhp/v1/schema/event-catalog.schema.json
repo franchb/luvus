@@ -1,4 +1,5 @@
 {
+  "$comment": "Effective Access permissions are returned by uhp.capabilities on the Access endpoint only; no new event or event-sequence semantics. session.snapshot terminal agent_name is a read projection of operator aliases. agent.name changes aliases without emitting an event or advancing event_sequence. pane.rename updates the same map, emits pane.renamed, and advances event_sequence, including when clearing a name. Consumers refresh snapshots to observe aliases; the sequence is not an alias ETag because agent.name is silent.",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://luvus.dev/protocol/uhp/v1/event-catalog.schema.json",
   "title": "Luvus Universal Harness Protocol general event payload catalog",
@@ -36,6 +37,7 @@
     "pane.renamed",
     "pane.resized",
     "pane.swapped",
+    "pane.transposed",
     "pane.zoomed",
     "server.agent_manifests_reloaded",
     "tab.closed",
@@ -55,6 +57,7 @@
     "task.needs_compaction",
     "task.ready",
     "task.released",
+    "task.retried",
     "task.started",
     "task.updated",
     "terminal.closed",
@@ -100,6 +103,7 @@
     "pane.renamed": { "$ref": "#/$defs/pane_renamed" },
     "pane.resized": { "$ref": "#/$defs/pane_resized" },
     "pane.swapped": { "$ref": "#/$defs/pane_swapped" },
+    "pane.transposed": { "$ref": "#/$defs/pane_only" },
     "pane.zoomed": { "$ref": "#/$defs/pane_zoomed" },
     "server.agent_manifests_reloaded": { "$ref": "#/$defs/manifests_reloaded" },
     "tab.closed": { "$ref": "#/$defs/tab_only" },
@@ -119,11 +123,12 @@
     "task.needs_compaction": { "$ref": "#/$defs/task_needs_compaction" },
     "task.ready": { "$ref": "#/$defs/id_only" },
     "task.released": { "$ref": "#/$defs/task_released" },
+    "task.retried": { "$ref": "#/$defs/task_retried" },
     "task.started": { "$ref": "#/$defs/task_started" },
     "task.updated": { "$ref": "#/$defs/task" },
-    "terminal.closed": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/event.schema.json#/oneOf/1/properties/data" },
+    "terminal.closed": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/event.schema.json#/$defs/closed_data" },
     "terminal.created": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/event.schema.json#/oneOf/1/properties/data" },
-    "terminal.exited": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/event.schema.json#/oneOf/1/properties/data" },
+    "terminal.exited": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/event.schema.json#/$defs/exited_data" },
     "terminal.metadata_changed": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/event.schema.json#/oneOf/1/properties/data" },
     "terminal.moved": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/event.schema.json#/oneOf/1/properties/data" },
     "terminal.output_ready": { "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/event.schema.json#/oneOf/1/properties/data" },
@@ -184,6 +189,7 @@
       "properties": {
         "automation_id": { "type": "string" },
         "run_id": { "type": "string" },
+        "retry_of": { "type": "string" },
         "task_id": { "type": "string" },
         "pane": { "type": "string" },
         "scheduled_at": { "type": "integer", "minimum": 0 },
@@ -332,6 +338,7 @@
       }
     },
     "agent_status": {
+      "description": "This event can represent identity or metadata changes with unchanged status. Such events cannot complete agent.prompt wait=true. The agent_prompt response and prompt-failure data, not this event payload, carry observed_state for a new working or blocked transition; this is not confirmation that prompt text was consumed.",
       "type": "object",
       "additionalProperties": false,
       "required": ["pane", "status", "agent", "cwd", "project", "branch", "authority"],
@@ -355,7 +362,8 @@
         "agent": { "type": "string" },
         "kind": { "type": "string" },
         "message": { "type": "string" },
-        "tool": { "type": "string" }
+        "tool": { "type": "string" },
+        "notification_type": { "type": "string" }
       }
     },
     "authority_reported": {
@@ -390,10 +398,11 @@
     "task": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "title", "status", "assignee", "deps", "paths", "gate", "outputs", "notes", "worktree", "branch", "context", "created", "updated"],
+      "required": ["id", "title", "status", "assignee", "deps", "paths", "gate", "outputs", "notes", "worktree", "branch", "context", "attempt", "previous_attempts", "created", "updated"],
       "properties": {
         "id": { "type": "string" },
         "title": { "type": "string" },
+        "prompt": { "type": ["string", "null"] },
         "status": { "enum": ["queued", "claimed", "running", "blocked", "review", "done", "merging", "merged", "failed"] },
         "assignee": { "type": ["integer", "null"], "minimum": 1 },
         "deps": { "type": "array", "items": { "type": "string" } },
@@ -405,9 +414,32 @@
         "branch": { "type": ["string", "null"] },
         "mode": { "enum": ["worktree", "workspace"] },
         "workspace_worker": { "$ref": "#/$defs/workspace_worker" },
+        "project": { "$ref": "#/$defs/task_project" },
         "context": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "attempt_started_at": { "type": "integer", "minimum": 0 },
+        "attempt_finished_at": { "type": "integer", "minimum": 0 },
+        "previous_attempts": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/task_attempt" }
+        },
         "created": { "type": "integer", "minimum": 0 },
         "updated": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "task_attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number", "final_status", "finished_at"],
+      "properties": {
+        "number": { "type": "integer", "minimum": 1 },
+        "final_status": { "enum": ["blocked", "review", "done", "failed"] },
+        "branch": { "type": "string" },
+        "worktree": { "type": "string" },
+        "started_at": { "type": "integer", "minimum": 0 },
+        "finished_at": { "type": "integer", "minimum": 0 },
+        "completion_source": { "enum": ["command", "gate", "automation"] }
       }
     },
     "workspace_worker": {
@@ -420,11 +452,29 @@
         "root": { "type": "string" }
       }
     },
+    "task_project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace_id", "root"],
+      "properties": {
+        "workspace_id": { "type": "string" },
+        "root": { "type": "string" }
+      }
+    },
     "task_released": {
       "oneOf": [
         { "$ref": "#/$defs/task" },
         { "$ref": "#/$defs/id_only" }
       ]
+    },
+    "task_retried": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "attempt"],
+      "properties": {
+        "id": { "type": "string" },
+        "attempt": { "type": "integer", "minimum": 2 }
+      }
     },
     "task_started": {
       "type": "object",

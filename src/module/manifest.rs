@@ -42,9 +42,28 @@ pub struct ModuleManifest {
     /// content arrives later through `luvus bar push` (`ui.bar.push` on the API).
     #[serde(default)]
     pub bars: Vec<BarWidgetEntry>,
+    /// Optional synchronous worktree provider. Luvus writes one versioned JSON
+    /// request to stdin and expects the operation-specific stdout contract.
+    #[serde(default)]
+    pub worktree_provider: Option<WorktreeProvider>,
     /// User-editable settings rendered in Settings → Modules (docs/13 §3.6).
     #[serde(default)]
     pub settings: Vec<SettingSpec>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WorktreeProvider {
+    /// Fixed argv for creation requests.
+    pub command: Vec<String>,
+    /// Optional fixed argv for explicit removal requests. When absent, Luvus
+    /// retains its built-in Git removal behavior.
+    #[serde(default)]
+    pub remove_command: Option<Vec<String>>,
+    /// The remove command binds confirmed UI deletion to expected_identity.
+    #[serde(default)]
+    pub identity_bound_remove: bool,
+    #[serde(default)]
+    pub platforms: Option<Vec<String>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -73,6 +92,75 @@ pub struct Action {
     #[serde(default)]
     pub platforms: Option<Vec<String>>,
     pub command: Vec<String>,
+    /// Optional `$name` exposure in Commander. Ordinary action invocations do
+    /// not use this metadata or receive Commander input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander: Option<CommanderAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommanderTarget {
+    None,
+    Pane,
+    Agent,
+    Tab,
+    Workspace,
+}
+
+impl CommanderTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pane => "pane",
+            Self::Agent => "agent",
+            Self::Tab => "tab",
+            Self::Workspace => "workspace",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommanderInput {
+    None,
+    Text,
+}
+
+impl CommanderInput {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Text => "text",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommanderConfirmation {
+    #[default]
+    Required,
+    None,
+}
+
+impl CommanderConfirmation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommanderAction {
+    pub name: String,
+    pub target: CommanderTarget,
+    pub input: CommanderInput,
+    #[serde(default)]
+    pub confirmation: CommanderConfirmation,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -236,6 +324,7 @@ impl ModuleManifest {
             check_platforms(s.platforms.as_ref(), &format!("startup {i}"))?;
         }
         let mut action_ids = HashSet::new();
+        let mut commander_names = HashSet::new();
         for a in &self.actions {
             if !valid_local_id(&a.id) {
                 return Err(format!(
@@ -248,6 +337,25 @@ impl ModuleManifest {
             }
             check_argv(&a.command, &format!("action {}", a.id))?;
             check_platforms(a.platforms.as_ref(), &format!("action {}", a.id))?;
+            if let Some(commander) = &a.commander {
+                let name = &commander.name;
+                if name.len() > 64
+                    || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'_' | b'-')
+                    })
+                {
+                    return Err(format!(
+                        "action {}: invalid Commander name {:?} (use [a-z][a-z0-9_-]*, ≤64)",
+                        a.id, name
+                    ));
+                }
+                if !commander_names.insert(name.as_str()) {
+                    return Err(format!("duplicate Commander name: {name}"));
+                }
+            }
             for c in a.contexts.iter().flatten() {
                 if !KNOWN_CONTEXTS.contains(&c.as_str()) {
                     return Err(format!(
@@ -275,6 +383,13 @@ impl ModuleManifest {
         for e in &self.events {
             check_argv(&e.command, &format!("event {}", e.on))?;
             check_platforms(e.platforms.as_ref(), &format!("event {}", e.on))?;
+        }
+        if let Some(provider) = &self.worktree_provider {
+            check_argv(&provider.command, "worktree_provider")?;
+            if let Some(command) = &provider.remove_command {
+                check_argv(command, "worktree_provider.remove_command")?;
+            }
+            check_platforms(provider.platforms.as_ref(), "worktree_provider")?;
         }
         let mut setting_keys = HashSet::new();
         for s in &self.settings {
@@ -361,6 +476,13 @@ impl ModuleManifest {
             .collect()
     }
 
+    /// Worktree provider command when declared and allowed on this platform.
+    pub fn worktree_provider(&self) -> Option<&WorktreeProvider> {
+        self.worktree_provider
+            .as_ref()
+            .filter(|provider| allowed_on(provider.platforms.as_ref()))
+    }
+
     /// Find a setting spec by key.
     pub fn setting(&self, key: &str) -> Option<&SettingSpec> {
         self.settings.iter().find(|s| s.key == key)
@@ -402,6 +524,7 @@ pub const KNOWN_EVENTS: &[&str] = &[
     "task.ready",
     "task.done",
     "task.released",
+    "task.retried",
     "task.deleted",
     "task.merged",
     "task.merge_started",
@@ -517,6 +640,7 @@ mod tests {
             panes: vec![],
             docks: vec![],
             bars: vec![],
+            worktree_provider: None,
             settings: vec![],
         }
     }
@@ -528,6 +652,7 @@ mod tests {
             contexts: None,
             platforms: None,
             command: vec!["echo".into(), "hi".into()],
+            commander: None,
         }
     }
 
@@ -536,6 +661,35 @@ mod tests {
         let mut m = base();
         m.actions.push(action("refresh"));
         assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn worktree_provider_validates_command_and_platform_gate() {
+        let mut manifest = base();
+        manifest.worktree_provider = Some(WorktreeProvider {
+            command: Vec::new(),
+            remove_command: None,
+            identity_bound_remove: false,
+            platforms: None,
+        });
+        assert!(manifest.validate().unwrap_err().contains("non-empty argv"));
+
+        manifest.worktree_provider = Some(WorktreeProvider {
+            command: vec!["provider".into()],
+            remove_command: Some(Vec::new()),
+            identity_bound_remove: false,
+            platforms: None,
+        });
+        assert!(manifest.validate().unwrap_err().contains("remove_command"));
+
+        manifest.worktree_provider = Some(WorktreeProvider {
+            command: vec!["provider".into()],
+            remove_command: None,
+            identity_bound_remove: false,
+            platforms: Some(vec!["never-this-platform".into()]),
+        });
+        assert!(manifest.validate().is_ok());
+        assert!(manifest.worktree_provider().is_none());
     }
 
     #[test]
@@ -723,6 +877,10 @@ default = 20
 min = 1
 max = 99
 step = 1
+
+[worktree_provider]
+command = ["./create-worktree"]
+remove_command = ["./remove-worktree"]
 "#,
         )
         .expect("parses");
@@ -731,6 +889,18 @@ step = 1
         assert_eq!(m.actions_for_context("workspace").len(), 1);
         assert!(m.setting("token").unwrap().secret);
         assert_eq!(m.setting("limit").unwrap().default_value(), 20);
+        assert_eq!(
+            m.worktree_provider().unwrap().command,
+            ["./create-worktree"]
+        );
+        assert_eq!(
+            m.worktree_provider()
+                .unwrap()
+                .remove_command
+                .as_ref()
+                .unwrap(),
+            &["./remove-worktree".to_string()]
+        );
     }
 
     #[test]
@@ -751,5 +921,63 @@ step = 1
             m.actions.push(action("dup"));
         }
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn commander_action_metadata_is_opt_in_and_validated() {
+        let mut m = base();
+        m.actions.push(action("ordinary"));
+        let encoded = toml::to_string(&m).unwrap();
+        let restored: ModuleManifest = toml::from_str(&encoded).unwrap();
+        assert!(restored.actions[0].commander.is_none());
+
+        m.actions[0].commander = Some(CommanderAction {
+            name: "review_changes".into(),
+            target: CommanderTarget::Agent,
+            input: CommanderInput::Text,
+            confirmation: CommanderConfirmation::Required,
+        });
+        assert!(m.validate().is_ok());
+        for invalid in [
+            "",
+            "9review",
+            "Review",
+            "review/name",
+            "a b",
+            "a$",
+            &"a".repeat(65),
+        ] {
+            m.actions[0].commander.as_mut().unwrap().name = invalid.into();
+            assert!(m.validate().is_err(), "{invalid:?} should be rejected");
+        }
+        m.actions[0].commander.as_mut().unwrap().name = "review".into();
+        let mut second = action("other");
+        second.commander = m.actions[0].commander.clone();
+        m.actions.push(second);
+        assert!(m
+            .validate()
+            .unwrap_err()
+            .contains("duplicate Commander name"));
+    }
+
+    #[test]
+    fn commander_manifest_example_parses_with_default_confirmation() {
+        let m: ModuleManifest = toml::from_str(
+            r#"id = "example.review"
+name = "Review"
+version = "0.1.0"
+min_luvus_version = "0.1.0"
+[[actions]]
+id = "review"
+title = "Review a pane"
+command = ["python3", "review.py"]
+commander = { name = "review", target = "pane", input = "text" }
+"#,
+        )
+        .unwrap();
+        m.validate().unwrap();
+        let exposure = m.actions[0].commander.as_ref().unwrap();
+        assert_eq!(exposure.confirmation, CommanderConfirmation::Required);
+        assert_eq!(exposure.target, CommanderTarget::Pane);
     }
 }

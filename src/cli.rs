@@ -1,7 +1,7 @@
 //! CLI client (M4): `luvus pane …` / `luvus ping` / `luvus events` connect to
 //! the session socket, send one JSON request, and print the reply. See docs/08.
 
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -27,6 +27,7 @@ pub fn is_cli(args: &[String]) -> bool {
                 | "api"
                 | "logs"
                 | "uhp"
+                | "web"
                 | "socket"
                 | "module"
                 | "theme"
@@ -45,6 +46,7 @@ pub fn is_cli(args: &[String]) -> bool {
                 | "update"
                 | "skill"
                 | "session"
+                | "machine"
         )
     )
 }
@@ -76,6 +78,7 @@ Commands:
   bar          Publish and arrange top and bottom status widgets
   ui           Configure sidebars, docks, and notifications
   session      List, attach, stop, and delete server sessions
+  machine      Save, inspect, and open Luvus machines over SSH
   server       Inspect and manage the selected background server
   integration  Manage agent session-resume integrations
   skill        Enable, inspect, show, or remove the bundled agent skill
@@ -83,6 +86,7 @@ Commands:
   search       Search across pane scrollback
   events       Stream live status changes
   uhp          Discover and use Universal Harness Protocol 1.0
+  web          Serve the optional browser client
   attach       Open the TUI focused on one pane
   doctor       Check optional external tools
   update       Check for and install a newer Luvus release
@@ -90,7 +94,6 @@ Commands:
 Examples:
   luvus agent list                       See every active coding agent
   luvus pane split --down                Add a pane below the focused pane
-  luvus workspace open .                 Open the current project
   luvus session attach docs              Start or open a named session
   luvus --session docs agent list        Control a session from another terminal
 
@@ -99,7 +102,6 @@ Options:
   --remote <host> [ssh args]             Attach through SSH
   --version, -V                          Print the version
   --help, -h                             Show this help
-
 Help:
   luvus help all                         Complete CLI reference
   luvus help <topic> [command]           Focus on one area or command
@@ -141,26 +143,28 @@ tabs:
   tab close [<n>]            close a tab (default: active)
 
 panes / agents:
-  pane list                  list panes and read-only history metrics in the current tab
-  pane split [<id>] [--down] [--no-focus]   split a pane (default: side by side, creates a workspace if empty)
+  pane list [--all-tabs]     list panes across every workspace and tab
+  pane list --current-tab    list panes and read-only history metrics in the current tab
+  pane split [<id>] [--auto|--right|--down] [--no-focus] [--cwd <path>]   split a pane (default: auto by size, creates a workspace if empty)
+  pane transpose [<id>]     transpose the nearest split without changing focus
   pane focus <id>            focus a pane (jumps to its workspace/tab)
   pane move [<id>] (--tab <n> | --new-tab)  move a pane within its workspace
   pane run [<id>] <cmd...>   run a command in a pane
-  pane send [<id>] <text>    send raw text to a pane
+  pane send [<id>] <text>    paste text into a pane
   pane read [<id>]           print a pane's recent output
   pane status [<id>]         print a pane's agent status and history metrics (any workspace)
   pane processes [<id>]      list cached executable identities without exposing arguments
   pane name <name>           name a pane so you can mention it (--pane <id>; --clear)
   pane close [<id>]          close a pane
   agent list                 list every agent across all workspaces/tabs
-  agent start <name> --kind <k> [--pane <id> | --anchor <id>] [--down] [--timeout <s>] [-- <args>]
+  agent start <name> --kind <k> [--pane <id> | --anchor <id>] [--auto|--right|--down] [--timeout <s>] [-- <args>]
                              spawn beside an anchor or reuse a pane, wait until ready, name it
   agent fork <target> [--name <alias>] [--no-focus]
                              fork a supported agent's session into a sibling pane
   agent name <name>          alias the current agent, same as pane name (--clear to drop)
-  agent prompt <target> <text> [--wait] [--until STATE] [--timeout <s>]
+  agent prompt <target> <text> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout <s>]
                              atomically prompt and optionally wait (send is an alias)
-  agent send <target> <text> [--wait] [--until STATE] [--timeout <s>]
+  agent send <target> <text> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout <s>]
                              compatibility alias for agent prompt
   agent keys <target> <key>...   send control keys (enter, esc, ctrl+c, up, …)
   agent read <target> [--lines N] [--source visible|recent]   print an agent's output
@@ -213,6 +217,10 @@ appearance:
   ui dock push --id <id> [--title <t>] [--side left|right] [--rows <json>]
                              feed a module's sidebar dock its rows (JSON array,
                              or piped on stdin). See docs/29 + the website
+  ui agent-title push [--titles <json>]
+                             set AGENTS sidebar titles for live and resumable rows
+  ui agent-title clear [--pane <id>|--agent <id> --session-id <id>]
+                             clear module-provided AGENTS sidebar titles
   ui notification push --text <text> [--level info|success|warning|error]
   ui notification clear [--dedupe-key <key>]
   ui toast <text>            flash a one-line message in the UI
@@ -223,6 +231,7 @@ modules (extensions):
   module info <id>           show a module's actions / panes / events / source
   module link <path>         register a local module dir (--disabled to skip enabling)
   module install <owner>/<repo>[/sub] [--ref REF] [--yes]   install from GitHub
+  module update <id> [--ref REF] [--yes]   update an installed module
   module unlink <id>         remove a module from the registry
   module uninstall <id>      unlink + delete a git-installed module's checkout
   module enable <id> | disable <id>
@@ -267,22 +276,23 @@ worktrees:
   worktree list              list the current repo's worktrees
   worktree create <branch>   create a worktree + workspace for <branch>
   worktree open <path>       open an existing worktree as a workspace
-  worktree remove <path>     remove a worktree (its branch is kept)
+  worktree remove <path> [--force]   remove a worktree (its branch is kept)
 
 orchestration (multiple agents on one project, docs/22):
-  task add \"<title>\" [--paths <glob>...] [--dep <id>...] [--gate <cmd>]
+  task add \"<title>\" [--prompt <text>|--prompt-file <path>] [--paths <glob>...] [--dep <id>...] [--gate <cmd>] [--workspace-id <id>]
   task list                  list all tasks + their status/assignee
   task get <id>              show one task
   task claim <id>            claim a task for this pane (deps must be done)
   task next [--start] [--agent <cmd>] [--mode worktree|workspace] [--workspace-id <id>]
                              claim the next ready task (--start creates a worker)
-  task start <id> [--branch <b>] [--agent <cmd>] [--mode worktree|workspace] [--workspace-id <id>]
-                             start a worker (worktree default; workspace shares checkout)
+  task start <id> [--branch <b>] [--agent <cmd>] [--mode worktree|workspace] [--workspace-id <id>] [--no-focus]
+                             start a worker (worktree default; --no-focus preserves the view)
   task heartbeat <id> --context-used <0..1>
                              report model context-window use, not task progress
                              (>85% blocks done; --context remains accepted)
-  task update <id> [--status <s>] [--output <o>] [--note <n>]
+  task update <id> [--prompt <text>|--prompt-file <path>] [--status <s>] [--output <o>] [--note <n>]
   task done <id>             mark done + release its leases
+  task retry <id>            queue a fresh attempt without deleting previous work
   task merge <id>            integrate the task's branch into luvus/integration
                              (isolated worktree, conflicts block the task)
   task release <id>          return a claimed task to the queue
@@ -321,14 +331,36 @@ universal harness protocol:
   uhp schema                print the complete installed UHP JSON Schema bundle
   uhp snapshot              print a fenced session snapshot for harness bootstrap
   uhp events                stream sequenced UHP events
-  uhp access [--control] [--ttl <seconds> | --no-expiry]   expose scoped UHP through a private provider endpoint
+  uhp access [--machines] [--control] [--ttl <seconds> | --no-expiry]
+                             expose scoped UHP through a private provider endpoint
   uhp proxy                 forward one JSON request from stdin to the selected server
+
+web access:
+  web [--control|--read-only] [--port <port>] [--max-devices <1-8>] [--ticket-ttl <seconds>] [--public-url <origin>] [--origin <origin>] [--no-open]
+                             serve the optional loopback browser client (read-only by default)
 
 sessions:
   session list [--json]      list default and named server sessions
   session attach <name>      start or attach the named session
   session stop <name> [--json]    stop only the named session and its panes
   session delete <name> [--json]  delete a stopped named session
+
+machines:
+  machine add <id> --host <ssh-alias> [--label <label>] [--session <name>] [--remote-binary <path>] [--install] [--disabled] [--revision <n>]
+                             provision and validate one SSH machine
+  machine list               list saved machine profiles and catalog revision
+  machine show <id>          show one saved profile
+  machine rename <id> <label> [--revision <n>]
+                             rename a profile with optional revision protection
+  machine enable <id> [--install] [--revision <n>]
+  machine disable <id> [--revision <n>]
+                             provision and enable after a bounded SSH probe, or disable locally
+  machine remove <id> [--revision <n>]
+                             remove only the local profile; remote panes stay alive
+  machine status <id>        verify the running selected server and workspace projection
+  machine sessions <id>      list named sessions through bounded SSH
+  machine open <id> [--session <name>]
+                             attach using the verified absolute remote binary
 
 remote:
   --remote <host> [ssh args] attach to a luvus session on <host> over plain ssh
@@ -337,10 +369,10 @@ server:
   server status              is the server running, and what version
   server start               start the background server if it isn't up
   server stop                stop the server (and all panes)
-  server restart             stop + start (load a newly-installed binary)
+  server restart [--all]     stop + start (load a newly-installed binary)
   server update-manifest     fetch the latest agent-detection rules from luvus.dev
                              (applies live if the server is up; else on next start)
-  integration install|uninstall <claude|copilot|codex|antigravity|opencode|kimi|grok|hermes|omp>
+  integration install|uninstall <claude|copilot|codex|antigravity|letta|opencode|kimi|grok|hermes|omp|devin>
                              add/remove luvus's session-resume hook (uninstall
                              removes only luvus's hook, never the agent)
 ";
@@ -482,6 +514,11 @@ fn run_inner(args: &[String]) -> Result<i32> {
     {
         return module_install(args, crate::i18n::cli::Context::configured());
     }
+    if args.get(1).map(String::as_str) == Some("module")
+        && args.get(2).map(String::as_str) == Some("update")
+    {
+        return module_update(args, crate::i18n::cli::Context::configured());
+    }
     // `module search` is a read-only GitHub lookup — no server involved.
     if args.get(1).map(String::as_str) == Some("module")
         && args.get(2).map(String::as_str) == Some("search")
@@ -603,6 +640,7 @@ fn help_topic_has_subcommands(topic: &str) -> bool {
             | "bar"
             | "ui"
             | "session"
+            | "machine"
             | "server"
             | "integration"
             | "skill"
@@ -616,7 +654,7 @@ fn normalize_help_topic(topic: &str) -> Option<&str> {
         "workspace" | "tab" | "pane" | "agent" | "files" | "git" | "mission" | "worktree"
         | "task" | "lease" | "automation" | "module" | "theme" | "bar" | "ui" | "session"
         | "server" | "integration" | "diff" | "skill" | "wait" | "search" | "events" | "uhp"
-        | "ping" | "doctor" | "update" | "attach" => Some(topic),
+        | "machine" | "web" | "ping" | "doctor" | "update" | "attach" => Some(topic),
         "node" => Some("pane"),
         "remote" | "--remote" => Some("remote"),
         _ => None,
@@ -749,7 +787,7 @@ fn write_topic_help_english(
             detailed_section("bars:\n", "\nappearance:\n"),
         ),
         "ui" => (
-            "luvus ui <sidebar|dock|notification|toast> [args]",
+            "luvus ui <sidebar|dock|agent-title|notification|toast> [args]",
             detailed_section("appearance:\n", "\nmodules (extensions):\n"),
         ),
         "module" => (
@@ -803,7 +841,15 @@ fn write_topic_help_english(
         ),
         "uhp" => (
             "luvus uhp <capabilities|schema|snapshot|events|access|proxy>",
-            detailed_section("universal harness protocol:\n", "\nsessions:\n"),
+            detailed_section("universal harness protocol:\n", "\nweb access:\n"),
+        ),
+        "web" => (
+            "luvus [--session <name>] web [options]",
+            detailed_section("web access:\n", "\nsessions:\n"),
+        ),
+        "machine" => (
+            "luvus machine <command> [args]",
+            detailed_section("machines:\n", "\nremote:\n"),
         ),
         "remote" => (
             "luvus [--session <name>] --remote <host> [ssh args]",
@@ -1385,6 +1431,7 @@ fn module_install(args: &[String], context: crate::i18n::cli::Context) -> Result
     let params = json!({
         "path": installed.root.display().to_string(),
         "source": installed.source,
+        "git_ref": installed.git_ref,
     });
     match send_request("module.link", params) {
         Ok(v) if v.get("error").is_some() => {
@@ -1414,6 +1461,80 @@ fn module_install(args: &[String], context: crate::i18n::cli::Context) -> Result
             Ok(0)
         }
     }
+}
+
+/// Update is a local approval/build followed by a fenced server-side adoption.
+/// Never fall back to editing the registry on an ambiguous transport failure.
+fn module_update(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
+    let (id, git_ref, yes) = parse_module_update(&args[3.min(args.len())..])?;
+    let response = send_request("module.info", json!({"id":id}))?;
+    ensure_api_success(&response)?;
+    if response["result"]["source"].is_null() {
+        return Err(anyhow!(context.text(
+            "linked modules must be updated in their own working directory"
+        )));
+    }
+    let target: crate::module::install::UpdateTarget = serde_json::from_value(
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("missing module.info result"))?,
+    )?;
+    // Check support before any download/build (older servers cannot adopt).
+    let capabilities = send_request("uhp.capabilities", json!({}))?;
+    ensure_api_success(&capabilities)?;
+    if !capabilities["result"]["methods"]
+        .as_array()
+        .is_some_and(|methods| methods.iter().any(|method| method == "module.update"))
+    {
+        return Err(anyhow!(
+            context.text("selected server does not support module.update")
+        ));
+    }
+    let installed = crate::module::install::update(&target, git_ref.as_deref(), yes)?;
+    let response = send_request(
+        "module.update",
+        json!({
+            "id": target.id,
+            "path": installed.root,
+            "source": installed.source,
+            "git_ref": installed.git_ref,
+            "expected_root": target.root,
+            "expected_source": target.source,
+            "expected_ref": target.git_ref,
+        }),
+    )?;
+    ensure_api_success(&response)?;
+    println!(
+        "{} {} ({})",
+        context.text("updated"),
+        installed.id,
+        installed.source
+    );
+    Ok(0)
+}
+
+fn parse_module_update(args: &[String]) -> Result<(String, Option<String>, bool)> {
+    let usage = "usage: luvus module update <id|owner/repo[/sub]> [--ref REF] [--yes]";
+    let mut id = None;
+    let mut git_ref = None;
+    let mut yes = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--ref" if git_ref.is_none() => {
+                let value = args
+                    .next()
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .ok_or_else(|| anyhow!(usage))?;
+                git_ref = Some(value.clone());
+            }
+            "--yes" | "-y" if !yes => yes = true,
+            value if !value.starts_with('-') && id.is_none() => id = Some(arg.clone()),
+            _ => return Err(anyhow!(usage)),
+        }
+    }
+    Ok((id.ok_or_else(|| anyhow!(usage))?, git_ref, yes))
 }
 
 /// `luvus doctor` — report which optional external tools are present. The core
@@ -1908,7 +2029,34 @@ fn agent_wait_fallback(response: &Value, uses_statuses: bool) -> AgentWaitFallba
 #[derive(Debug, PartialEq)]
 enum AgentStartTarget {
     Existing(String),
-    Split { anchor: Option<String>, down: bool },
+    Split {
+        anchor: Option<String>,
+        /// Present only for an explicit `--auto`/`--right`/`--down`. Omitted
+        /// direction lets an older server keep its left/right default.
+        direction: Option<&'static str>,
+    },
+}
+
+/// The explicit split direction in `args`, or `None` when the caller passed no
+/// direction flag. `None` deliberately leaves `direction` off the wire so an
+/// older server keeps its own left/right default instead of rejecting `"auto"`.
+/// `--stack` is the documented alias for `--down`.
+fn split_direction_flag(args: &[String], usage: &str) -> Result<Option<&'static str>> {
+    let down = args.iter().any(|a| a == "--down" || a == "--stack");
+    let right = args.iter().any(|a| a == "--right");
+    let auto = args.iter().any(|a| a == "--auto");
+    if usize::from(down) + usize::from(right) + usize::from(auto) > 1 {
+        return Err(anyhow!("{usage}"));
+    }
+    Ok(if down {
+        Some("down")
+    } else if right {
+        Some("right")
+    } else if auto {
+        Some("auto")
+    } else {
+        None
+    })
 }
 
 fn parse_agent_start_target(args: &[String], caller: Option<String>) -> Result<AgentStartTarget> {
@@ -1919,22 +2067,26 @@ fn parse_agent_start_target(args: &[String], caller: Option<String>) -> Result<A
             "agent start accepts either --pane <id> or --anchor <id>, not both"
         ));
     }
+    let direction = split_direction_flag(
+        args,
+        "agent start accepts only one of --auto, --right, or --down",
+    )?;
     Ok(match pane {
         Some(pane) => AgentStartTarget::Existing(pane),
         None => AgentStartTarget::Split {
             anchor: anchor.or(caller),
-            down: args.iter().any(|a| a == "--down"),
+            direction,
         },
     })
 }
 
-/// `luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--down] [--timeout S] [-- <extra…>]` —
+/// `luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--auto|--right|--down] [--timeout S] [-- <extra…>]` —
 /// spawn a coding agent in a sibling pane (or a given one), wait until detection
 /// recognizes it, and give it a name, all in one command. Exit 0 when it becomes
 /// ready, 2 if it did not within the timeout (the pane and name still exist).
 fn agent_start_cmd(args: &[String]) -> Result<i32> {
     let name = args.get(3).cloned().ok_or_else(|| {
-        anyhow!("usage: luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--down] [--timeout S] [-- <extra>]")
+        anyhow!("usage: luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--auto|--right|--down] [--timeout S] [-- <extra>]")
     })?;
     let separator = args.iter().position(|arg| arg == "--");
     let options = &args[..separator.unwrap_or(args.len())];
@@ -1953,14 +2105,13 @@ fn agent_start_cmd(args: &[String]) -> Result<i32> {
         AgentStartTarget::Existing(pane) => {
             params.insert("pane".into(), json!(pane));
         }
-        AgentStartTarget::Split { anchor, down } => {
+        AgentStartTarget::Split { anchor, direction } => {
             if let Some(anchor) = anchor {
                 params.insert("anchor".into(), json!(anchor));
             }
-            params.insert(
-                "direction".into(),
-                json!(if down { "down" } else { "right" }),
-            );
+            if let Some(direction) = direction {
+                params.insert("direction".into(), json!(direction));
+            }
         }
     }
     if let Some(timeout) = flag(options, "--timeout") {
@@ -1988,7 +2139,7 @@ fn validate_agent_start_options(args: &[String]) -> Result<()> {
                 }
                 index += 2;
             }
-            "--down" => index += 1,
+            "--down" | "--stack" | "--right" | "--auto" => index += 1,
             option if option.starts_with("--") => {
                 return Err(anyhow!("unknown agent start option: {option}"));
             }
@@ -2125,15 +2276,17 @@ fn skill_cmd(rest: &[String], context: crate::i18n::cli::Context) -> Result<i32>
     }
 }
 
-/// `luvus agent prompt <target> <text…> [--wait] [--until STATE] [--timeout S]`
+/// `luvus agent prompt <target> <text…> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout S]`
 /// submits and waits as one server-owned operation. `agent send` remains a
 /// compatibility alias.
 fn agent_send_cmd(args: &[String]) -> Result<i32> {
     let target = args.get(3).cloned().ok_or_else(|| {
-        anyhow!("usage: luvus agent prompt <target> <text> [--wait] [--until STATE] [--timeout S]")
+        anyhow!("usage: luvus agent prompt <target> <text> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout S]")
     })?;
     let mut text_parts = Vec::new();
     let mut wait = false;
+    let mut strict = false;
+    let mut terminal_id = None;
     let mut until = Vec::new();
     let mut timeout = None;
     let mut positional_only = false;
@@ -2153,6 +2306,22 @@ fn agent_send_cmd(args: &[String]) -> Result<i32> {
             "--wait" => {
                 wait = true;
                 index += 1;
+            }
+            "--strict" => {
+                strict = true;
+                index += 1;
+            }
+            "--terminal-id" => {
+                let id = args.get(index + 1).ok_or_else(|| {
+                    anyhow!("--terminal-id requires a 32-character lowercase hex ID")
+                })?;
+                if !crate::terminal::backend::valid_id(id) {
+                    return Err(anyhow!(
+                        "--terminal-id requires a 32-character lowercase hex ID"
+                    ));
+                }
+                terminal_id = Some(id.clone());
+                index += 2;
             }
             "--until" => {
                 until.push(
@@ -2188,6 +2357,12 @@ fn agent_send_cmd(args: &[String]) -> Result<i32> {
     params.insert("target".into(), json!(target));
     params.insert("text".into(), json!(text));
     params.insert("wait".into(), json!(wait));
+    if strict {
+        params.insert("strict".into(), json!(true));
+    }
+    if let Some(terminal_id) = terminal_id {
+        params.insert("terminal_id".into(), json!(terminal_id));
+    }
     if !until.is_empty() {
         params.insert("until".into(), json!(until));
     }
@@ -2201,13 +2376,17 @@ fn agent_send_cmd(args: &[String]) -> Result<i32> {
         "{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
-    Ok(if !ok {
-        1
-    } else if wait && !matched {
-        2
-    } else {
-        0
-    })
+    Ok(
+        if wait && response["error"]["code"] == "agent_not_running" {
+            2
+        } else if !ok {
+            1
+        } else if wait && !matched {
+            2
+        } else {
+            0
+        },
+    )
 }
 
 fn pane_status_from_response(response: &Value) -> Result<Option<&str>> {
@@ -2338,9 +2517,17 @@ pub fn request_attach(pane: &str) -> Result<()> {
 
 /// One request/response over the control socket.
 pub(crate) fn send_request(method: &str, params: Value) -> Result<Value> {
-    let path = crate::persist::cli_socket_path();
-    let mut stream = crate::ipc::transport::connect(&path)
-        .map_err(|error| server_connect_error(&path, error))?;
+    send_request_to(&crate::persist::cli_socket_path(), method, params)
+}
+
+/// One request/response over a specific server's control socket.
+pub(crate) fn send_request_to(
+    path: &std::path::Path,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let mut stream =
+        crate::ipc::transport::connect(path).map_err(|error| server_connect_error(path, error))?;
     let req = json!({ "id": "1", "method": method, "params": params });
     writeln!(stream, "{req}")?;
     let mut reader = BufReader::new(stream);
@@ -2435,6 +2622,7 @@ fn register_directly(installed: &crate::module::install::Installed) -> Result<()
         root: installed.root.clone(),
         enabled: true,
         source: Some(installed.source.clone()),
+        git_ref: installed.git_ref.clone(),
         manifest,
         warning: None,
     });
@@ -2589,6 +2777,13 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                 } else {
                     "usage: luvus search <text...> [--case]"
                 }));
+            }
+            let query_bytes = query
+                .iter()
+                .map(String::len)
+                .fold(query.len().saturating_sub(1), usize::saturating_add);
+            if !fuzzy && query_bytes > crate::search::local::LOCAL_QUERY_BYTES {
+                return Err(anyhow!("exact search query must be at most 4096 bytes"));
             }
             if fuzzy {
                 (
@@ -2839,6 +3034,53 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                     ("ui.dock.move".into(), Value::Object(obj))
                 }
                 _ => ("ui.dock.list".into(), json!({})),
+            }
+        }
+        ("ui", "agent-title") => {
+            let sub = rest.first().map(String::as_str).unwrap_or("");
+            let mut obj = serde_json::Map::new();
+            if let Ok(owner) = std::env::var("LUVUS_MODULE_ID") {
+                obj.insert("owner".into(), json!(owner));
+            }
+            if let Ok(token) = std::env::var(crate::module::runtime::MODULE_TOKEN_ENV) {
+                obj.insert("module_token".into(), json!(token));
+            }
+            match sub {
+                "push" => {
+                    let titles_str = match flag(args, "--titles") {
+                        Some(s) => s,
+                        None => {
+                            use std::io::Read;
+                            let mut s = String::new();
+                            let _ = std::io::stdin().read_to_string(&mut s);
+                            s
+                        }
+                    };
+                    let titles: Value = if titles_str.trim().is_empty() {
+                        json!([])
+                    } else {
+                        serde_json::from_str(&titles_str)
+                            .map_err(|e| anyhow!("--titles must be a JSON array: {e}"))?
+                    };
+                    if !titles.is_array() {
+                        return Err(anyhow!("--titles must be a JSON array"));
+                    }
+                    obj.insert("titles".into(), titles);
+                    ("ui.agent_title.push".into(), Value::Object(obj))
+                }
+                "clear" => {
+                    if let Some(pane) = flag(args, "--pane") {
+                        obj.insert("pane".into(), json!(pane));
+                    }
+                    if let Some(agent) = flag(args, "--agent") {
+                        obj.insert("agent".into(), json!(agent));
+                    }
+                    if let Some(session_id) = flag(args, "--session-id") {
+                        obj.insert("session_id".into(), json!(session_id));
+                    }
+                    ("ui.agent_title.clear".into(), Value::Object(obj))
+                }
+                _ => return Err(anyhow!("usage: luvus ui agent-title push|clear")),
             }
         }
         ("bar", sub) => {
@@ -3157,13 +3399,42 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
 
         ("pane", "split") => {
             let mut obj = serde_json::Map::new();
-            if args.iter().any(|a| a == "--down" || a == "--stack") {
-                obj.insert("direction".to_string(), json!("down"));
+            if let Some(direction) =
+                split_direction_flag(args, "pass only one of --auto, --right, or --down")?
+            {
+                obj.insert("direction".to_string(), json!(direction));
             }
             if args.iter().any(|a| a == "--no-focus") {
                 obj.insert("focus".to_string(), json!(false));
             }
+            for (i, arg) in rest.iter().enumerate() {
+                if arg == "--cwd" {
+                    let raw = rest
+                        .get(i + 1)
+                        .filter(|v| !v.is_empty() && !v.starts_with("--"))
+                        .ok_or_else(|| anyhow!("usage: luvus pane split [<id>] [--cwd <path>]"))?;
+                    if obj.contains_key("cwd") {
+                        return Err(anyhow!("--cwd may be passed only once"));
+                    }
+                    let path = std::path::PathBuf::from(raw);
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        std::env::current_dir()?.join(path)
+                    };
+                    let path = path
+                        .to_str()
+                        .ok_or_else(|| anyhow!("--cwd must be valid UTF-8"))?;
+                    obj.insert("cwd".to_string(), json!(path));
+                }
+            }
             ("pane.split".into(), with_pane(obj))
+        }
+        ("pane", "transpose") => {
+            if rest.len() > 1 || rest.first().is_some_and(|id| id.parse::<u32>().is_err()) {
+                return Err(anyhow!("usage: luvus pane transpose [<id>]"));
+            }
+            ("pane.transpose".into(), with_pane(serde_json::Map::new()))
         }
         ("pane", "focus") => ("pane.focus".into(), with_pane(serde_json::Map::new())),
         ("pane", "move") => {
@@ -3236,6 +3507,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             let text = tail().join(" ");
             let mut obj = serde_json::Map::new();
             obj.insert("text".to_string(), json!(text));
+            obj.insert("paste".to_string(), json!(true));
             ("pane.send_input".into(), with_pane(obj))
         }
         ("pane", "read") => ("pane.read".into(), with_pane(serde_json::Map::new())),
@@ -3286,9 +3558,17 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             if let Some(t) = flag(args, "--tool") {
                 obj.insert("tool".to_string(), json!(t));
             }
+            if let Some(notification_type) = flag(args, "--notification-type") {
+                obj.insert("notification_type".to_string(), json!(notification_type));
+            }
             ("pane.report_event".into(), with_pane(obj))
         }
-        ("pane", "" | "list") => ("pane.list".into(), json!({})),
+        ("pane", "" | "list") => match rest {
+            [] => ("pane.list".into(), json!({"all_tabs": true})),
+            [flag] if flag == "--all-tabs" => ("pane.list".into(), json!({"all_tabs": true})),
+            [flag] if flag == "--current-tab" => ("pane.list".into(), json!({"all_tabs": false})),
+            _ => return Err(anyhow!("usage: luvus pane list [--all-tabs|--current-tab]")),
+        },
         ("pane", other) => {
             return Err(anyhow!(
                 "unknown pane command `{other}`. Try `luvus help pane`."
@@ -3387,7 +3667,12 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                 _ => return Err(anyhow!("usage: luvus module pane open|focus|close …")),
             }
         }
-        ("module", _) => ("module.list".into(), json!({})),
+        ("module", "" | "list") => ("module.list".into(), json!({})),
+        ("module", other) => {
+            return Err(anyhow!(
+                "unknown module command `{other}`. Try `luvus help module`."
+            ))
+        }
 
         ("diff", "refresh") => {
             if !rest.is_empty() {
@@ -3621,7 +3906,31 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
 
         ("worktree", "create") => ("worktree.create".into(), one("branch", arg0())),
         ("worktree", "open") => ("worktree.open".into(), one("path", arg0())),
-        ("worktree", "remove") => ("worktree.remove".into(), one("path", arg0())),
+        ("worktree", "remove") => {
+            let usage = "usage: luvus worktree remove <path> [--force]";
+            let mut path = None;
+            let mut force = false;
+            for value in rest {
+                match value.as_str() {
+                    "--force" if !force => force = true,
+                    "--force" => return Err(anyhow!("--force may be passed only once")),
+                    option if option.starts_with("--") => {
+                        return Err(anyhow!(
+                            "unknown worktree remove option `{option}`. {usage}"
+                        ));
+                    }
+                    value if path.is_none() => path = Some(value.to_string()),
+                    _ => return Err(anyhow!(usage)),
+                }
+            }
+            let path = path.ok_or_else(|| anyhow!(usage))?;
+            let mut params = serde_json::Map::new();
+            params.insert("path".to_string(), json!(path));
+            if force {
+                params.insert("force".to_string(), json!(true));
+            }
+            ("worktree.remove".into(), Value::Object(params))
+        }
         ("worktree", _) => ("worktree.list".into(), json!({})),
 
         ("automation", "create") => {
@@ -3730,13 +4039,27 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
 
         // ── orchestration (docs/22, M0): task ledger + path leases ──────────
         ("task", "add") => {
-            let title = rest.iter().find(|a| !a.starts_with("--")).cloned();
+            let title = rest
+                .first()
+                .filter(|value| !value.starts_with("--"))
+                .cloned()
+                .ok_or_else(|| anyhow!("task add requires a title"))?;
             let mut obj = serde_json::Map::new();
-            obj.insert("title".into(), json!(title.unwrap_or_default()));
+            obj.insert("title".into(), json!(title));
             obj.insert("paths".into(), json!(multi_flag(args, "--paths")));
             obj.insert("deps".into(), json!(multi_flag(args, "--dep")));
+            if let Some(prompt) = task_prompt_arg(args)? {
+                obj.insert("prompt".into(), json!(prompt));
+            }
             if let Some(g) = flag(args, "--gate") {
                 obj.insert("gate".into(), json!(g));
+            }
+            if let Some(workspace_id) = flag(args, "--workspace-id") {
+                obj.insert("workspace_id".into(), json!(workspace_id));
+            }
+            let pv = pane();
+            if !pv.is_null() {
+                obj.insert("pane".into(), pv);
             }
             ("task.add".into(), Value::Object(obj))
         }
@@ -3795,6 +4118,9 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             if let Some(workspace_id) = flag(args, "--workspace-id") {
                 obj.insert("workspace_id".into(), json!(workspace_id));
             }
+            if args.iter().any(|arg| arg == "--no-focus") {
+                obj.insert("focus".into(), json!(false));
+            }
             ("task.start".into(), Value::Object(obj))
         }
         ("task", "claim") => {
@@ -3809,14 +4135,18 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             ("task.claim".into(), Value::Object(obj))
         }
         ("task", "done") => ("task.done".into(), one("id", arg0())),
+        ("task", "retry") => ("task.retry".into(), one("id", arg0())),
         ("task", "delete") => ("task.delete".into(), one("id", arg0())),
         ("task", "merge") => ("task.merge".into(), one("id", arg0())),
         ("task", "release") => ("task.release".into(), one("id", arg0())),
         ("task", "update") => {
+            let id = rest
+                .first()
+                .filter(|value| !value.starts_with("--"))
+                .cloned()
+                .ok_or_else(|| anyhow!("task update requires an id"))?;
             let mut obj = serde_json::Map::new();
-            if let Some(id) = arg0() {
-                obj.insert("id".into(), json!(id));
-            }
+            obj.insert("id".into(), json!(id));
             if let Some(s) = flag(args, "--status") {
                 obj.insert("status".into(), json!(s));
             }
@@ -3825,6 +4155,9 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             }
             if let Some(n) = flag(args, "--note") {
                 obj.insert("note".into(), json!(n));
+            }
+            if let Some(prompt) = task_prompt_arg(args)? {
+                obj.insert("prompt".into(), json!(prompt));
             }
             ("task.update".into(), Value::Object(obj))
         }
@@ -3873,6 +4206,54 @@ fn multi_flag(args: &[String], name: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Read an optional task prompt from argv without allowing a prompt file to
+/// allocate past the same limit enforced by the server and UHP schema.
+fn task_prompt_arg(args: &[String]) -> Result<Option<String>> {
+    let inline = flag(args, "--prompt").filter(|value| !value.starts_with("--"));
+    let file = flag(args, "--prompt-file").filter(|value| !value.starts_with("--"));
+    if inline.is_some() && file.is_some() {
+        return Err(anyhow!("use only one of --prompt and --prompt-file"));
+    }
+    if args.iter().any(|arg| arg == "--prompt") && inline.is_none() {
+        return Err(anyhow!("--prompt requires text"));
+    }
+    if args.iter().any(|arg| arg == "--prompt-file") && file.is_none() {
+        return Err(anyhow!("--prompt-file requires a path"));
+    }
+    if let Some(prompt) = inline {
+        return Ok(Some(prompt));
+    }
+    let Some(path) = file else {
+        return Ok(None);
+    };
+    let file =
+        std::fs::File::open(&path).map_err(|error| anyhow!("cannot read {path}: {error}"))?;
+    // Every normalized LF can occupy at most two source bytes as CRLF. Read
+    // one byte beyond that largest valid representation so an oversized file
+    // is rejected instead of silently accepted after a truncated read.
+    let max_source_bytes = crate::orch::MAX_TASK_PROMPT_BYTES * 2;
+    let mut bytes = Vec::with_capacity(max_source_bytes + 1);
+    file.take((max_source_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow!("cannot read {path}: {error}"))?;
+    if bytes.len() > max_source_bytes {
+        return Err(anyhow!(
+            "task prompt exceeds the {}-byte limit",
+            crate::orch::MAX_TASK_PROMPT_BYTES
+        ));
+    }
+    let mut prompt = String::from_utf8(bytes)
+        .map_err(|error| anyhow!("cannot read {path} as UTF-8 text: {error}"))?;
+    prompt = prompt.replace("\r\n", "\n").replace('\r', "\n");
+    if prompt.len() > crate::orch::MAX_TASK_PROMPT_BYTES {
+        return Err(anyhow!(
+            "task prompt exceeds the {}-byte limit",
+            crate::orch::MAX_TASK_PROMPT_BYTES
+        ));
+    }
+    Ok(Some(prompt))
 }
 
 fn automation_definition_params(
@@ -4148,6 +4529,34 @@ mod tests {
         assert_eq!(unchanged.to_string(), server_message);
     }
 
+    #[test]
+    fn parses_module_update_and_rejects_extras() {
+        let parse = |s: &str| parse_module_update(&argv(s));
+        assert_eq!(parse("you.test").unwrap(), ("you.test".into(), None, false));
+        assert_eq!(
+            parse("--yes owner/repo/sub --ref v2").unwrap(),
+            ("owner/repo/sub".into(), Some("v2".into()), true)
+        );
+        assert!(parse("you.test -y").unwrap().2);
+        for invalid in [
+            "",
+            "--yes",
+            "you.test extra",
+            "you.test --all",
+            "you.test --ref",
+            "you.test --ref --yes",
+            "you.test --ref v1 --ref v2",
+            "you.test --yes -y",
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+        assert!(parse_module_update(&["you.test".into(), "--ref".into(), "".into()]).is_err());
+        assert!(DETAILED_USAGE.contains("module update <id>"));
+        let help = rendered_topic_help("module", Some("update"));
+        assert!(help.contains("module update <id>"));
+        assert!(!help.contains("module install"));
+    }
+
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
     }
@@ -4179,6 +4588,9 @@ mod tests {
                             | "task"
                             | "automation"
                             | "integration"
+                            | "machine"
+                            | "uhp"
+                            | "web"
                     )
                 ) && !trimmed.contains("  ");
                 if trimmed.is_empty()
@@ -4405,6 +4817,41 @@ mod tests {
     }
 
     #[test]
+    fn pane_report_event_forwards_notification_type() {
+        let (method, params) = parse(&argv(
+            "luvus pane report-event 9 --agent claude --kind Notification --notification-type idle_prompt",
+        ))
+        .unwrap();
+        assert_eq!(method, "pane.report_event");
+        assert_eq!(params["pane"], "9");
+        assert_eq!(params["agent"], "claude");
+        assert_eq!(params["kind"], "Notification");
+        assert_eq!(params["notification_type"], "idle_prompt");
+    }
+
+    #[test]
+    fn pane_send_requests_atomic_paste_semantics() {
+        let (method, params) = parse(&argv("luvus pane send 9 first second")).unwrap();
+        assert_eq!(method, "pane.send_input");
+        assert_eq!(params.get("pane").and_then(Value::as_str), Some("9"));
+        assert_eq!(
+            params.get("text").and_then(Value::as_str),
+            Some("first second")
+        );
+        assert_eq!(params.get("paste").and_then(Value::as_bool), Some(true));
+
+        let args = ["luvus", "pane", "send", "9", "first\nsecond"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let (_, params) = parse(&args).unwrap();
+        assert_eq!(
+            params.get("text").and_then(Value::as_str),
+            Some("first\nsecond")
+        );
+    }
+
+    #[test]
     fn uhp_is_the_single_public_protocol_cli_route() {
         assert!(is_cli(&argv("luvus uhp capabilities")));
         assert_eq!(
@@ -4513,7 +4960,9 @@ mod tests {
     #[test]
     fn uhp_help_includes_transport_neutral_access() {
         let help = rendered_topic_help("uhp", None);
-        assert!(help.contains("uhp access [--control] [--ttl <seconds> | --no-expiry]"));
+        assert!(
+            help.contains("uhp access [--machines] [--control] [--ttl <seconds> | --no-expiry]")
+        );
         assert!(help.contains("private provider endpoint"));
     }
 
@@ -4572,12 +5021,35 @@ mod tests {
         let (m, _) = parse(&argv("luvus ping")).unwrap();
         assert_eq!(m, "ping");
 
-        let (m, _) = parse(&argv("luvus pane list")).unwrap();
+        let (m, p) = parse(&argv("luvus pane list")).unwrap();
         assert_eq!(m, "pane.list");
+        assert_eq!(p, json!({"all_tabs": true}));
+        let (m, p) = parse(&argv("luvus pane list --all-tabs")).unwrap();
+        assert_eq!(m, "pane.list");
+        assert_eq!(p, json!({"all_tabs": true}));
+        let (m, p) = parse(&argv("luvus pane list --current-tab")).unwrap();
+        assert_eq!(m, "pane.list");
+        assert_eq!(p, json!({"all_tabs": false}));
+        assert!(parse(&argv("luvus pane list --all-tabs --all-tabs")).is_err());
+        assert!(parse(&argv("luvus pane list --all-tabs --current-tab")).is_err());
+        assert!(parse(&argv("luvus pane list --unknown")).is_err());
 
         let (m, p) = parse(&argv("luvus pane split --down")).unwrap();
         assert_eq!(m, "pane.split");
         assert_eq!(p.get("direction").and_then(|v| v.as_str()), Some("down"));
+
+        let (m, p) = parse(&argv("luvus pane split")).unwrap();
+        assert_eq!(m, "pane.split");
+        assert!(p.get("direction").is_none());
+
+        let (m, p) = parse(&argv("luvus pane split --auto")).unwrap();
+        assert_eq!(m, "pane.split");
+        assert_eq!(p.get("direction").and_then(|v| v.as_str()), Some("auto"));
+
+        let (m, p) = parse(&argv("luvus pane split --right")).unwrap();
+        assert_eq!(m, "pane.split");
+        assert_eq!(p.get("direction").and_then(|v| v.as_str()), Some("right"));
+        assert!(parse(&argv("luvus pane split --auto --down")).is_err());
 
         let (m, p) = parse(&argv("luvus pane run 3 echo hi")).unwrap();
         assert_eq!(m, "pane.run");
@@ -4593,6 +5065,83 @@ mod tests {
         assert_eq!(m, "tab.new");
         let (m, _) = parse(&argv("luvus agent list")).unwrap();
         assert_eq!(m, "agent.list");
+    }
+
+    #[test]
+    fn pane_split_cwd_resolves_paths_and_keeps_existing_options() {
+        let absolute = std::env::current_dir().unwrap();
+        let args = vec![
+            "luvus".into(),
+            "pane".into(),
+            "split".into(),
+            "3".into(),
+            "--cwd".into(),
+            absolute.to_string_lossy().into_owned(),
+            "--right".into(),
+            "--no-focus".into(),
+        ];
+        let (method, params) = parse(&args).unwrap();
+        assert_eq!(method, "pane.split");
+        assert_eq!(
+            params,
+            json!({
+                "pane": "3", "cwd": absolute, "direction": "right", "focus": false,
+            })
+        );
+
+        let (_, params) = parse(&argv("luvus pane split --cwd nested --auto")).unwrap();
+        assert_eq!(params["cwd"], json!(absolute.join("nested")));
+        assert_eq!(params["direction"], "auto");
+        for command in ["luvus pane split --cwd", "luvus pane split --cwd --down"] {
+            assert!(parse(&argv(command))
+                .unwrap_err()
+                .to_string()
+                .contains("usage:"));
+        }
+        assert!(parse(&argv("luvus pane split --cwd one --cwd two")).is_err());
+        let empty = vec![
+            "luvus".into(),
+            "pane".into(),
+            "split".into(),
+            "--cwd".into(),
+            String::new(),
+        ];
+        assert!(parse(&empty).unwrap_err().to_string().contains("usage:"));
+    }
+
+    // This filesystem fixture needs non-UTF-8 filenames, which APFS rejects.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pane_split_cwd_reports_non_utf8_working_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        const CHILD: &str = "LUVUS_TEST_SPLIT_NON_UTF8_CWD";
+        if std::env::var_os(CHILD).is_some() {
+            let error = parse(&argv("luvus pane split --cwd nested")).unwrap_err();
+            assert_eq!(error.to_string(), "--cwd must be valid UTF-8");
+            return;
+        }
+
+        // A subprocess exercises current_dir without changing the test suite's cwd.
+        let _env = crate::persist::test_env("split-non-utf8-cwd");
+        let cwd =
+            crate::persist::config_dir().join(std::ffi::OsString::from_vec(b"cwd-\xff".to_vec()));
+        fs::create_dir_all(&cwd).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::tests::pane_split_cwd_reports_non_utf8_working_directory",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -4651,6 +5200,21 @@ mod tests {
         ] {
             assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
         }
+
+        let oversized = format!(
+            "luvus search {}",
+            "x".repeat(crate::search::local::LOCAL_QUERY_BYTES + 1)
+        );
+        let error = parse(&argv(&oversized)).expect_err("oversized exact search must fail");
+        assert_eq!(
+            error.to_string(),
+            "exact search query must be at most 4096 bytes"
+        );
+        let localized = localize_cli_error_with(
+            error,
+            crate::i18n::cli::Context::for_language(crate::i18n::cli::Language::Zh),
+        );
+        assert_eq!(localized.to_string(), "精确搜索查询不得超过 4096 字节");
     }
 
     #[test]
@@ -4685,6 +5249,28 @@ mod tests {
             parse(&argv(&long)).is_err(),
             "41-character name is rejected"
         );
+    }
+
+    #[test]
+    fn transpose_parser_and_focused_help() {
+        let (method, params) = parse(&argv("luvus pane transpose 7")).unwrap();
+        assert_eq!(method, "pane.transpose");
+        assert_eq!(params, json!({"pane":"7"}));
+        assert_eq!(
+            parse(&argv("luvus pane transpose")).unwrap().0,
+            "pane.transpose"
+        );
+        for command in [
+            "luvus pane transpose 7 8",
+            "luvus pane transpose --right",
+            "luvus pane transpose bad",
+            "luvus pane transpose -1",
+        ] {
+            assert!(parse(&argv(command)).is_err(), "{command}");
+        }
+        let help = rendered_topic_help("pane", Some("transpose"));
+        assert!(help.contains("pane transpose [<id>]"));
+        assert!(!help.contains("pane split"));
     }
 
     #[test]
@@ -4916,6 +5502,25 @@ mod tests {
         let (m, _) = parse(&argv("luvus ui dock list")).unwrap();
         assert_eq!(m, "ui.dock.list");
 
+        let titles_argv: Vec<String> = vec![
+            "luvus".into(),
+            "ui".into(),
+            "agent-title".into(),
+            "push".into(),
+            "--titles".into(),
+            r#"[{"pane":"3","title":"Ship desktop"}]"#.into(),
+        ];
+        let (m, p) = parse(&titles_argv).unwrap();
+        assert_eq!(m, "ui.agent_title.push");
+        assert_eq!(p["titles"][0]["title"].as_str(), Some("Ship desktop"));
+        let (m, p) = parse(&argv(
+            "luvus ui agent-title clear --agent pi --session-id sess-1",
+        ))
+        .unwrap();
+        assert_eq!(m, "ui.agent_title.clear");
+        assert_eq!(p.get("agent").and_then(|v| v.as_str()), Some("pi"));
+        assert!(parse(&argv("luvus ui agent-title")).is_err());
+
         // `ui sidebar` now takes an optional side.
         let (m, p) = parse(&argv("luvus ui sidebar --side right --width 30")).unwrap();
         assert_eq!(m, "ui.sidebar");
@@ -4926,6 +5531,7 @@ mod tests {
     fn maps_luvus_bar_and_notification_commands() {
         let _env = crate::persist::test_env("cli-bar");
         std::env::set_var("LUVUS_MODULE_ID", "you.ci");
+        std::env::set_var(crate::module::runtime::MODULE_TOKEN_ENV, "module-token");
         let args = vec![
             "luvus".into(),
             "bar".into(),
@@ -4942,6 +5548,18 @@ mod tests {
         assert_eq!(params["owner"], "you.ci");
         assert_eq!(params["content"].as_array().unwrap().len(), 2);
 
+        let (method, params) = parse(&argv(
+            r#"luvus ui agent-title push --titles [{"agent":"pi","session_id":"s1","title":"Title"}]"#,
+        ))
+        .unwrap();
+        assert_eq!(method, "ui.agent_title.push");
+        assert_eq!(params["owner"], "you.ci");
+        assert_eq!(params["module_token"], "module-token");
+        let (method, params) = parse(&argv("luvus ui agent-title clear")).unwrap();
+        assert_eq!(method, "ui.agent_title.clear");
+        assert_eq!(params["owner"], "you.ci");
+        assert_eq!(params["module_token"], "module-token");
+
         let (method, params) =
             parse(&argv("luvus bar move --id status --region bottom-right")).unwrap();
         assert_eq!(method, "ui.bar.move");
@@ -4955,6 +5573,7 @@ mod tests {
         assert_eq!(params["ttl_ms"], 6000);
         assert_eq!(params["owner"], "you.ci");
         std::env::remove_var("LUVUS_MODULE_ID");
+        std::env::remove_var(crate::module::runtime::MODULE_TOKEN_ENV);
 
         for bad in [
             "luvus bar push --id status",
@@ -4986,6 +5605,70 @@ mod tests {
         );
         assert_eq!(p.get("gate").and_then(|v| v.as_str()), Some("cargo"));
 
+        let (method, params) =
+            parse(&argv("luvus task add scoped --workspace-id workspace-a")).unwrap();
+        assert_eq!(method, "task.add");
+        assert_eq!(params["workspace_id"], "workspace-a");
+
+        let prompt_args = [
+            "luvus",
+            "task",
+            "add",
+            "Detailed review task that remains one title argument",
+            "--prompt",
+            "Inspect the API.\nCover rollback behavior.",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let (method, params) = parse(&prompt_args).unwrap();
+        assert_eq!(method, "task.add");
+        assert_eq!(
+            params["prompt"],
+            "Inspect the API.\nCover rollback behavior."
+        );
+
+        let update_args = [
+            "luvus",
+            "task",
+            "update",
+            "t1",
+            "--prompt",
+            "Updated briefing",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let (method, params) = parse(&update_args).unwrap();
+        assert_eq!(method, "task.update");
+        assert_eq!(params["prompt"], "Updated briefing");
+        let (_, params) = parse(&[
+            "luvus".into(),
+            "task".into(),
+            "update".into(),
+            "t1".into(),
+            "--prompt".into(),
+            "inline\r\nprompt\rtext".into(),
+        ])
+        .unwrap();
+        assert_eq!(params["prompt"], "inline\r\nprompt\rtext");
+        assert!(parse(&argv(
+            "luvus task add title --prompt inline --prompt-file task.md"
+        ))
+        .is_err());
+        assert_eq!(
+            parse(&argv("luvus task add --prompt briefing"))
+                .unwrap_err()
+                .to_string(),
+            "task add requires a title"
+        );
+        assert_eq!(
+            parse(&argv("luvus task update --prompt briefing"))
+                .unwrap_err()
+                .to_string(),
+            "task update requires an id"
+        );
+
         let (m, _) = parse(&argv("luvus task list")).unwrap();
         assert_eq!(m, "task.list");
         let (m, p) = parse(&argv("luvus task claim t3")).unwrap();
@@ -4993,6 +5676,9 @@ mod tests {
         assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("t3"));
         let (m, _) = parse(&argv("luvus task done t3")).unwrap();
         assert_eq!(m, "task.done");
+        let (m, p) = parse(&argv("luvus task retry t3")).unwrap();
+        assert_eq!(m, "task.retry");
+        assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("t3"));
 
         let (m, p) = parse(&argv("luvus lease acquire src/auth/** --task t1")).unwrap();
         assert_eq!(m, "lease.acquire");
@@ -5018,6 +5704,10 @@ mod tests {
             p.get("workspace_id").and_then(|v| v.as_str()),
             Some("workspace-a")
         );
+
+        let (m, p) = parse(&argv("luvus task start t2 --no-focus")).unwrap();
+        assert_eq!(m, "task.start");
+        assert_eq!(p.get("focus").and_then(|v| v.as_bool()), Some(false));
 
         let (m, p) = parse(&argv("luvus task next --start --agent claude")).unwrap();
         assert_eq!(m, "task.next");
@@ -5058,6 +5748,57 @@ mod tests {
         let (m, p) = parse(&argv("luvus task merge t1")).unwrap();
         assert_eq!(m, "task.merge");
         assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("t1"));
+    }
+
+    #[test]
+    fn task_prompt_file_is_bounded_and_maps_to_the_prompt_field() {
+        let _env = crate::persist::test_env("task-prompt-file");
+        let root = crate::persist::config_dir();
+        fs::create_dir_all(&root).unwrap();
+        let prompt_path = root.join("task.md");
+        fs::write(
+            &prompt_path,
+            "Review the API.\r\nCover rollback behavior.\rCheck recovery.\r\n",
+        )
+        .unwrap();
+        let args = vec![
+            "luvus".into(),
+            "task".into(),
+            "add".into(),
+            "Review API".into(),
+            "--prompt-file".into(),
+            prompt_path.display().to_string(),
+        ];
+        let (method, params) = parse(&args).unwrap();
+        assert_eq!(method, "task.add");
+        assert_eq!(
+            params["prompt"],
+            "Review the API.\nCover rollback behavior.\nCheck recovery.\n"
+        );
+
+        fs::write(
+            &prompt_path,
+            "\r\n".repeat(crate::orch::MAX_TASK_PROMPT_BYTES),
+        )
+        .unwrap();
+        let (_, params) = parse(&args).unwrap();
+        let prompt = params["prompt"].as_str().unwrap();
+        assert_eq!(prompt.len(), crate::orch::MAX_TASK_PROMPT_BYTES);
+        assert!(prompt.bytes().all(|byte| byte == b'\n'));
+
+        fs::write(
+            &prompt_path,
+            "\r\n".repeat(crate::orch::MAX_TASK_PROMPT_BYTES + 1),
+        )
+        .unwrap();
+        assert!(parse(&args).unwrap_err().to_string().contains("byte limit"));
+
+        fs::write(
+            &prompt_path,
+            "x".repeat(crate::orch::MAX_TASK_PROMPT_BYTES + 1),
+        )
+        .unwrap();
+        assert!(parse(&args).unwrap_err().to_string().contains("byte limit"));
     }
 
     #[test]
@@ -5167,6 +5908,16 @@ mod tests {
         let (m, p) = parse(&argv("luvus module enable my-mod")).unwrap();
         assert_eq!(m, "module.enable");
         assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("my-mod"));
+
+        let (m, _) = parse(&argv("luvus module")).unwrap();
+        assert_eq!(m, "module.list");
+
+        assert_eq!(
+            parse(&argv("luvus module action my-mod refresh"))
+                .unwrap_err()
+                .to_string(),
+            "unknown module command `action`. Try `luvus help module`."
+        );
     }
 
     fn wait_test_server() -> crate::ipc::transport::Listener {
@@ -5191,6 +5942,70 @@ mod tests {
             .expect("read wait request");
         let request = serde_json::from_str(&line).expect("parse wait request");
         (connection, request)
+    }
+
+    #[test]
+    fn observed_prompt_cli_preserves_invocations_and_exit_codes() {
+        let _env = crate::persist::test_env("p-cli");
+        let listener = wait_test_server();
+        let cases = [
+            ("luvus agent prompt 7 review", json!({"target":"7","text":"review","wait":false})),
+            ("luvus agent send reviewer review this", json!({"target":"reviewer","text":"review this","wait":false})),
+            ("luvus agent prompt codex review --wait", json!({"target":"codex","text":"review","wait":true})),
+            ("luvus agent prompt claude --strict review", json!({"target":"claude","text":"review","wait":false,"strict":true})),
+            ("luvus agent send reviewer --strict review this", json!({"target":"reviewer","text":"review this","wait":false,"strict":true})),
+            ("luvus agent prompt 7 review --terminal-id 0123456789abcdef0123456789abcdef", json!({"target":"7","text":"review","wait":false,"terminal_id":"0123456789abcdef0123456789abcdef"})),
+            ("luvus agent send 7 --terminal-id 0123456789abcdef0123456789abcdef review", json!({"target":"7","text":"review","wait":false,"terminal_id":"0123456789abcdef0123456789abcdef"})),
+            ("luvus agent send 7 review --wait --until done --timeout 0.5", json!({"target":"7","text":"review","wait":true,"until":["done"],"timeout_s":0.5})),
+            ("luvus agent prompt 7 --wait --until idle --until working --until blocked --until done review --timeout 3600", json!({"target":"7","text":"review","wait":true,"until":["idle","working","blocked","done"],"timeout_s":3600.0})),
+            ("luvus agent send 7 --wait --until idle --until idle --timeout 0 review", json!({"target":"7","text":"review","wait":true,"until":["idle","idle"],"timeout_s":0.0})),
+            ("luvus agent prompt 7 -- --wait literal", json!({"target":"7","text":"--wait literal","wait":false})),
+        ];
+        let expected: Vec<Value> = cases.iter().map(|(_, params)| params.clone()).collect();
+        let server = std::thread::spawn(move || {
+            for params in expected {
+                let (mut connection, request) = accept_wait_request(&listener);
+                assert_eq!(request["method"], "agent.prompt");
+                assert_eq!(request["params"], params);
+                writeln!(
+                    connection,
+                    "{}",
+                    json!({"id":"1","result":{"submitted":true,"matched":true}})
+                )
+                .unwrap();
+            }
+            for response in [
+                json!({"result":{"submitted":true,"matched":false}}),
+                json!({"error":{"code":"send_failed","message":"queue closed"}}),
+                json!({"error":{"code":"agent_not_running","message":"exited"}}),
+                json!({"error":{"code":"agent_not_running","message":"exited"}}),
+            ] {
+                let (mut connection, _) = accept_wait_request(&listener);
+                writeln!(connection, "{response}").unwrap();
+            }
+        });
+        for (invocation, _) in cases {
+            assert_eq!(
+                agent_send_cmd(&argv(invocation)).unwrap(),
+                0,
+                "{invocation}"
+            );
+        }
+        for (wait, exit) in [(true, 2), (true, 1), (true, 2), (false, 1)] {
+            let invocation = if wait {
+                "luvus agent prompt 7 review --wait"
+            } else {
+                "luvus agent prompt 7 review"
+            };
+            assert_eq!(agent_send_cmd(&argv(invocation)).unwrap(), exit);
+        }
+        server.join().unwrap();
+        for invocation in [
+            "luvus agent prompt 7 review --terminal-id BAD",
+            "luvus agent send 7 review --terminal-id",
+        ] {
+            assert!(agent_send_cmd(&argv(invocation)).is_err(), "{invocation}");
+        }
     }
 
     #[test]
@@ -5540,7 +6355,7 @@ mod tests {
             .unwrap(),
             AgentStartTarget::Split {
                 anchor: Some("4".into()),
-                down: true,
+                direction: Some("down"),
             }
         );
         assert_eq!(
@@ -5551,11 +6366,38 @@ mod tests {
             .unwrap(),
             AgentStartTarget::Split {
                 anchor: Some("7".into()),
-                down: false,
+                direction: None,
+            }
+        );
+        assert_eq!(
+            parse_agent_start_target(
+                &argv("luvus agent start worker --kind codex --auto"),
+                Some("7".into())
+            )
+            .unwrap(),
+            AgentStartTarget::Split {
+                anchor: Some("7".into()),
+                direction: Some("auto"),
+            }
+        );
+        assert_eq!(
+            parse_agent_start_target(
+                &argv("luvus agent start worker --kind codex --right"),
+                Some("7".into())
+            )
+            .unwrap(),
+            AgentStartTarget::Split {
+                anchor: Some("7".into()),
+                direction: Some("right"),
             }
         );
         assert!(parse_agent_start_target(
             &argv("luvus agent start worker --kind codex --pane 9 --anchor 4"),
+            None
+        )
+        .is_err());
+        assert!(parse_agent_start_target(
+            &argv("luvus agent start worker --kind codex --auto --down"),
             None
         )
         .is_err());
@@ -5601,6 +6443,14 @@ mod tests {
         let (m, p) = parse(&argv("luvus worktree remove /tmp/wt")).unwrap();
         assert_eq!(m, "worktree.remove");
         assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
+        assert_eq!(p.get("force"), None);
+        let (m, p) = parse(&argv("luvus worktree remove --force /tmp/wt")).unwrap();
+        assert_eq!(m, "worktree.remove");
+        assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
+        assert_eq!(p.get("force").and_then(Value::as_bool), Some(true));
+        assert!(parse(&argv("luvus worktree remove")).is_err());
+        assert!(parse(&argv("luvus worktree remove /tmp/a /tmp/b")).is_err());
+        assert!(parse(&argv("luvus worktree remove /tmp/wt --unknown")).is_err());
     }
 
     #[test]
@@ -5742,13 +6592,16 @@ mod tests {
         // different agent with no hook integration, so neither the help text
         // nor the published CLI reference may advertise `pi` here — and both
         // must list `omp`.
-        assert!(DETAILED_USAGE.contains("|omp>"));
-        assert!(!DETAILED_USAGE.contains("|pi>"));
+        let lists = |text: &str, agent: &str| {
+            text.contains(&format!("|{agent}|")) || text.contains(&format!("|{agent}>"))
+        };
+        assert!(lists(DETAILED_USAGE, "omp"));
+        assert!(!lists(DETAILED_USAGE, "pi"));
         let page = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("website/src/content/docs/docs/reference/cli.mdx");
         if let Ok(text) = fs::read_to_string(page) {
-            assert!(text.contains("|omp>"));
-            assert!(!text.contains("|pi>"));
+            assert!(lists(&text, "omp"));
+            assert!(!lists(&text, "pi"));
         }
     }
 }

@@ -25,6 +25,7 @@ A module can reach every surface the app has:
 | **Settings** | `[[settings]]` | Typed controls in Settings → Modules, no UI code |
 | **Events** | `[[events]]` | Run when agents, panes, tabs, or tasks change |
 | **Startup** | `[[startup]]` | Restore your state when the session comes up |
+| **AGENTS titles** | any command | Publish session titles onto live and resumable AGENTS rows |
 
 ## Author with your AI agent
 
@@ -97,6 +98,7 @@ with `module log`.
 | `min_luvus_version` | ✓ | Install is refused if newer than the host. Use `0.8.3` if you use right-click menus, settings, startup hooks, or dock row values. |
 | `description` |  | One-line summary. |
 | `platforms` |  | e.g. `["macos", "linux"]`. Omit for all. `[]` is an error. |
+| `worktree_provider` |  | A single `[worktree_provider]` table declares a fixed synchronous worktree creation command. |
 
 The manifest filename is `luvus-module.toml`.
 
@@ -104,6 +106,84 @@ Every entry below (`build`, `startup`, `actions`, `events`, `panes`) also
 accepts its own `platforms` list, which overrides the top-level one. That's how
 one manifest ships a `pbcopy` action on macOS and a `clip.exe` action on
 Windows without either showing up on the wrong machine.
+
+### `[worktree_provider]`: create and remove worktrees for Luvus
+
+A module may expose one synchronous creation command and an optional explicit
+removal command:
+
+```toml
+[worktree_provider]
+command = ["./create-worktree"]
+remove_command = ["./remove-worktree"] # optional
+identity_bound_remove = true # only if remove_command binds expected_identity
+platforms = ["macos", "linux"] # optional
+```
+
+The user selects the module by canonical id in
+`config.json` as `worktree.provider`; configuration cannot replace this fixed
+argv. Luvus runs the command in the module root with normal module identity and
+settings variables, and writes exactly one versioned JSON request to stdin.
+Creation receives:
+
+```json
+{
+  "version": 1,
+  "operation": "create",
+  "repository": "/absolute/source/repository",
+  "branch": "feature/example",
+  "branch_exists": false
+}
+```
+
+Removal receives:
+
+```json
+{
+  "version": 1,
+  "operation": "remove",
+  "repository": "/absolute/source/repository",
+  "path": "/absolute/path/to/worktree",
+  "branch": "feature/example",
+  "force": false
+}
+```
+
+Confirmed sidebar deletion also includes `expected_identity` with `volume` and
+`file` (the directory's device/inode on Unix or volume/file ID on Windows).
+Set `identity_bound_remove = true` only when the remove command binds its
+destructive operation to that directory identity and rejects a replaced target;
+checking the path only before deletion does not prevent a replacement race.
+One approach is to move the linked checkout to a unique sibling path, verify
+the moved directory's identity, then remove that moved checkout; restore it if
+the identity differs.
+Without this opt-in, confirmed sidebar deletion uses built-in Git removal. The
+field is absent for ordinary API removal, preserving existing provider requests.
+
+Creation returns exactly one JSON object on stdout:
+
+```json
+{"path":"/absolute/path/to/worktree"}
+```
+
+Removal must write nothing to stdout and exit successfully. It succeeds only
+after the target has been unregistered from Git and its directory no longer
+exists. If a provider violates the exit or stdout contract after the irreversible
+deletion already completed, Luvus reconciles the proven filesystem and Git state
+instead of leaving a stale workspace; this recovery does not make stdout a
+supported result channel. Luvus validates that the removal target is a linked
+worktree of the source repository before running the command and verifies the
+result afterwards. If `remove_command` is omitted, explicit removal uses
+built-in Git.
+
+Write human logs to stderr. A non-zero exit preserves stderr for the user.
+The provider command is synchronous: do not call the Luvus CLI or API from it,
+because the server is waiting for the provider result. It may use its own module
+settings, config, and state directories normally. Luvus opens no workspace until it verifies that the returned path exists, is a
+registered worktree of the source repository, shares its Git common directory,
+and checks out the requested branch. Internal rollback and ORCH merge stay
+Git-backed. Both fixed provider commands are shown in the module install
+confirmation alongside all other executable commands.
 
 ### `[[actions]]`: on-demand commands
 
@@ -118,6 +198,41 @@ command = ["bun", "run", "commit.ts"]
 
 Invoke with `luvus module run <module-id> <action-id>`. The qualified id is
 `{module-id}.{action-id}`.
+
+To expose that same fixed-argv action in Commander, add optional metadata:
+
+```toml
+[[actions]]
+id = "review"
+title = "Review a terminal pane"
+command = ["python3", "review.py"]
+commander = { name = "review", target = "pane", input = "text", confirmation = "required" }
+```
+
+This creates `$review` when its name is unique among runnable modules;
+`$<module-id>/review` always identifies it. The name must begin with a
+lowercase ASCII letter and contain only lowercase letters, digits, `_`, or `-`
+(maximum 64 bytes). Names must be unique within one module. `target` is `none`,
+`pane`, `agent`, `tab`, or `workspace`; non-`none` requires one exact `@`
+mention immediately after the command. `input` is `none` or `text`. With
+`text`, everything after the target is literal input; with `none`, extra text
+is rejected. `confirmation` defaults to `required`; `none` invokes on the first
+Enter. Installation preview displays the `$` exposure and policy alongside
+the action's argv. Non-opted-in actions keep their previous behavior.
+
+Only Commander invocations write a UTF-8 JSON document to the action's stdin,
+bounded to 64 KiB after serialization. Its version 1 shape is:
+
+```json
+{"version":1,"command":"review","target":{"kind":"pane","pane_id":"17"},"text":"Check the latest output"}
+```
+
+For `agent`, the target contains `kind: "agent"` and `pane_id`; for `tab`,
+`workspace_id` and `tab_id`; for `workspace`, `workspace_id`; and for no target,
+`kind: "none"`. The existing `LUVUS_MODULE_CONTEXT_JSON` and `LUVUS_*` context
+still describe the exact selected location. Text is never appended to argv or
+placed in the environment. CLI, UHP, menu, dock, and startup invocations of
+the action do not receive this stdin document.
 
 ### `contexts`: put an action in a right-click menu
 
@@ -288,7 +403,9 @@ custom colors, and module-controlled rendering are rejected.
 
 An actionable segment names an action from the same manifest. Its command gets
 `LUVUS_MODULE_BAR_ID`, `LUVUS_MODULE_BAR_SEGMENT`, and
-`LUVUS_MODULE_BAR_VALUE`. Live content is in-memory, so restore it from a
+`LUVUS_MODULE_BAR_VALUE` — except on a `progress` segment, whose `value` is the
+numeric fill, so its click passes no payload; carry it on a neighboring `text`
+or `badge` segment instead. Live content is in-memory, so restore it from a
 one-shot startup hook. A repeated push is an atomic replacement, not an append.
 
 For transient status, use the bounded notification lane instead of repeatedly
@@ -319,7 +436,7 @@ Your command runs with `LUVUS_MODULE_EVENT` (the name) and
 | Tabs | `tab.created` · `tab.closed` |
 | Panes | `pane.created` · `pane.closed` · `pane.agent_status_changed` |
 | Agents | `agent.hook` |
-| Orchestration | `task.added` · `task.claimed` · `task.started` · `task.updated` · `task.ready` · `task.done` · `task.released` · `task.deleted` · `task.merge_started` · `task.merged` · `task.merge_conflict` · `task.merge_failed` · `task.needs_compaction` · `task.gate_running` · `task.gate_passed` · `task.gate_failed` |
+| Orchestration | `task.added` · `task.claimed` · `task.started` · `task.updated` · `task.ready` · `task.done` · `task.released` · `task.retried` · `task.deleted` · `task.merge_started` · `task.merged` · `task.merge_conflict` · `task.merge_failed` · `task.needs_compaction` · `task.gate_running` · `task.gate_passed` · `task.gate_failed` |
 | Leases | `lease.acquired` · `lease.released` |
 
 `pane.agent_status_changed` is the highest-value hook -- notify when `status`
@@ -387,8 +504,10 @@ Each **row** is an object:
 
 | Field | Required | Meaning |
 |---|:---:|---|
-| `text` | ✓ | The row label. |
+| `text` | ✓ | The row label. May be omitted only when `spans` has at least one non-empty segment, then it defaults to the segments joined. A row with neither renders empty and its action receives an empty `LUVUS_MODULE_ROW_TEXT`. |
 | `dot` |  | A status dot: `idle` / `working` / `blocked` / `done` (colored like the Agents list). |
+| `tone` |  | Colors the row text with a Luvus Bar tone: `normal` / `muted` / `accent` / `success` / `warning` / `error`. Omit for the default row color (`normal` is the bar's own text color, one step dimmer than the default). An unknown name falls back to the default. |
+| `spans` |  | Draw the row from segments instead of `text`: `[{"text": "[", "tone": "muted"}, {"text": "━━━", "tone": "success"}]`. Each segment takes its own tone, else the row's. `text` stays the plain version handed to the action, and defaults to the segments joined when omitted. |
 | `action` |  | A module **action id** run when the row is clicked. |
 | `value` |  | An opaque payload for that action, so one action can back every row. |
 | `menu` |  | Extra actions offered when the row is **right-clicked**. See below. |
@@ -558,6 +677,20 @@ For pipes or `$VAR`, invoke a shell explicitly:
 3. stdout and stderr are captured (64 KiB each), the exit is recorded:
    `running` → `succeeded` / `failed`.
 
+A process your action starts in the background keeps running after the action
+exits. If it inherited stdout or stderr, luvus waits about 2 seconds for those
+streams to close, then records the action's own exit status with the output
+captured so far and a note that later output was not captured. Until that
+process closes the streams, the action still counts toward the 32-command
+in-flight limit. Redirect a background process's output (for example
+`server >server.log 2>&1 &`) when you want the action to finish immediately and
+free its slot.
+
+Commander input that your action exits without reading was not delivered. For
+an action that reads input, that makes the run fail even if it exited with 0.
+An action whose `commander` table sets `input = "none"` may leave its input
+unread.
+
 Caps: at most **32** module commands in flight, and the **200** most recent log
 entries are kept. Commands are isolated processes, so a crash or hang never
 takes down luvus.
@@ -570,6 +703,7 @@ takes down luvus.
 |---|---|
 | `LUVUS_ENV` | Always `1`, meaning you're running under luvus. |
 | `LUVUS_MODULE_ID` | Your module's id. |
+| `LUVUS_MODULE_TOKEN` | Per-server credential forwarded automatically by the CLI for module-owned UI data. Do not persist or override it. |
 | `LUVUS_MODULE_VERSION` | Your module's declared version. |
 | `LUVUS_MODULE_ROOT` | The module directory (also the cwd). Read-only by convention. |
 | `LUVUS_MODULE_CONFIG_DIR` | Durable, user-owned config/secrets dir (created for you). |
@@ -642,7 +776,36 @@ selected=$(printf '%s' "$LUVUS_MODULE_CONTEXT_JSON" | jq -r .selection)
 "$LUVUS_BIN_PATH" tab rename review        # name the current tab
 "$LUVUS_BIN_PATH" ui toast "build passing" # flash a one-line message
 "$LUVUS_BIN_PATH" ui dock push --id you:ci --rows '[...]'   # feed your sidebar dock
+"$LUVUS_BIN_PATH" ui agent-title push --titles '[{"agent":"pi","session_id":"01a0…","title":"Ship desktop"}]'
 ```
+
+### AGENTS sidebar titles
+
+Luvus does not parse an agent's native session store for the AGENTS sidebar.
+A module can publish titles onto live rows (including idle) and All/history
+resumable rows. `agent` must name a built-in Luvus adapter:
+
+```sh
+"$LUVUS_BIN_PATH" ui agent-title push --titles '[
+  {"pane":"3","title":"Ship desktop"},
+  {"agent":"pi","session_id":"01a07061-9cc8-779d-b50d-f09889439f94","title":"Ship desktop"}
+]'
+```
+
+OSC titles still win. If there is no OSC title, the pane title is used, then
+the `agent`+`session_id` title. If neither exists, live rows keep
+`workspace · =pane` and resumable rows keep the project folder. Never send a
+Luvus pane alias (`=name`) as `title`. Empty `title` clears that key. Clear all
+titles owned by your module with `ui agent-title clear`, or one row with
+`--pane` / `--agent` + `--session-id`. The CLI authenticates these updates with
+the module token automatically; do not pass or persist it manually. Luvus removes
+a module's titles when the module is disabled, unlinked, or uninstalled, and a
+disabled module cannot publish. Your token stays valid while the module remains
+registered on that server, so a pane or command that outlives a disable/enable
+toggle keeps working.
+
+Repaint from `[[startup]]` and `[[events]]` such as `pane.agent_status_changed`.
+Pi's `session_info.name` belongs in that module, not in Luvus core.
 
 Anything in `luvus help all` is available: panes, tabs, workspaces, worktrees, the
 git tab, the orchestration board, agents, and the UI chrome. Your command reads

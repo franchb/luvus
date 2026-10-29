@@ -111,6 +111,7 @@ pub enum GeneralRow {
     FileClick,
     FilesShowHidden,
     ShiftEnter,
+    CommanderWorking,
     CheckUpdates,
     /// Replay each agent's own CLI options on resume (docs/62).
     ResumeFlags,
@@ -146,6 +147,7 @@ impl App {
             GeneralRow::FileClick,
             GeneralRow::FilesShowHidden,
             GeneralRow::ShiftEnter,
+            GeneralRow::CommanderWorking,
             GeneralRow::CheckUpdates,
             GeneralRow::ResumeFlags,
             GeneralRow::NewPaneToWorkspaceRoot,
@@ -161,13 +163,10 @@ impl App {
     /// Index of the first notification row (where the `── Notify ──` divider
     /// goes), mirroring `dock_section_start` in the Layout tab.
     ///
-    /// This is one short: `AgentTitle` is a general setting, so the divider
-    /// renders above it and it reads as a notification option. That off-by-one
-    /// predates the `File click behavior` row — the constant went 6 → 7 only to
-    /// keep the divider where it already was. Fixing it properly means 8, which
-    /// moves a row users have already learned, so it is left for its own change.
+    /// Preserve the existing divider above `AgentTitle`; adding a Commander
+    /// setting before it shifts that boundary by one.
     pub fn general_section_start(&self) -> usize {
-        7
+        8
     }
 
     /// The Layout tab's ordered selectable rows (docs/29). The first index of the
@@ -295,6 +294,11 @@ impl App {
         // (Esc cancels). This must intercept before the normal handling so keys
         // like Tab / digits can themselves be bound.
         if capturing {
+            // Capture waits for a fresh Press. A held candidate must not
+            // confirm itself as the prefix or rebind a command.
+            if super::is_key_repeat(&key) {
+                return;
+            }
             if cursor == KEYS_PREFIX_ROW {
                 if key.code == KeyCode::Esc {
                     if let Some(ui) = self.settings.as_mut() {
@@ -339,6 +343,31 @@ impl App {
                 ui.prefix_candidate = None;
             }
             return;
+        }
+        // A held key moves the cursor, radio selection, or numeric sliders.
+        // Toggles, activations, resets, tab switches, and cycles run once.
+        if super::is_key_repeat(&key) {
+            let continuous = match key.code {
+                KeyCode::Up | KeyCode::Down => true,
+                KeyCode::Left | KeyCode::Right => match tab {
+                    SettingsTab::Theme | SettingsTab::Language => true,
+                    SettingsTab::Layout => matches!(
+                        self.layout_rows().get(cursor),
+                        Some(
+                            LayoutRow::SidebarWidth
+                                | LayoutRow::RightWidth
+                                | LayoutRow::Scrollback
+                                | LayoutRow::MobileWidth
+                                | LayoutRow::DiffContext
+                        )
+                    ),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !continuous {
+                return;
+            }
         }
         match key.code {
             KeyCode::Esc => self.close_settings(),
@@ -856,9 +885,38 @@ impl App {
             .retain(|(theme_id, _)| theme_id != id);
         self.pending_theme_uninstalls
             .insert(id.to_string(), restore);
+        self.show_toast(self.catalog.settings.theme_removing.replace("{id}", id));
+        self.deferred_theme_uninstalls.push(id.to_string());
+        self.flush_theme_uninstalls(true);
+    }
+
+    /// Saving and removing use separate workers. Do not let removal observe the
+    /// previous active theme on disk while the fallback save is still in flight.
+    pub(super) fn flush_theme_uninstalls(&mut self, saved: bool) -> bool {
+        if saved && self.config_save_pending() {
+            return false;
+        }
+        let changed = !self.deferred_theme_uninstalls.is_empty();
+        for id in std::mem::take(&mut self.deferred_theme_uninstalls) {
+            if !saved {
+                self.finish_theme_uninstall(
+                    id,
+                    Err("settings save failed; theme was not removed".into()),
+                );
+            } else if theme::canonical(&self.config.theme) == id {
+                self.finish_theme_uninstall(
+                    id,
+                    Err("theme is active again; removal cancelled".into()),
+                );
+            } else {
+                self.start_theme_uninstall(id);
+            }
+        }
+        changed
+    }
+
+    fn start_theme_uninstall(&self, id: String) {
         let tx = self.app_tx.clone();
-        let id = id.to_string();
-        self.show_toast(self.catalog.settings.theme_removing.replace("{id}", &id));
         std::thread::spawn(move || {
             let result = crate::theme::install::uninstall(&id)
                 .map(|_| crate::theme::ThemeRegistry::load())
@@ -1272,6 +1330,17 @@ impl App {
             // Flips config *and* the live tree (docs/38), so it applies at once.
             Some(GeneralRow::FilesShowHidden) => self.toggle_files_hidden(),
             Some(GeneralRow::ShiftEnter) => self.cycle_shift_enter(delta),
+            Some(GeneralRow::CommanderWorking) => {
+                self.config.commander_working_policy = match self.config.commander_working_policy {
+                    crate::config::CommanderWorkingPolicy::Ask => {
+                        crate::config::CommanderWorkingPolicy::AutoSend
+                    }
+                    crate::config::CommanderWorkingPolicy::AutoSend => {
+                        crate::config::CommanderWorkingPolicy::Ask
+                    }
+                };
+                self.persist_config();
+            }
             Some(GeneralRow::CheckUpdates) => {
                 self.config.check_updates = !self.config.check_updates;
                 self.persist_config();
@@ -1365,6 +1434,80 @@ fn lang_cursor(code: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::AppEvent;
+    use ratatui::crossterm::event::KeyEventKind;
+
+    fn phase(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> AppEvent {
+        AppEvent::Key(KeyEvent::new_with_kind(code, modifiers, kind))
+    }
+
+    #[test]
+    fn a_held_prefix_candidate_never_confirms_itself() {
+        let _env = crate::persist::test_env("settings-prefix-repeat");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let original = app.config.prefix.clone();
+        app.open_settings();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::Keys;
+            ui.cursor = KEYS_PREFIX_ROW;
+            ui.capturing = true;
+        }
+
+        app.handle_event(phase(
+            KeyCode::F(12),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        assert_eq!(
+            app.settings.as_ref().unwrap().prefix_candidate.as_deref(),
+            Some("f12"),
+            "the first Press only proposes the candidate"
+        );
+        app.handle_event(phase(
+            KeyCode::F(12),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(app.config.prefix, original, "a held key cannot confirm it");
+        assert!(app.settings.as_ref().unwrap().capturing);
+    }
+
+    #[test]
+    fn a_held_arrow_flips_a_layout_gap_once() {
+        let _env = crate::persist::test_env("settings-gap-repeat");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.open_settings();
+        let row = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::ColGap))
+            .expect("column gap row");
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::Layout;
+            ui.cursor = row;
+        }
+        let before = app.config.layout.col_gap;
+
+        app.handle_event(phase(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        let flipped = app.config.layout.col_gap;
+        assert_ne!(flipped, before, "the Press toggles the gap");
+        // One Repeat is enough: an XOR toggle flipped twice would hide the bug.
+        app.handle_event(phase(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(
+            app.config.layout.col_gap, flipped,
+            "a Repeat never flips it back"
+        );
+    }
 
     #[test]
     fn prefix_capture_accepts_safe_non_ctrl_keys_and_exact_modifiers() {
@@ -1753,13 +1896,26 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 13);
+        assert_eq!(app.settings_rows(SettingsTab::General), 14);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
         assert_eq!(
             rows[1],
             GeneralRow::FileClick,
             "click behavior sits next to the viewer it qualifies"
+        );
+        let working = rows
+            .iter()
+            .position(|r| *r == GeneralRow::CommanderWorking)
+            .unwrap();
+        assert_eq!(
+            app.config.commander_working_policy,
+            crate::config::CommanderWorkingPolicy::AutoSend
+        );
+        app.settings_adjust(working, 1);
+        assert_eq!(
+            app.config.commander_working_policy,
+            crate::config::CommanderWorkingPolicy::Ask
         );
 
         let style = rows
@@ -2168,8 +2324,9 @@ mod tests {
         );
     }
 
-    /// The General tab's Shift+Enter chooser cycles through the known sequences
-    /// and drives the bytes `encode_key` forwards.
+    /// The General tab's modified-Enter fallback chooser cycles through the
+    /// known legacy sequences and drives the bytes `encode_key` forwards when
+    /// no Kitty keyboard mode is active.
     #[test]
     fn general_shift_enter_cycles_and_drives_the_bytes() {
         let _env = crate::persist::test_env("shift-enter-cycle");
@@ -2366,6 +2523,8 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
         app.apply_theme("custom-enter");
+        app.flush_config_for_test(&rx);
+        assert_eq!(crate::config::load().theme, "custom-enter");
         app.open_settings();
         app.settings_set_tab(SettingsTab::Theme);
         let index = app.theme_registry.index_of("custom-enter").unwrap();
@@ -2375,6 +2534,7 @@ mod tests {
 
         assert_eq!(app.config.theme, theme::THEMES[0]);
         assert!(app.theme_uninstall_pending("custom-enter"));
+        assert_eq!(app.deferred_theme_uninstalls, vec!["custom-enter"]);
         let event = loop {
             match rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() {
                 event @ crate::event::AppEvent::ThemeUninstalled { .. } => break event,
@@ -2385,6 +2545,43 @@ mod tests {
         };
         app.handle_event(event);
         assert!(app.theme_registry.get("custom-enter").is_none());
+    }
+
+    #[test]
+    fn theme_removal_save_failure_keeps_the_file_and_restores_selection() {
+        let _env = crate::persist::test_env("theme-remove-save-failure");
+        let source = crate::persist::ensure_config_dir().join("custom-save-failure.toml");
+        crate::theme::install::init(&source, "custom-save-failure", None).unwrap();
+        let installed = crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.apply_theme("custom-save-failure");
+        app.flush_config_for_test(&rx);
+        app.request_theme_uninstall("custom-save-failure");
+        app.flush_theme_uninstalls(false);
+        assert!(installed.path.exists());
+        assert!(!app.theme_uninstall_pending("custom-save-failure"));
+        assert!(app.deferred_theme_uninstalls.is_empty());
+        assert_eq!(app.config.theme, "custom-save-failure");
+        app.flush_config_for_test(&rx);
+    }
+
+    #[test]
+    fn theme_removal_cancels_when_reselected_before_save_completes() {
+        let _env = crate::persist::test_env("theme-remove-reselected");
+        let source = crate::persist::ensure_config_dir().join("custom-reselected.toml");
+        crate::theme::install::init(&source, "custom-reselected", None).unwrap();
+        let installed = crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.apply_theme("custom-reselected");
+        app.flush_config_for_test(&rx);
+        app.request_theme_uninstall("custom-reselected");
+        app.apply_theme("custom-reselected");
+        app.flush_config_for_test(&rx);
+        assert!(installed.path.exists());
+        assert!(!app.theme_uninstall_pending("custom-reselected"));
+        assert_eq!(app.config.theme, "custom-reselected");
     }
 
     #[test]

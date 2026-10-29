@@ -19,6 +19,50 @@ pub enum Language {
     Ko,
 }
 
+pub(crate) fn machine_install_label(language: Language) -> &'static str {
+    match language {
+        Language::En => "Install compatible Luvus if needed",
+        Language::Es => "Instalar Luvus compatible si es necesario",
+        Language::Pt => "Instalar Luvus compatível se necessário",
+        Language::Fr => "Installer Luvus compatible si nécessaire",
+        Language::De => "Kompatibles Luvus bei Bedarf installieren",
+        Language::Id => "Instal Luvus yang kompatibel jika diperlukan",
+        Language::Zh => "需要时安装兼容的 Luvus",
+        Language::Ja => "必要に応じて互換性のある Luvus をインストール",
+        Language::Ko => "필요한 경우 호환되는 Luvus 설치",
+    }
+}
+
+pub(crate) fn machine_install_action_label(language: Language) -> &'static str {
+    match language {
+        Language::En => "install",
+        Language::Es => "instalar",
+        Language::Pt => "instalar",
+        Language::Fr => "installer",
+        Language::De => "installieren",
+        Language::Id => "instal",
+        Language::Zh => "安装",
+        Language::Ja => "インストール",
+        Language::Ko => "설치",
+    }
+}
+
+pub(crate) fn machine_saved_labels(
+    language: Language,
+) -> (&'static str, &'static str, &'static str) {
+    match language {
+        Language::En => ("Saved machines", "open", "enable"),
+        Language::Es => ("Máquinas guardadas", "abrir", "habilitar"),
+        Language::Pt => ("Máquinas salvas", "abrir", "ativar"),
+        Language::Fr => ("Machines enregistrées", "ouvrir", "activer"),
+        Language::De => ("Gespeicherte Maschinen", "öffnen", "aktivieren"),
+        Language::Id => ("Mesin tersimpan", "buka", "aktifkan"),
+        Language::Zh => ("已保存的机器", "打开", "启用"),
+        Language::Ja => ("保存済みのマシン", "開く", "有効化"),
+        Language::Ko => ("저장된 머신", "열기", "활성화"),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Context {
     language: Language,
@@ -132,6 +176,84 @@ macro_rules! tr {
 /// Entries are matched only as a complete line or a whitespace-delimited line
 /// suffix, so canonical syntax at the start of a row is never rewritten.
 static HELP: &[Translation] = &[
+    tr!("update an installed module", "actualizar un módulo instalado", "atualizar um módulo instalado", "mettre à jour un module installé", "ein installiertes Modul aktualisieren", "perbarui modul terpasang", "更新已安装的模块", "インストール済みモジュールを更新", "설치된 모듈 업데이트"),
+    tr!(
+        "Pairing links work once and expire after five minutes.",
+        "Los enlaces de vinculación se usan una vez y caducan a los cinco minutos.",
+        "Os links de pareamento funcionam uma vez e expiram após cinco minutos.",
+        "Les liens d’association sont à usage unique et expirent après cinq minutes.",
+        "Kopplungslinks sind einmalig und laufen nach fünf Minuten ab.",
+        "Tautan pemasangan berlaku sekali dan kedaluwarsa setelah lima menit.",
+        "配对链接只能使用一次，五分钟后失效。",
+        "ペアリングリンクは一度だけ使用でき、5 分後に失効します。",
+        "페어링 링크는 한 번만 사용할 수 있으며 5분 후 만료됩니다."
+    ),
+    tr!(
+        "Paired browsers remember access across tabs and browser restarts until the bridge stops.",
+        "Los navegadores vinculados conservan el acceso entre pestañas y reinicios hasta que se detiene el puente.",
+        "Os navegadores pareados mantêm o acesso entre abas e reinicializações até a ponte parar.",
+        "Les navigateurs associés conservent l’accès entre onglets et redémarrages jusqu’à l’arrêt du pont.",
+        "Gekoppelte Browser behalten den Zugriff über Tabs und Browserneustarts hinweg bis zum Stopp der Bridge.",
+        "Browser yang dipasangkan mengingat akses antar tab dan setelah dimulai ulang hingga bridge berhenti.",
+        "已配对的浏览器可跨标签页和浏览器重启保留访问权限，直到桥接器停止。",
+        "ペアリング済みブラウザーはタブ間や再起動後もアクセスを保持し、ブリッジ停止時に失効します。",
+        "페어링된 브라우저는 탭과 브라우저 재시작 간에 접근을 유지하며 브리지가 중지되면 만료됩니다."
+    ),
+    tr!(
+        "Press Enter in this terminal while the bridge runs to print a new one.",
+        "Pulsa Enter en esta terminal mientras funciona el puente para imprimir uno nuevo.",
+        "Pressione Enter neste terminal enquanto a ponte estiver ativa para imprimir um novo.",
+        "Appuyez sur Enter dans ce terminal pendant le fonctionnement du pont pour en afficher un nouveau.",
+        "Drücken Sie bei laufender Bridge in diesem Terminal Enter, um einen neuen Link auszugeben.",
+        "Tekan Enter di terminal ini saat bridge berjalan untuk mencetak tautan baru.",
+        "桥接器运行时，在此终端按 Enter 可显示新链接。",
+        "ブリッジ実行中にこのターミナルで Enter を押すと、新しいリンクを表示します。",
+        "브리지가 실행 중일 때 이 터미널에서 Enter를 누르면 새 링크가 출력됩니다."
+    ),
+    tr!(
+        "expire browser access after 1-86400 seconds (default: until bridge stops)",
+        "caducar el acceso del navegador tras 1-86400 segundos (predeterminado: hasta detener el puente)",
+        "expirar o acesso do navegador após 1-86400 segundos (padrão: até a ponte parar)",
+        "faire expirer l’accès après 1-86400 secondes (défaut : jusqu’à l’arrêt du pont)",
+        "Browserzugriff nach 1-86400 Sekunden beenden (Standard: bis zum Stopp der Bridge)",
+        "akhiri akses browser setelah 1-86400 detik (bawaan: hingga bridge berhenti)",
+        "在 1-86400 秒后使浏览器访问失效（默认：桥接器停止时）",
+        "1-86400 秒後にブラウザーのアクセスを失効（既定：ブリッジ停止時）",
+        "1-86400초 후 브라우저 접근 만료(기본값: 브리지 중지 시)"
+    ),
+    tr!(
+        "Serve the optional browser client",
+        "Servir el cliente web opcional",
+        "Servir o cliente web opcional",
+        "Servir le client web facultatif",
+        "Den optionalen Webclient bereitstellen",
+        "Sajikan klien web opsional",
+        "提供可选的 Web 客户端",
+        "オプションの Web クライアントを提供",
+        "선택적 웹 클라이언트 제공"
+    ),
+    tr!(
+        "web access:",
+        "acceso web:",
+        "acesso web:",
+        "accès web :",
+        "Webzugriff:",
+        "akses web:",
+        "Web 访问：",
+        "Web アクセス:",
+        "웹 접근:"
+    ),
+    tr!(
+        "serve the optional loopback browser client (read-only by default)",
+        "servir el cliente web opcional en loopback (solo lectura por defecto)",
+        "servir o cliente web opcional em loopback (somente leitura por padrão)",
+        "servir le client web facultatif en boucle locale (lecture seule par défaut)",
+        "den optionalen Loopback-Webclient bereitstellen (standardmäßig schreibgeschützt)",
+        "sajikan klien web loopback opsional (bawaan hanya-baca)",
+        "提供可选的回环 Web 客户端（默认只读）",
+        "オプションのループバック Web クライアントを提供（既定は読み取り専用）",
+        "선택적 루프백 웹 클라이언트 제공(기본값은 읽기 전용)"
+    ),
     tr!(
         "expose scoped UHP through a private provider endpoint",
         "exponer UHP con alcance mediante un endpoint privado para proveedores",
@@ -429,6 +551,127 @@ static HELP: &[Translation] = &[
         "会话：",
         "セッション：",
         "세션:"
+    ),
+    tr!(
+        "machines:",
+        "máquinas:",
+        "máquinas:",
+        "machines :",
+        "Maschinen:",
+        "mesin:",
+        "机器：",
+        "マシン：",
+        "머신:"
+    ),
+    tr!(
+        "Save, inspect, and open Luvus machines over SSH",
+        "Guardar, inspeccionar y abrir máquinas Luvus mediante SSH",
+        "Salvar, inspecionar e abrir máquinas Luvus por SSH",
+        "Enregistrer, inspecter et ouvrir des machines Luvus via SSH",
+        "Luvus-Maschinen über SSH speichern, prüfen und öffnen",
+        "Simpan, periksa, dan buka mesin Luvus melalui SSH",
+        "通过 SSH 保存、检查并打开 Luvus 机器",
+        "SSH 経由で Luvus マシンを保存、検査、接続",
+        "SSH로 Luvus 머신을 저장하고 검사하고 열기"
+    ),
+    tr!(
+        "provision and validate one SSH machine",
+        "aprovisionar y validar una máquina SSH",
+        "provisionar e validar uma máquina SSH",
+        "provisionner et valider une machine SSH",
+        "eine SSH-Maschine bereitstellen und prüfen",
+        "sediakan dan validasi satu mesin SSH",
+        "自动配置并验证一台 SSH 机器",
+        "SSH マシンをプロビジョニングして検証",
+        "SSH 머신 하나를 프로비저닝하고 검증"
+    ),
+    tr!(
+        "list saved machine profiles and catalog revision",
+        "listar perfiles de máquina guardados y la revisión del catálogo",
+        "listar perfis de máquina salvos e a revisão do catálogo",
+        "lister les profils de machine enregistrés et la révision du catalogue",
+        "gespeicherte Maschinenprofile und Katalogrevision auflisten",
+        "tampilkan profil mesin tersimpan dan revisi katalog",
+        "列出已保存的机器配置和目录修订版本",
+        "保存済みマシンプロファイルとカタログのリビジョンを一覧表示",
+        "저장된 머신 프로필과 카탈로그 리비전 나열"
+    ),
+    tr!(
+        "show one saved profile",
+        "mostrar un perfil guardado",
+        "mostrar um perfil salvo",
+        "afficher un profil enregistré",
+        "ein gespeichertes Profil anzeigen",
+        "tampilkan satu profil tersimpan",
+        "显示一个已保存的配置",
+        "保存済みプロファイルを表示",
+        "저장된 프로필 하나 표시"
+    ),
+    tr!(
+        "rename a profile with optional revision protection",
+        "renombrar un perfil con protección de revisión opcional",
+        "renomear um perfil com proteção de revisão opcional",
+        "renommer un profil avec une protection de révision facultative",
+        "ein Profil mit optionalem Revisionsschutz umbenennen",
+        "ganti nama profil dengan perlindungan revisi opsional",
+        "重命名配置，可选择启用修订版本保护",
+        "オプションのリビジョン保護付きでプロファイル名を変更",
+        "선택적 리비전 보호로 프로필 이름 변경"
+    ),
+    tr!(
+        "provision and enable after a bounded SSH probe, or disable locally",
+        "aprovisionar y habilitar tras una prueba SSH acotada o deshabilitar localmente",
+        "provisionar e habilitar após uma sondagem SSH limitada ou desabilitar localmente",
+        "provisionner et activer après une vérification SSH bornée ou désactiver localement",
+        "nach einer begrenzten SSH-Prüfung bereitstellen und aktivieren oder lokal deaktivieren",
+        "sediakan dan aktifkan setelah pemeriksaan SSH terbatas atau nonaktifkan secara lokal",
+        "在有限 SSH 探测后自动配置并启用，或在本地禁用",
+        "制限付き SSH プローブ後にプロビジョニングして有効化、またはローカルで無効化",
+        "제한된 SSH 검사 후 프로비저닝하고 활성화하거나 로컬에서 비활성화"
+    ),
+    tr!(
+        "remove only the local profile; remote panes stay alive",
+        "eliminar solo el perfil local; los paneles remotos siguen activos",
+        "remover apenas o perfil local; os painéis remotos continuam ativos",
+        "supprimer uniquement le profil local ; les volets distants restent actifs",
+        "nur das lokale Profil entfernen; entfernte Panes bleiben aktiv",
+        "hapus hanya profil lokal; pane jarak jauh tetap aktif",
+        "仅删除本地配置；远程窗格保持运行",
+        "ローカルプロファイルのみ削除し、リモートペインは稼働を継続",
+        "로컬 프로필만 제거하며 원격 창은 계속 실행"
+    ),
+    tr!(
+        "verify the running selected server and workspace projection",
+        "verificar el servidor seleccionado en ejecución y su proyección de espacios de trabajo",
+        "verificar o servidor selecionado em execução e sua projeção de espaços de trabalho",
+        "vérifier le serveur sélectionné en cours d'exécution et sa projection des espaces de travail",
+        "den laufenden ausgewählten Server und seine Workspace-Projektion prüfen",
+        "verifikasi server terpilih yang sedang berjalan dan proyeksi ruang kerjanya",
+        "验证正在运行的所选服务器及其工作区投影",
+        "実行中の選択済みサーバーとワークスペース投影を検証",
+        "실행 중인 선택 서버와 작업 공간 프로젝션 검증"
+    ),
+    tr!(
+        "list named sessions through bounded SSH",
+        "listar sesiones con nombre mediante SSH acotado",
+        "listar sessões nomeadas por SSH limitado",
+        "lister les sessions nommées via une connexion SSH bornée",
+        "benannte Sitzungen über begrenztes SSH auflisten",
+        "tampilkan sesi bernama melalui SSH terbatas",
+        "通过有限 SSH 列出命名会话",
+        "制限付き SSH 経由で名前付きセッションを一覧表示",
+        "제한된 SSH를 통해 이름 있는 세션 나열"
+    ),
+    tr!(
+        "attach using the verified absolute remote binary",
+        "conectar usando el binario remoto absoluto verificado",
+        "conectar usando o binário remoto absoluto verificado",
+        "se connecter avec le binaire distant absolu vérifié",
+        "mit der geprüften absoluten Remote-Binärdatei verbinden",
+        "sambungkan menggunakan biner jarak jauh absolut yang terverifikasi",
+        "使用已验证的远程二进制绝对路径连接",
+        "検証済みの絶対パスのリモートバイナリで接続",
+        "검증된 절대 경로의 원격 바이너리로 연결"
     ),
     tr!(
         "remote:",
@@ -1234,15 +1477,37 @@ static HELP: &[Translation] = &[
         "현재 탭의 패널과 읽기 전용 기록 지표 나열"
     ),
     tr!(
-        "split a pane (default: side by side, creates a workspace if empty)",
-        "dividir un panel (predeterminado: lado a lado, crea un espacio de trabajo si está vacío)",
-        "dividir um painel (padrão: lado a lado, cria um espaço de trabalho se estiver vazio)",
-        "diviser un volet (par défaut : côte à côte, crée un espace de travail si vide)",
-        "Bereich teilen (Standard: nebeneinander, erstellt bei Leerstand einen Arbeitsbereich)",
-        "bagi panel (bawaan: berdampingan, membuat ruang kerja jika kosong)",
-        "拆分窗格（默认：左右并排，空状态时创建工作区）",
-        "ペインを分割（既定：横並び、空の場合はワークスペースを作成）",
-        "패널 분할 (기본값: 좌우 분할, 비어 있으면 작업 공간 생성)"
+        "list panes across every workspace and tab",
+        "listar paneles de todos los espacios de trabajo y pestañas",
+        "listar painéis de todos os espaços de trabalho e abas",
+        "lister les volets de tous les espaces de travail et onglets",
+        "Bereiche aus allen Arbeitsbereichen und Tabs auflisten",
+        "daftar panel di semua ruang kerja dan tab",
+        "列出所有工作区和标签页中的窗格",
+        "すべてのワークスペースとタブのペインを一覧表示",
+        "모든 작업 공간과 탭의 패널 나열"
+    ),
+    tr!(
+        "split a pane (default: auto by size, creates a workspace if empty)",
+        "dividir un panel (predeterminado: automático según el tamaño, crea un espacio de trabajo si está vacío)",
+        "dividir um painel (padrão: automático pelo tamanho, cria um espaço de trabalho se estiver vazio)",
+        "diviser un volet (par défaut : automatique selon la taille, crée un espace de travail si vide)",
+        "Bereich teilen (Standard: automatisch nach Größe, erstellt bei Leerstand einen Arbeitsbereich)",
+        "bagi panel (bawaan: otomatis menurut ukuran, membuat ruang kerja jika kosong)",
+        "拆分窗格（默认：按长宽自动选择方向，空状态时创建工作区）",
+        "ペインを分割（既定：サイズに応じて自動、空の場合はワークスペースを作成）",
+        "패널 분할 (기본값: 크기에 따라 자동 분할, 비어 있으면 작업 공간 생성)"
+    ),
+    tr!(
+        "transpose the nearest split without changing focus",
+        "transponer la división más cercana sin cambiar el foco",
+        "transpor a divisão mais próxima sem mudar o foco",
+        "transposer la division la plus proche sans changer le focus",
+        "nächste Teilung umkehren, ohne den Fokus zu ändern",
+        "transpose pembagian terdekat tanpa mengubah fokus",
+        "互换最近的分屏方向，不改变焦点",
+        "フォーカスを変えずに最も近い分割方向を入れ替え",
+        "포커스를 바꾸지 않고 가장 가까운 분할 방향 바꾸기"
     ),
     tr!(
         "focus a pane (jumps to its workspace/tab)",
@@ -1278,15 +1543,15 @@ static HELP: &[Translation] = &[
         "패널에서 명령어 실행"
     ),
     tr!(
-        "send raw text to a pane",
-        "enviar texto sin procesar a un panel",
-        "enviar texto bruto para um painel",
-        "envoyer du texte brut à un volet",
-        "Rohtext an einen Bereich senden",
-        "kirim teks mentah ke panel",
-        "向窗格发送原始文本",
-        "ペインへ生テキストを送信",
-        "패널에 원본 텍스트 전송"
+        "paste text into a pane",
+        "pegar texto en un panel",
+        "colar texto em um painel",
+        "coller du texte dans un volet",
+        "Text in einen Bereich einfügen",
+        "tempelkan teks ke panel",
+        "将文本粘贴到窗格",
+        "ペインにテキストを貼り付け",
+        "패널에 텍스트 붙여넣기"
     ),
     tr!(
         "print a pane's recent output",
@@ -1795,6 +2060,28 @@ static HELP: &[Translation] = &[
         "모듈의 사이드바 도킹에 행 전달 (JSON 배열,"
     ),
     tr!(
+        "set AGENTS sidebar titles for live and resumable rows",
+        "definir títulos de la barra AGENTS para filas vivas y reanudables",
+        "definir títulos da barra AGENTS para linhas ativas e retomáveis",
+        "définir les titres de la barre AGENTS pour les lignes actives et reprises",
+        "AGENTS-Seitenleistentitel für Live- und fortsetzbare Zeilen setzen",
+        "atur judul bilah sisi AGENTS untuk baris live dan yang dapat dilanjutkan",
+        "设置 AGENTS 侧栏标题（活动与可恢复行）",
+        "AGENTS サイドバーのライブ行と履歴行のタイトルを設定",
+        "AGENTS 사이드바 타이틀을 실행 및 재개 행에 설정"
+    ),
+    tr!(
+        "clear module-provided AGENTS sidebar titles",
+        "borrar títulos de AGENTS aportados por un módulo",
+        "limpar títulos de AGENTS fornecidos por um módulo",
+        "effacer les titres AGENTS fournis par un module",
+        "von einem Modul gesetzte AGENTS-Titel löschen",
+        "hapus judul bilah sisi AGENTS dari modul",
+        "清除模块提供的 AGENTS 侧栏标题",
+        "モジュールが提供した AGENTS サイドバータイトルを消去",
+        "모듈이 제공한 AGENTS 사이드바 타이틀 지우기"
+    ),
+    tr!(
         "or piped on stdin). See docs/29 + the website",
         "o por stdin). Consulta docs/29 y el sitio web",
         "ou via stdin). Veja docs/29 e o site",
@@ -2191,15 +2478,15 @@ static HELP: &[Translation] = &[
         "준비된 다음 작업 할당 (--start로 워커 생성)"
     ),
     tr!(
-        "start a worker (worktree default; workspace shares checkout)",
-        "iniciar un trabajador (worktree predeterminado; workspace comparte el checkout)",
-        "iniciar um worker (worktree padrão; workspace compartilha o checkout)",
-        "démarrer un worker (worktree par défaut ; workspace partage le checkout)",
-        "Worker starten (Worktree ist Standard; Workspace teilt den Checkout)",
-        "jalankan worker (default worktree; workspace berbagi checkout)",
-        "启动工作进程（默认 worktree；workspace 共享检出目录）",
-        "ワーカーを起動（既定は worktree、workspace はチェックアウトを共有）",
-        "워커 시작 (기본값 worktree, workspace는 체크아웃 공유)"
+        "start a worker (worktree default; --no-focus preserves the view)",
+        "iniciar un trabajador (worktree predeterminado; --no-focus conserva la vista)",
+        "iniciar um worker (worktree padrão; --no-focus mantém a vista)",
+        "démarrer un worker (worktree par défaut ; --no-focus conserve la vue)",
+        "Worker starten (Worktree ist Standard; --no-focus behält die Ansicht bei)",
+        "jalankan worker (default worktree; --no-focus mempertahankan tampilan)",
+        "启动工作进程（默认 worktree；--no-focus 保留当前视图）",
+        "ワーカーを起動（既定は worktree、--no-focus で現在の表示を維持）",
+        "워커 시작 (기본값 worktree, --no-focus로 현재 보기 유지)"
     ),
     tr!(
         "report model context-window use, not task progress",
@@ -2233,6 +2520,17 @@ static HELP: &[Translation] = &[
         "标记完成并释放租约",
         "完了にして予約を解放",
         "완료 표시 및 임대 해제"
+    ),
+    tr!(
+        "queue a fresh attempt without deleting previous work",
+        "poner en cola un nuevo intento sin eliminar el trabajo anterior",
+        "colocar uma nova tentativa na fila sem excluir o trabalho anterior",
+        "mettre en file une nouvelle tentative sans supprimer le travail précédent",
+        "einen neuen Versuch einreihen, ohne frühere Arbeit zu löschen",
+        "antrekan percobaan baru tanpa menghapus pekerjaan sebelumnya",
+        "在不删除先前工作的情况下排队新的尝试",
+        "以前の作業を削除せずに新しい試行をキューへ追加",
+        "이전 작업을 삭제하지 않고 새 시도 대기열 추가"
     ),
     tr!(
         "integrate the task's branch into luvus/integration",
@@ -2614,6 +2912,105 @@ static HELP: &[Translation] = &[
 /// labels such as `name` can never be mistaken for a help-row description.
 static TEXT: &[Translation] = &[
     tr!(
+        "Pair this browser once within 5 minutes. Access is remembered across tabs and browser restarts.",
+        "Vincula este navegador una vez en 5 minutos. El acceso se conserva entre pestañas y reinicios.",
+        "Pareie este navegador uma vez em 5 minutos. O acesso é mantido entre abas e reinicializações.",
+        "Associez ce navigateur une fois dans les 5 minutes. L’accès est conservé entre onglets et redémarrages.",
+        "Koppeln Sie diesen Browser einmal innerhalb von 5 Minuten. Der Zugriff bleibt über Tabs und Browserneustarts erhalten.",
+        "Pasangkan browser ini sekali dalam 5 menit. Akses diingat antar tab dan setelah browser dimulai ulang.",
+        "请在 5 分钟内配对此浏览器。访问权限可跨标签页和浏览器重启保留。",
+        "5 分以内にこのブラウザーを一度ペアリングしてください。タブ間や再起動後もアクセスが保持されます。",
+        "5분 이내에 이 브라우저를 한 번 페어링하세요. 탭과 브라우저 재시작 간에 접근이 유지됩니다."
+    ),
+    tr!(
+        "Browser access expires after {seconds} seconds.",
+        "El acceso del navegador caduca tras {seconds} segundos.",
+        "O acesso do navegador expira após {seconds} segundos.",
+        "L’accès du navigateur expire après {seconds} secondes.",
+        "Der Browserzugriff läuft nach {seconds} Sekunden ab.",
+        "Akses browser kedaluwarsa setelah {seconds} detik.",
+        "浏览器访问将在 {seconds} 秒后失效。",
+        "ブラウザーのアクセスは {seconds} 秒後に失効します。",
+        "브라우저 접근은 {seconds}초 후 만료됩니다."
+    ),
+    tr!(
+        "Browser access lasts until this bridge stops or you forget this browser.",
+        "El acceso dura hasta detener este puente u olvidar este navegador.",
+        "O acesso dura até esta ponte parar ou você esquecer este navegador.",
+        "L’accès dure jusqu’à l’arrêt de ce pont ou à l’oubli de ce navigateur.",
+        "Der Zugriff gilt, bis diese Bridge stoppt oder Sie diesen Browser vergessen.",
+        "Akses berlaku hingga bridge ini berhenti atau Anda melupakan browser ini.",
+        "访问权限持续到此桥接器停止或您取消此浏览器的配对。",
+        "アクセスはブリッジ停止時、またはこのブラウザーの登録解除時まで有効です。",
+        "접근은 이 브리지가 중지되거나 이 브라우저를 잊을 때까지 유지됩니다."
+    ),
+    tr!(
+        "--ticket-ttl requires a value",
+        "--ticket-ttl requiere un valor",
+        "--ticket-ttl requer um valor",
+        "--ticket-ttl exige une valeur",
+        "--ticket-ttl erfordert einen Wert",
+        "--ticket-ttl memerlukan nilai",
+        "--ticket-ttl 需要一个值",
+        "--ticket-ttl には値が必要です",
+        "--ticket-ttl에는 값이 필요합니다"
+    ),
+    tr!(
+        "--ticket-ttl must be an integer from 1 through 86400",
+        "--ticket-ttl debe ser un entero entre 1 y 86400",
+        "--ticket-ttl deve ser um inteiro de 1 a 86400",
+        "--ticket-ttl doit être un entier compris entre 1 et 86400",
+        "--ticket-ttl muss eine ganze Zahl von 1 bis 86400 sein",
+        "--ticket-ttl harus berupa bilangan bulat dari 1 hingga 86400",
+        "--ticket-ttl 必须是 1 到 86400 之间的整数",
+        "--ticket-ttl は 1 から 86400 までの整数で指定してください",
+        "--ticket-ttl은 1에서 86400 사이의 정수여야 합니다"
+    ),
+    tr!(
+        "No room for another device: every allowed device is still connected. Forget a browser in Devices, close all its tabs, or restart with a larger --max-devices.",
+        "No hay espacio para otro dispositivo: todos siguen conectados. Olvida un navegador en Devices, cierra todas sus pestañas o reinicia con un --max-devices mayor.",
+        "Não há espaço para outro dispositivo: todos continuam conectados. Esqueça um navegador em Devices, feche todas as suas abas ou reinicie com --max-devices maior.",
+        "Aucune place pour un autre appareil : tous restent connectés. Oubliez un navigateur dans Devices, fermez tous ses onglets ou redémarrez avec --max-devices plus grand.",
+        "Kein Platz für ein weiteres Gerät: Alle sind noch verbunden. Vergessen Sie einen Browser in Devices, schließen Sie alle seine Tabs oder starten Sie mit größerem --max-devices neu.",
+        "Tidak ada ruang untuk perangkat lain: semuanya masih terhubung. Lupakan browser di Devices, tutup semua tabnya, atau mulai ulang dengan --max-devices lebih besar.",
+        "无法添加设备：所有允许的设备仍已连接。请在 Devices 中取消一个浏览器的配对，关闭其所有标签页，或使用更大的 --max-devices 重启。",
+        "追加のデバイス用の空きがありません。Devices でブラウザーの登録を解除するか、その全タブを閉じるか、--max-devices を増やして再起動してください。",
+        "다른 기기를 위한 자리가 없습니다. 모두 연결되어 있습니다. Devices에서 브라우저를 잊거나 모든 탭을 닫거나 --max-devices를 늘려 다시 시작하세요."
+    ),
+    tr!(
+        "--cwd may be passed only once",
+        "--cwd solo puede especificarse una vez",
+        "--cwd só pode ser especificado uma vez",
+        "--cwd ne peut être spécifié qu'une seule fois",
+        "--cwd darf nur einmal angegeben werden",
+        "--cwd hanya boleh diberikan sekali",
+        "--cwd 只能指定一次",
+        "--cwd は一度だけ指定できます",
+        "--cwd는 한 번만 지정할 수 있습니다"
+    ),
+    tr!(
+        "--cwd must be valid UTF-8",
+        "--cwd debe ser UTF-8 válido",
+        "--cwd deve ser UTF-8 válido",
+        "--cwd doit être un UTF-8 valide",
+        "--cwd muss gültiges UTF-8 sein",
+        "--cwd harus berupa UTF-8 yang valid",
+        "--cwd 必须是有效的 UTF-8",
+        "--cwd は有効な UTF-8 である必要があります",
+        "--cwd는 유효한 UTF-8이어야 합니다"
+    ),
+    tr!(
+        "exact search query must be at most 4096 bytes",
+        "la búsqueda exacta no puede superar los 4096 bytes",
+        "a busca exata não pode exceder 4096 bytes",
+        "la recherche exacte ne doit pas dépasser 4096 octets",
+        "die exakte Suchanfrage darf höchstens 4096 Bytes lang sein",
+        "kueri pencarian persis maksimal 4096 byte",
+        "精确搜索查询不得超过 4096 字节",
+        "完全一致検索のクエリは 4096 バイト以下にしてください",
+        "정확 검색어는 4096바이트를 초과할 수 없습니다"
+    ),
+    tr!(
         "Could not authorize UHP access.",
         "No se pudo autorizar el acceso UHP.",
         "Não foi possível autorizar o acesso UHP.",
@@ -2794,6 +3191,9 @@ static TEXT: &[Translation] = &[
         "생성됨"),
     tr!("valid theme", "tema válido", "tema válido", "thème valide", "gültiges Theme", "tema valid", "有效主题", "有効なテーマ",
         "유효한 테마"),
+    tr!("Update module from", "Actualizar módulo desde", "Atualizar módulo de", "Mettre à jour le module depuis", "Modul aktualisieren von", "Perbarui modul dari", "更新模块，来源", "モジュールの更新元", "모듈 업데이트 출처"),
+    tr!("selected server does not support module.update", "el servidor seleccionado no admite module.update", "o servidor selecionado não suporta module.update", "le serveur sélectionné ne prend pas en charge module.update", "der ausgewählte Server unterstützt module.update nicht", "server yang dipilih tidak mendukung module.update", "所选服务器不支持 module.update", "選択したサーバーは module.update をサポートしていません", "선택한 서버가 module.update를 지원하지 않습니다"),
+    tr!("linked modules must be updated in their own working directory", "los módulos vinculados deben actualizarse en su propio directorio de trabajo", "módulos vinculados devem ser atualizados em seu próprio diretório de trabalho", "les modules liés doivent être mis à jour dans leur propre répertoire de travail", "verknüpfte Module müssen in ihrem eigenen Arbeitsverzeichnis aktualisiert werden", "modul tertaut harus diperbarui di direktori kerjanya sendiri", "本地链接模块必须在其工作目录中更新", "リンク済みモジュールは自身の作業ディレクトリで更新してください", "연결된 모듈은 자체 작업 디렉터리에서 업데이트해야 합니다"),
     tr!("installed", "instalado", "instalado", "installé", "installiert", "terpasang", "已安装", "インストール済み",
         "설치됨"),
     tr!("from", "desde", "de", "depuis", "von", "dari", "来源", "取得元",
@@ -3005,6 +3405,44 @@ mod tests {
             assert_eq!(Language::from_code(code).code(), *code);
         }
         assert_eq!(Language::from_code("unknown"), Language::En);
+    }
+
+    #[test]
+    fn exact_search_limit_diagnostic_is_localized() {
+        let source = "exact search query must be at most 4096 bytes";
+        for code in crate::i18n::LANGS {
+            let language = Language::from_code(code);
+            assert_eq!(diagnostic(source, language), text(source, language));
+            if language != Language::En {
+                assert_ne!(diagnostic(source, language), source);
+            }
+        }
+    }
+
+    #[test]
+    fn pane_split_cwd_diagnostics_are_localized() {
+        for source in ["--cwd may be passed only once", "--cwd must be valid UTF-8"] {
+            for code in crate::i18n::LANGS {
+                let language = Language::from_code(code);
+                let translated = diagnostic(source, language);
+                assert!(translated.contains("--cwd"));
+                if source.contains("UTF-8") {
+                    assert!(translated.contains("UTF-8"));
+                }
+                if language != Language::En {
+                    assert_ne!(translated, source, "{code} kept the English diagnostic");
+                }
+            }
+        }
+        let usage = "usage: luvus pane split [<id>] [--cwd <path>]";
+        for code in crate::i18n::LANGS {
+            let language = Language::from_code(code);
+            let translated = diagnostic(usage, language);
+            assert!(translated.contains("luvus pane split [<id>] [--cwd <path>]"));
+            if language != Language::En {
+                assert_ne!(translated, usage, "{code} kept the English usage label");
+            }
+        }
     }
 
     #[test]

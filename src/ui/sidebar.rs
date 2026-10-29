@@ -18,7 +18,7 @@ fn attention(s: State) -> u8 {
 }
 
 /// Most urgent pane state across a whole workspace.
-fn rollup(app: &App, ws_index: usize) -> State {
+pub(crate) fn rollup(app: &App, ws_index: usize) -> State {
     let mut best = State::Idle;
     if let Some(ws) = app.workspaces.get(ws_index) {
         for tab in &ws.tabs {
@@ -48,10 +48,14 @@ pub(super) type SidebarHits = (
 type WorkspaceHits = (Vec<(usize, Rect)>, Option<Rect>);
 type AgentHits = (Vec<(PaneId, Rect)>, Vec<(String, Rect)>, Vec<(usize, Rect)>);
 
-/// Rows of sidebar chrome above the dock stack: the brand/menu row plus one
-/// blank separator row. The dock body, and therefore dock-height measurement
-/// during a divider drag, starts this many rows below the sidebar origin.
+/// Rows of sidebar chrome above the dock stack: the session/menu row plus one
+/// blank separator row. Dock layout and divider-drag measurement share this
+/// offset on both sides so titles never touch the top chrome.
 pub(crate) const SIDEBAR_CHROME_ROWS: u16 = 2;
+
+/// Rows every dock spends on its title. Content follows immediately below it;
+/// the blank separator belongs above the dock stack, not inside each dock.
+pub(crate) const DOCK_HEADER_ROWS: u16 = 1;
 
 /// Rows an expanded list item occupies: two content rows, drawn back-to-back.
 const EXPANDED_ROW_STRIDE: u16 = 2;
@@ -82,22 +86,15 @@ fn draw_scrollbar(
     scroll: usize,
     t: &Theme,
 ) {
-    if total <= cap || track.height == 0 {
-        return;
-    }
-    let len = track.height as usize;
-    let thumb = (len * cap / total).clamp(1, len);
-    let span = total - cap;
-    let pos = ((len - thumb) * scroll.min(span))
-        .checked_div(span)
-        .unwrap_or(0);
-    let buf = f.buffer_mut();
-    for i in 0..len {
-        let on = i >= pos && i < pos + thumb;
-        let cell = &mut buf[(track.x, track.y + i as u16)];
-        cell.set_symbol("▕");
-        cell.set_fg(if on { t.overlay1 } else { t.surface1 });
-    }
+    super::workspace_row::scrollbar(
+        f.buffer_mut(),
+        track,
+        total,
+        cap,
+        scroll,
+        t.overlay1,
+        t.surface1,
+    );
 }
 
 /// Split a sidebar `body` rect into `n` stacked dock slots with a one-row
@@ -374,6 +371,15 @@ fn draw_named_session_button(
     t: &Theme,
 ) {
     let available = right.saturating_sub(x);
+    let slot = Rect::new(x, y, available, 1);
+    app.named_session_slot_rect = (app.server_mode && slot.width > 0).then_some(slot);
+    if app.client_shell_owns_session_chrome {
+        // The machine-aware client owns this complete interval. A remote
+        // endpoint must contribute neither session pixels nor a live hit
+        // target, regardless of the length of its backing session name.
+        app.named_session_button_rect = None;
+        return;
+    }
     let name = crate::ui::truncate(
         &crate::session::display_name(),
         available.saturating_sub(2) as usize,
@@ -415,6 +421,21 @@ fn draw_workspaces_dock(
     };
     let mut ws_rects = Vec::new();
 
+    // A machine-aware thin client owns the complete Workspaces projection.
+    // The server still chooses the native dock geometry and theme, but leaves
+    // its cells blank so the client can present one stable list containing
+    // owner-local workspaces and remote machines while endpoint content swaps
+    // underneath it. This also gives popup/modal occlusion a clean baseline.
+    if app.client_machine_capable {
+        app.client_shell_dock_rect = Some(area);
+        if app.client_shell_owns_workspaces {
+            // Preserve native keyboard paging and menu anchoring even though
+            // endpoint grouping is painted by the thin client.
+            app.workspaces_area = area;
+            return (ws_rects, None);
+        }
+    }
+
     line_at(f, area.y, header(cat.workspaces, t));
     let new_ws_rect = if area.width >= 8 {
         let rect = Rect::new(area.right().saturating_sub(4), area.y, 3, 1);
@@ -429,12 +450,37 @@ fn draw_workspaces_dock(
     } else {
         None
     };
-    let nlist_top = area.y + 1;
-    let nrows = area.height.saturating_sub(1);
+    let nlist_top = area.y + DOCK_HEADER_ROWS;
+    let nrows = area.height.saturating_sub(DOCK_HEADER_ROWS);
     let paths_visible = app.config.layout.workspace_paths;
     let row_stride = dock_row_stride(paths_visible);
-    let ncap = list_capacity(nrows, row_stride);
     let ntotal = app.workspaces.len();
+    // A machine-aware display client owns only the endpoint labels. The server
+    // still owns the Workspaces layout and appends a bounded client projection
+    // to this list, so remote endpoints share its row height and Show Paths
+    // behavior without receiving the owner-local machine catalog.
+    let endpoint_count = if app.client_shell_dock_rect.is_none() {
+        usize::from(app.client_shell_dock_rows)
+    } else {
+        0
+    };
+    let total_capacity = list_capacity(nrows, row_stride);
+    let workspace_floor = usize::from(ntotal > 0 && total_capacity > 0);
+    let endpoint_capacity = if endpoint_count <= total_capacity.saturating_sub(workspace_floor) {
+        endpoint_count
+    } else {
+        // Never expose a misleading partial endpoint list. The machine-aware
+        // client keeps its complete keyboard selector in Menu when the
+        // Workspaces dock is too short for every saved endpoint.
+        0
+    };
+    let ncap = total_capacity.saturating_sub(endpoint_capacity);
+    let endpoint_leading = app.client_shell_dock_leading && endpoint_capacity > 0;
+    let machine_children = endpoint_leading && app.client_shell_dock_indent_workspaces;
+    let endpoint_rows = u16::try_from(endpoint_capacity)
+        .unwrap_or(u16::MAX)
+        .saturating_mul(row_stride);
+    let workspace_top = nlist_top.saturating_add(if endpoint_leading { endpoint_rows } else { 0 });
     // Draw order groups each worktree under the node it branched from (docs/18
     // WT-4), so scroll positions index into this order, not raw creation order.
     let order = app.workspace_display_order();
@@ -461,104 +507,68 @@ fn draw_workspaces_dock(
         app.last_active_ws_shown = app.active_ws;
     }
     app.workspaces_scroll = app.workspaces_scroll.min(ntotal.saturating_sub(ncap));
-    app.workspaces_area = Rect::new(area.x, nlist_top, area.width, nrows);
     let nscroll = app.workspaces_scroll;
-    for (vi, (i, is_member)) in order.into_iter().skip(nscroll).take(ncap).enumerate() {
-        let y = nlist_top + vi as u16 * row_stride;
+    let visible = order
+        .into_iter()
+        .skip(nscroll)
+        .take(ncap)
+        .collect::<Vec<_>>();
+    let workspace_rows = u16::try_from(visible.len())
+        .unwrap_or(u16::MAX)
+        .saturating_mul(row_stride);
+    app.workspaces_area = Rect::new(area.x, workspace_top, area.width, workspace_rows);
+    for (vi, (i, is_member)) in visible.into_iter().enumerate() {
+        let y = workspace_top + vi as u16 * row_stride;
         let active = i == app.active_ws;
         let selected = keyboard_focused && nscroll + vi == app.workspace_cursor;
         ws_rects.push((i, Rect::new(area.x, y, area.width, row_stride)));
         let st = rollup(app, i);
         let ws = &app.workspaces[i];
-        let terminal_cwd = app.workspace_terminal_cwd(i).unwrap_or(&ws.cwd);
-        let name_style = if selected || active {
-            Style::new().fg(t.accent).bold()
-        } else {
-            Style::new().fg(t.subtext1)
-        };
-        // A linked worktree is nested under its parent checkout with a connector.
-        let indent: u16 = if is_member { 2 } else { 0 };
-        // Row 1: state dot + workspace name + git branch (dot aligned with "WORKSPACES").
-        // On a narrow sidebar the name keeps priority: it is ellipsized only when
-        // it can't share the row, and the branch is fitted (then ellipsized, then
-        // dropped) into whatever space is left, so the row never hard-cuts.
-        let avail = (cw as usize).saturating_sub(indent as usize + 2);
-        let name_w = crate::ui::display_width(&ws.name);
-        let (name_disp, branch_disp) = match &ws.branch {
-            Some(b) => {
-                let branch_seg = 2 + crate::ui::display_width(b); // "  branch"
-                if name_w + branch_seg <= avail {
-                    (ws.name.clone(), Some(b.clone()))
-                } else if name_w + 4 <= avail {
-                    (
-                        ws.name.clone(),
-                        Some(crate::ui::truncate(b, avail - name_w - 2)),
-                    )
-                } else {
-                    (crate::ui::truncate(&ws.name, avail), None)
-                }
-            }
-            None => (crate::ui::truncate(&ws.name, avail), None),
-        };
-        let mut line1: Vec<Span> = Vec::new();
-        if is_member {
-            line1.push(Span::styled("└ ", Style::new().fg(t.overlay0)));
-        }
-        line1.push(Span::styled(st.dot(), Style::new().fg(st.color(t))));
-        line1.push(Span::raw(" "));
-        line1.push(Span::styled(name_disp, name_style));
-        if let Some(b) = &branch_disp {
-            line1.push(Span::styled(
-                format!("  {b}"),
-                Style::new().fg(if selected {
-                    t.accent
-                } else if active {
-                    t.green
-                } else {
-                    t.overlay0
-                }),
-            ));
-        }
-        line_at(f, y, Line::from(line1));
-        if paths_visible {
-            // Row 2: the project path, indented under the name (extra for members).
-            let pad = 2 + indent as usize;
-            line_at(
-                f,
-                y + 1,
-                Line::from(Span::styled(
-                    format!(
-                        "{}{}",
-                        " ".repeat(pad),
-                        short_path(terminal_cwd, cw.saturating_sub(pad as u16))
-                    ),
-                    Style::new().fg(if selected {
-                        t.accent
-                    } else if active {
-                        t.subtext0
-                    } else {
-                        t.overlay0
-                    }),
-                )),
-            );
-        }
-        if active || selected {
-            let buf = f.buffer_mut();
-            for row in y..y + row_stride {
-                for x in area.x..area.right().saturating_sub(1) {
-                    buf[(x, row)].set_bg(if selected { t.surface1 } else { t.sel_bg });
-                }
-            }
-        }
+        super::workspace_row::draw(
+            f.buffer_mut(),
+            Rect::new(area.x, y, area.width, row_stride),
+            super::workspace_row::WorkspaceRow {
+                name: &ws.name,
+                branch: ws.branch.as_deref(),
+                path: &short_path(&ws.cwd, u16::MAX),
+                dot: st.dot(),
+                dot_color: st.color(t),
+                nested: machine_children || is_member,
+                active,
+                selected,
+                hovered: false,
+            },
+            super::workspace_row::Palette {
+                accent: t.accent,
+                normal: t.subtext1,
+                muted: t.overlay0,
+                path: t.subtext0,
+                branch: t.green,
+                active_bg: t.sel_bg,
+                selected_bg: t.surface1,
+            },
+        );
     }
     draw_scrollbar(
         f,
-        Rect::new(bar_col, nlist_top, 1, nrows),
+        Rect::new(bar_col, workspace_top, 1, workspace_rows),
         ntotal,
         ncap,
         nscroll,
         t,
     );
+    if endpoint_capacity > 0 {
+        app.client_shell_dock_rect = Some(Rect::new(
+            area.x,
+            if endpoint_leading {
+                nlist_top
+            } else {
+                workspace_top.saturating_add(workspace_rows)
+            },
+            area.width,
+            endpoint_rows,
+        ));
+    }
     (ws_rects, new_ws_rect)
 }
 
@@ -612,7 +622,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     // Workspace scope is controlled by prefix `A`, Settings → Keys, or an
     // agent/session row's context menu. It consumes no extra dock row.
     let scoped = app.agents_scope_active();
-    let alist_top = aheader + 1;
+    let alist_top = aheader + DOCK_HEADER_ROWS;
     let arows = area.bottom().saturating_sub(alist_top);
     let paths_visible = app.config.layout.agent_paths;
     let row_stride = dock_row_stride(paths_visible);
@@ -631,7 +641,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         for tab in &ws.tabs {
             for id in tab.layout.leaves() {
                 if let Some(s) = app.status.get(&id) {
-                    let is_agent = app.manifests.is_agent(&s.agent) || s.agent_session.is_some();
+                    let is_agent = app.is_status_reporter_pane(id);
                     if !is_agent {
                         continue;
                     }
@@ -790,11 +800,19 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 let id = *id;
                 let focused = id == focus;
                 let st = pane_state(app, id);
-                let agent = app
+                let mut agent = app
+                    .status_reporter_label(id)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(progress) = app
                     .status
                     .get(&id)
-                    .map(|s| s.agent.clone())
-                    .unwrap_or_default();
+                    .filter(|s| s.state_source == "program_status")
+                    .and_then(|s| s.program_status.as_ref())
+                    .and_then(|store| store.effective_progress())
+                {
+                    agent.push_str(&format!(" · {progress}%"));
+                }
                 let name_style = if focused {
                     Style::new().fg(t.accent).bold()
                 } else {
@@ -824,8 +842,8 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         .agent_name_for(id)
                         .map(|n| format!("={n}"))
                         .unwrap_or_else(|| format!("={}", id.0));
-                    // When enabled, show the live OSC title in place of the meta
-                    // line; fall back when the agent set no useful title.
+                    // When enabled, show OSC first, then a module-provided
+                    // title; fall back to workspace · =pane when neither is set.
                     let meta = app
                         .config
                         .layout
@@ -924,11 +942,21 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("project");
+                    let meta = app
+                        .config
+                        .layout
+                        .agent_title
+                        .then(|| {
+                            app.agent_row_title_for_session(&s.agent, &s.session_id)
+                                .map(|title| format!("  {title}"))
+                        })
+                        .flatten()
+                        .unwrap_or_else(|| format!("  {proj}"));
                     line_at(
                         f,
                         y + 1,
                         Line::from(Span::styled(
-                            crate::ui::truncate(&format!("  {proj}"), cw as usize),
+                            crate::ui::truncate(&meta, cw as usize),
                             Style::new().fg(t.overlay0),
                         )),
                     );
@@ -1010,8 +1038,8 @@ fn draw_module_dock(f: &mut RenderTarget, area: Rect, id: &str, app: &mut App, t
         None => (id.to_string(), Vec::new()),
     };
     line_at(f, area.y, header(&title, t));
-    let list_top = area.y + 1;
-    let cap = area.height.saturating_sub(1) as usize;
+    let list_top = area.y + DOCK_HEADER_ROWS;
+    let cap = area.height.saturating_sub(DOCK_HEADER_ROWS) as usize;
     for (i, row) in rows.iter().take(cap).enumerate() {
         let y = list_top + i as u16;
         let mut spans: Vec<Span> = Vec::new();
@@ -1022,8 +1050,56 @@ fn draw_module_dock(f: &mut RenderTarget, area: Rect, id: &str, app: &mut App, t
             spans.push(Span::raw(" "));
             prefix_w = 2;
         }
-        let text = crate::ui::truncate(&row.text, (cw as usize).saturating_sub(prefix_w));
-        spans.push(Span::styled(text, Style::new().fg(t.subtext1)));
+        let tone_of = |name: Option<&str>| {
+            name.and_then(crate::bar::BarTone::from_name)
+                .map_or(t.subtext1, |tone| crate::bar::render::tone_color(tone, t))
+        };
+        let row_color = tone_of(row.tone.as_deref());
+        let budget = (cw as usize).saturating_sub(prefix_w);
+        if row.spans.is_empty() {
+            let text = crate::ui::truncate(&row.text, budget);
+            spans.push(Span::styled(text, Style::new().fg(row_color)));
+        } else {
+            // Truncate the joined spans as one line, exactly like `truncate`
+            // does for plain text: when they overflow, the last column is the
+            // ellipsis, so a dropped tail (`72%` after a bar that exactly fills
+            // the dock) is never silent.
+            let total: usize = row
+                .spans
+                .iter()
+                .map(|sp| crate::ui::display_width(&sp.text))
+                .sum();
+            let ellipsis = total > budget && budget > 0;
+            let mut left = if ellipsis { budget - 1 } else { budget };
+            let mut last_color = row_color;
+            for sp in &row.spans {
+                if left == 0 {
+                    break;
+                }
+                let text = crate::ui::clip_columns(&sp.text, left);
+                let shown = crate::ui::display_width(&text);
+                // A span that did not fit whole ends the line, even when it
+                // put nothing on screen (a wide glyph at the edge). Otherwise
+                // the spans after it would slide left into its place and the
+                // row would read as a different value than the module sent.
+                let cut = shown < crate::ui::display_width(&sp.text);
+                left -= shown;
+                if shown > 0 {
+                    last_color = if sp.tone.is_some() {
+                        tone_of(sp.tone.as_deref())
+                    } else {
+                        row_color
+                    };
+                    spans.push(Span::styled(text, Style::new().fg(last_color)));
+                }
+                if cut {
+                    break;
+                }
+            }
+            if ellipsis {
+                spans.push(Span::styled("…", Style::new().fg(last_color)));
+            }
+        }
         line_at(f, y, Line::from(spans));
         if row.action.is_some() {
             app.module_dock_rects
@@ -1190,6 +1266,72 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_chrome_keeps_one_blank_row_above_dock_titles() {
+        let _env = crate::persist::test_env("sidebar-chrome-spacing");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.server_mode = true;
+        app.sidebars.left.docks = vec![crate::app::DockKind::Workspaces];
+        app.sidebars.right.docks = vec![crate::app::DockKind::Files];
+        app.sidebars.right.visible = true;
+        app.file_tree.apply_dir(
+            app.file_tree.root().to_path_buf(),
+            vec![crate::files::Entry {
+                name: "spacing.rs".into(),
+                is_dir: false,
+            }],
+        );
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        for width in [crate::app::SIDEBAR_WIDTH_MIN, 35] {
+            app.sidebars.left.width = width;
+            app.sidebars.right.width = width;
+            for left_visible in [true, false] {
+                app.sidebars.left.visible = left_visible;
+                for client_owned in [false, true] {
+                    app.client_machine_capable = client_owned;
+                    app.client_shell_owns_workspaces = client_owned;
+                    term.draw(|frame| crate::ui::render(frame, &mut app))
+                        .unwrap();
+                    let chrome_y = app.last_main_area.y;
+                    let buf = term.backend().buffer();
+                    let mut docks = vec![app.files_area];
+                    if left_visible {
+                        if client_owned {
+                            assert_eq!(app.client_shell_dock_rect, Some(app.workspaces_area));
+                            docks.push(app.client_shell_dock_rect.unwrap());
+                        } else {
+                            assert_eq!(app.ws_rects[0].1.y, chrome_y + 3);
+                            docks.push(Rect::new(
+                                app.workspaces_area.x,
+                                app.new_ws_rect.unwrap().y,
+                                app.workspaces_area.width,
+                                1,
+                            ));
+                        }
+                    }
+                    for dock in docks {
+                        assert_eq!(
+                            dock.y,
+                            chrome_y + 2,
+                            "the title follows the chrome and exactly one blank row"
+                        );
+                        assert!(
+                            (dock.x + 1..dock.right().saturating_sub(1))
+                                .all(|x| { buf.cell((x, chrome_y + 1)).unwrap().symbol() == " " }),
+                            "the separator stays blank on either sidebar"
+                        );
+                    }
+                    assert_eq!(app.files_mode_rects[0].1.y, chrome_y + 2);
+                    assert_eq!(app.file_tree_rects[0].1.y, chrome_y + 3);
+                    assert_eq!(app.settings_icon_rect.unwrap().y, chrome_y);
+                    assert_eq!(app.named_session_button_rect.unwrap().y, chrome_y);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn keyboard_focus_highlights_workspace_and_agent_rows() {
         let _env = crate::persist::test_env("sidebar-keyboard-highlight");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -1253,6 +1395,43 @@ mod tests {
             .unwrap();
         assert_eq!(app.ws_rects[0].1.height, 1);
         assert_eq!(app.session_rects[0].1.height, 1);
+    }
+
+    #[test]
+    fn workspace_sidebar_keeps_the_stored_root_when_the_pane_moves() {
+        let _env = crate::persist::test_env("sidebar-static-workspace-root");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let pane = app.layout().focus;
+        let root = std::path::PathBuf::from("static-root");
+        let live = std::path::PathBuf::from("live-cwd");
+        app.workspaces[0].cwd = root.clone();
+        app.panes.get_mut(&pane).unwrap().cwd = live.clone();
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        let workspace = app.ws_rects[0].1;
+        let path_row: String = (workspace.x..workspace.right())
+            .map(|column| {
+                term.backend()
+                    .buffer()
+                    .cell((column, workspace.y + 1))
+                    .map(|cell| cell.symbol())
+                    .unwrap_or(" ")
+            })
+            .collect();
+        assert!(path_row.contains(&root.display().to_string()), "{path_row}");
+        assert!(
+            !path_row.contains(&live.display().to_string()),
+            "{path_row}"
+        );
+        assert_eq!(
+            app.workspace_terminal_cwd(0),
+            Some(live.as_path()),
+            "the API projection still exposes the focused pane cwd"
+        );
     }
 
     /// The column each agent row's state label starts at, for every row drawn.
@@ -1335,6 +1514,28 @@ mod tests {
             !sidebar.contains(long),
             "the full over-long name is never rendered in the sidebar"
         );
+    }
+
+    #[test]
+    fn osc7501_program_reporter_has_display_row_without_agent_capabilities() {
+        let _env = crate::persist::test_env("osc7501-sidebar-program");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let pane = app.layout().focus;
+        let mut store = crate::terminal::program_status::ProgramStatusStore::default();
+        store.apply(
+            crate::terminal::program_status::parse_report(b"state=working:app=cargo:progress=40")
+                .unwrap(),
+        );
+        app.status.get_mut(&pane).unwrap().agent = "zsh".into();
+        app.sync_program_status(pane, store);
+        app.status.get_mut(&pane).unwrap().state = crate::ui::theme::State::Working;
+        app.status.get_mut(&pane).unwrap().state_source = "program_status";
+        assert!(!app.is_agent_pane(pane));
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "cargo · 40%"));
+        assert!(app.agent_rects.iter().any(|(id, _)| *id == pane));
     }
 
     // The focused agent's "project · =pane" line sits on the selection
@@ -1632,6 +1833,66 @@ mod tests {
             "closed-workspace schedules do not leak into the remaining scope"
         );
     }
+
+    #[test]
+    fn agent_title_shows_module_title_not_alias() {
+        let _env = crate::persist::test_env("agent-module-title");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.config.layout.agent_title = true;
+        let id = app.layout().focus;
+        {
+            let status = app.status.get_mut(&id).unwrap();
+            status.agent = "pi".into();
+            status.agent_session = Some(crate::app::AgentSession {
+                agent: "pi".into(),
+                session_id: "sess-1".into(),
+            });
+        }
+        app.agent_names.insert("chezmoi".into(), id);
+        assert!(app.set_agent_row_title_for_session(
+            "pi".into(),
+            "sess-1".into(),
+            Some("Ship desktop".into()),
+        ));
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            buffer_contains(&term, "Ship desktop"),
+            "idle live rows show the module-provided session title"
+        );
+        assert!(
+            !buffer_contains(&term, "=chezmoi"),
+            "a Luvus pane alias must not stand in for the session title"
+        );
+    }
+
+    #[test]
+    fn resumable_rows_show_module_session_title() {
+        let _env = crate::persist::test_env("resumable-module-title");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.config.layout.agent_title = true;
+        app.agents_active_only = false;
+        app.resumable = vec![crate::agent::SessionInfo {
+            agent: "pi".into(),
+            session_id: "sess-closed".into(),
+            cwd: std::path::PathBuf::from("/tmp/proj"),
+            updated: std::time::SystemTime::UNIX_EPOCH,
+        }];
+        assert!(app.set_agent_row_title_for_session(
+            "pi".into(),
+            "sess-closed".into(),
+            Some("Closed session name".into()),
+        ));
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "resume"));
+        assert!(
+            buffer_contains(&term, "Closed session name"),
+            "All history rows show the module-provided title"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1682,6 +1943,283 @@ mod chrome_colour_tests {
             seam(&term),
             t.border_focus,
             "the hovered resize seam uses the focus border colour"
+        );
+    }
+}
+
+/// Module dock rows with a `tone` or `spans` (docs: *Writing a Module*, dock
+/// field table). Rendered through the real sidebar so the colours below are
+/// what a module author sees, not what a helper returns.
+#[cfg(test)]
+mod dock_tone_tests {
+    use crate::app::{App, DockRow, DockSpan, Side};
+    use ratatui::{backend::TestBackend, style::Color, Terminal};
+
+    fn row(text: &str, tone: Option<&str>, spans: &[(&str, Option<&str>)]) -> DockRow {
+        DockRow {
+            text: text.into(),
+            dot: None,
+            tone: tone.map(Into::into),
+            spans: spans
+                .iter()
+                .map(|(text, tone)| DockSpan {
+                    text: (*text).into(),
+                    tone: tone.map(Into::into),
+                })
+                .collect(),
+            action: Some("noop".into()),
+            value: None,
+            menu: Vec::new(),
+        }
+    }
+
+    fn render(app: &mut App) -> Terminal<TestBackend> {
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, app)).unwrap();
+        term
+    }
+
+    /// The `TestEnv` comes back with the app so `$LUVUS_HOME` stays isolated
+    /// for the whole test body, not just this call.
+    fn app_with_rows(
+        name: &str,
+        rows: Vec<DockRow>,
+    ) -> (crate::persist::TestEnv, App, Terminal<TestBackend>) {
+        let env = crate::persist::test_env(name);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.push_module_dock("mod:quota", Some("QUOTA".into()), Side::Left, rows);
+        assert_eq!(
+            app.sidebars
+                .side_of(&crate::app::DockKind::Module("mod:quota".into())),
+            Some(Side::Left),
+            "the dock mounted, so its rows are on screen"
+        );
+        let term = render(&mut app);
+        (env, app, term)
+    }
+
+    /// Where `needle` starts in the buffer, compared cell by cell so a
+    /// multi-byte glyph such as `━` counts as one column (a byte offset from
+    /// `str::find` would land on the wrong cell).
+    fn locate(term: &Terminal<TestBackend>, needle: &str) -> Option<(u16, u16)> {
+        let buf = term.backend().buffer();
+        let want: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        for r in 0..buf.area.height {
+            let syms: Vec<&str> = (0..buf.area.width)
+                .map(|c| buf.cell((c, r)).map(|x| x.symbol()).unwrap_or(" "))
+                .collect();
+            for start in 0..=syms.len().saturating_sub(want.len()) {
+                if want.iter().enumerate().all(|(i, w)| syms[start + i] == w) {
+                    return Some((start as u16, r));
+                }
+            }
+        }
+        None
+    }
+
+    fn fg_at(term: &Terminal<TestBackend>, needle: &str) -> Color {
+        let (x, y) = locate(term, needle).unwrap_or_else(|| panic!("{needle:?} is on screen"));
+        term.backend().buffer().cell((x, y)).unwrap().fg
+    }
+
+    #[test]
+    fn row_tone_colours_the_text_and_untoned_rows_keep_the_default() {
+        let (_env, app, term) = app_with_rows(
+            "dock-tone-row",
+            vec![
+                row("session 72%", Some("success"), &[]),
+                row("plain row", None, &[]),
+                row("typo row", Some("reddish"), &[]),
+            ],
+        );
+        let t = &app.theme;
+        assert_eq!(
+            fg_at(&term, "session 72%"),
+            t.mint,
+            "success is the theme's mint"
+        );
+        assert_eq!(
+            fg_at(&term, "plain row"),
+            t.subtext1,
+            "no tone: exactly as before"
+        );
+        assert_eq!(
+            fg_at(&term, "typo row"),
+            t.subtext1,
+            "an unknown tone falls back to the default instead of failing"
+        );
+    }
+
+    #[test]
+    fn spans_take_their_own_tone_or_inherit_the_rows() {
+        let (_env, app, term) = app_with_rows(
+            "dock-tone-spans",
+            vec![
+                row(
+                    "week [xx] 41%",
+                    Some("warning"),
+                    &[
+                        ("week ", None),
+                        ("[", Some("muted")),
+                        ("xx", Some("success")),
+                        ("] 41%", None),
+                    ],
+                ),
+                row("day [yy]", None, &[("day ", None), ("[yy]", Some("error"))]),
+            ],
+        );
+        let t = &app.theme;
+        assert_eq!(
+            fg_at(&term, "week"),
+            t.amber,
+            "no span tone: the row's warning"
+        );
+        assert_eq!(fg_at(&term, "[xx"), t.overlay0, "muted span");
+        assert_eq!(fg_at(&term, "xx]"), t.mint, "success span");
+        assert_eq!(
+            fg_at(&term, "] 41%"),
+            t.amber,
+            "tail inherits the row again"
+        );
+        assert_eq!(
+            fg_at(&term, "day"),
+            t.subtext1,
+            "no row tone either: the default"
+        );
+        assert_eq!(fg_at(&term, "[yy]"), t.coral, "error span");
+    }
+
+    #[test]
+    fn spans_truncate_as_one_line_with_a_trailing_ellipsis() {
+        // Learn the dock's text budget from the rect a clickable row records:
+        // the text starts two columns in and the dock keeps a one-column gutter.
+        let (_env, mut app, _term) =
+            app_with_rows("dock-tone-trunc", vec![row("probe", None, &[])]);
+        let rect = app.module_dock_rects[0].2;
+        let budget = rect.width as usize - 3;
+        assert!(budget > 8, "sidebar wide enough for the cases below");
+        let text_x = rect.x + 2;
+        let last_x = text_x + budget as u16 - 1;
+
+        let fill = "a".repeat(budget);
+        app.push_module_dock(
+            "mod:quota",
+            Some("QUOTA".into()),
+            Side::Left,
+            vec![
+                // Bar exactly fills the dock, then a number that cannot fit.
+                row(
+                    "over",
+                    None,
+                    &[(fill.as_str(), Some("success")), ("72%", Some("error"))],
+                ),
+                // Exactly fits: no ellipsis, nothing dropped.
+                row(
+                    "exact",
+                    None,
+                    &[
+                        ("b".repeat(budget - 3).as_str(), None),
+                        ("41%", Some("error")),
+                    ],
+                ),
+                // A single span wider than the dock.
+                row(
+                    "wide",
+                    None,
+                    &[("c".repeat(budget + 5).as_str(), Some("warning"))],
+                ),
+            ],
+        );
+        let term = render(&mut app);
+        let buf = term.backend().buffer();
+        let t = &app.theme;
+
+        assert!(
+            locate(&term, "72%").is_none(),
+            "the tail that cannot fit is dropped"
+        );
+        let (_, y) = locate(&term, "aaaa").expect("the bar row is on screen");
+        assert_eq!(
+            buf.cell((last_x, y)).unwrap().symbol(),
+            "…",
+            "the last column is the ellipsis"
+        );
+        assert_eq!(
+            buf.cell((last_x - 1, y)).unwrap().symbol(),
+            "a",
+            "the bar runs right up to it"
+        );
+        assert_eq!(
+            buf.cell((last_x, y)).unwrap().fg,
+            t.mint,
+            "the ellipsis takes the cut span's colour"
+        );
+        let after = buf.cell((last_x + 1, y)).unwrap().symbol();
+        assert!(
+            !matches!(after, "a" | "7" | "…"),
+            "nothing spills past the dock into the border column, got {after:?}"
+        );
+
+        let (_, y) = locate(&term, "41%").expect("an exact fit keeps its tail");
+        assert_eq!(
+            buf.cell((last_x, y)).unwrap().symbol(),
+            "%",
+            "no ellipsis when it fits"
+        );
+        assert_eq!(buf.cell((last_x - 2, y)).unwrap().fg, t.coral);
+
+        let (_, y) = locate(&term, "cccc").expect("the wide row is on screen");
+        assert_eq!(buf.cell((last_x, y)).unwrap().symbol(), "…");
+        assert_eq!(buf.cell((last_x, y)).unwrap().fg, t.amber);
+    }
+
+    /// A two-column glyph that does not fit at the edge ends the line. The
+    /// spans after it must not slide left into its place, or the row would
+    /// read as a different value than the module pushed.
+    #[test]
+    fn a_wide_glyph_at_the_edge_ends_the_line_instead_of_being_skipped() {
+        let (_env, mut app, _term) = app_with_rows("dock-tone-wide", vec![row("probe", None, &[])]);
+        let rect = app.module_dock_rects[0].2;
+        let budget = rect.width as usize - 3;
+        let text_x = rect.x + 2;
+
+        // Two narrow columns are left for the ellipsis and the glyph: the
+        // glyph needs two on its own, so it is dropped, and so is "Q9".
+        let lead = "d".repeat(budget - 2);
+        app.push_module_dock(
+            "mod:quota",
+            Some("QUOTA".into()),
+            Side::Left,
+            vec![row(
+                "wide",
+                None,
+                &[(lead.as_str(), None), ("日", Some("error")), ("Q9", None)],
+            )],
+        );
+        let term = render(&mut app);
+        let buf = term.backend().buffer();
+        let t = &app.theme;
+
+        let (_, y) = locate(&term, "dddd").expect("the row is on screen");
+        assert!(
+            locate(&term, "日").is_none(),
+            "the glyph that did not fit is not drawn"
+        );
+        assert!(
+            locate(&term, "Q9").is_none(),
+            "nothing after it slides into its place"
+        );
+        let ell_x = text_x + (budget - 2) as u16;
+        assert_eq!(
+            buf.cell((ell_x, y)).unwrap().symbol(),
+            "…",
+            "the ellipsis follows the last drawn span"
+        );
+        assert_eq!(
+            buf.cell((ell_x, y)).unwrap().fg,
+            t.subtext1,
+            "the ellipsis takes the colour of a span that was drawn, not the dropped one"
         );
     }
 }

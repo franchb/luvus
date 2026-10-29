@@ -24,6 +24,34 @@ pub enum Axis {
     Row,
 }
 
+/// Typical monospace cell height divided by width. Terminal glyphs are about
+/// twice as tall as they are wide (for example 8×16 pixels), so comparing
+/// columns to rows directly treats a physically tall pane as landscape.
+pub const CELL_ASPECT_HEIGHT_OVER_WIDTH: f32 = 2.0;
+
+/// Split the longer *physical* side of a pane so the two halves stay closer to
+/// square. `cell_aspect` is cell height / cell width. `1.0` treats cells as
+/// square and is the headless fallback: a 10_000×10_000 logical area still
+/// splits left/right. Equal physical sides keep the historical left/right default.
+pub fn auto_split_axis_with_cell_aspect(width: u16, height: u16, cell_aspect: f32) -> Axis {
+    let aspect = if cell_aspect.is_finite() && cell_aspect > 0.0 {
+        cell_aspect
+    } else {
+        1.0
+    };
+    if (height as f32) * aspect > f32::from(width) {
+        Axis::Row
+    } else {
+        Axis::Col
+    }
+}
+
+/// Split using square cells. Prefer [`auto_split_axis_with_cell_aspect`] for
+/// painted terminal geometry.
+pub fn auto_split_axis(width: u16, height: u16) -> Axis {
+    auto_split_axis_with_cell_aspect(width, height, 1.0)
+}
+
 enum Node {
     Leaf(PaneId),
     Split {
@@ -179,6 +207,30 @@ impl TileLayout {
             return false;
         }
         swap_leaf_ids(&mut self.root, first, second);
+        true
+    }
+
+    /// Transpose the split immediately containing `pane`.
+    ///
+    /// This changes only that split's orientation, preserving its ratio and
+    /// both pane identities. Descendant splits and their ratios are untouched,
+    /// so transposing a pane is a local layout operation rather than a global
+    /// rearrangement.
+    pub fn transpose_pane(&mut self, pane: PaneId) -> bool {
+        let mut path = Vec::new();
+        if !path_to_leaf(&self.root, pane, &mut path) || path.is_empty() {
+            return false;
+        }
+        // The final turn selects the leaf; its prefix identifies the split
+        // directly containing it.
+        path.pop();
+        let Some(Node::Split { axis, .. }) = self.node_at_mut(&path) else {
+            return false;
+        };
+        *axis = match *axis {
+            Axis::Col => Axis::Row,
+            Axis::Row => Axis::Col,
+        };
         true
     }
 
@@ -411,6 +463,17 @@ impl TileLayout {
 
     fn node_at(&self, path: &[bool]) -> Option<&Node> {
         let mut node = &self.root;
+        for &side in path {
+            match node {
+                Node::Split { a, b, .. } => node = if side { b } else { a },
+                Node::Leaf(_) => return None,
+            }
+        }
+        Some(node)
+    }
+
+    fn node_at_mut(&mut self, path: &[bool]) -> Option<&mut Node> {
+        let mut node = &mut self.root;
         for &side in path {
             match node {
                 Node::Split { a, b, .. } => node = if side { b } else { a },
@@ -737,6 +800,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transpose_preserves_ratio_focus_and_nested_splits() {
+        let a = PaneId::alloc();
+        let b = PaneId::alloc();
+        let c = PaneId::alloc();
+        let mut layout = TileLayout::new(a);
+        assert!(!layout.transpose_pane(a));
+        assert!(!layout.transpose_pane(b));
+        layout.split_focused(Axis::Col, b);
+        layout.split_focused(Axis::Row, c);
+        layout.set_ratio(Rect::new(0, 0, 120, 60), &[], 0.6);
+        layout.set_ratio(Rect::new(0, 0, 120, 60), &[true], 0.3);
+        let before = serde_json::to_value(layout.to_tree()).unwrap();
+        let focus = layout.focus;
+        assert!(layout.transpose_pane(b));
+        let mut expected = before.clone();
+        expected["Split"]["b"]["Split"]["axis"] = serde_json::json!(0);
+        assert_eq!(serde_json::to_value(layout.to_tree()).unwrap(), expected);
+        assert_eq!(layout.focus, focus);
+        assert_eq!(layout.leaves(), vec![a, b, c]);
+        assert!(layout.transpose_pane(b));
+        assert_eq!(serde_json::to_value(layout.to_tree()).unwrap(), before);
+        assert!(layout.transpose_pane(a));
+        let mut expected = before;
+        expected["Split"]["axis"] = serde_json::json!(1);
+        assert_eq!(serde_json::to_value(layout.to_tree()).unwrap(), expected);
+        let remap = [(a.0, a), (b.0, b), (c.0, c)].into_iter().collect();
+        let restored = TileLayout::from_tree(&layout.to_tree(), &remap, focus.0).unwrap();
+        assert_eq!(serde_json::to_value(restored.to_tree()).unwrap(), expected);
+        for area in [Rect::new(0, 0, 120, 60), Rect::new(0, 0, 1, 1)] {
+            assert_eq!(restored.panes(area).len(), 3);
+        }
+    }
+
+    #[test]
     fn split_and_navigate() {
         let a = PaneId::alloc();
         let mut l = TileLayout::new(a);
@@ -1004,5 +1101,31 @@ mod tests {
         let l2 = TileLayout::from_tree(&tree, &remap, a.0).unwrap();
         let got = l2.panes(area).into_iter().find(|p| p.id == a).unwrap().rect;
         assert_eq!(want, got, "resized ratio persisted");
+    }
+
+    #[test]
+    fn auto_split_axis_cuts_the_longer_side() {
+        assert_eq!(auto_split_axis(120, 30), Axis::Col);
+        assert_eq!(auto_split_axis(40, 80), Axis::Row);
+        assert_eq!(auto_split_axis(50, 50), Axis::Col);
+        assert_eq!(auto_split_axis(0, 0), Axis::Col);
+        assert_eq!(auto_split_axis(1, 2), Axis::Row);
+    }
+
+    #[test]
+    fn auto_split_axis_accounts_for_tall_terminal_cells() {
+        let aspect = CELL_ASPECT_HEIGHT_OVER_WIDTH;
+        // 60×40 cells at 8×16 px is 480×640 px, physically taller.
+        assert_eq!(auto_split_axis_with_cell_aspect(60, 40, aspect), Axis::Row);
+        assert_eq!(auto_split_axis(60, 40), Axis::Col);
+        assert_eq!(auto_split_axis_with_cell_aspect(120, 30, aspect), Axis::Col);
+        assert_eq!(auto_split_axis_with_cell_aspect(40, 80, aspect), Axis::Row);
+        // Equal physical sides keep the left/right default.
+        assert_eq!(auto_split_axis_with_cell_aspect(80, 40, aspect), Axis::Col);
+        assert_eq!(auto_split_axis_with_cell_aspect(60, 40, 0.0), Axis::Col);
+        assert_eq!(
+            auto_split_axis_with_cell_aspect(60, 40, f32::NAN),
+            Axis::Col
+        );
     }
 }

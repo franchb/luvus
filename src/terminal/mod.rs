@@ -3,9 +3,13 @@
 
 pub mod appearance;
 pub mod backend;
+pub mod color_depth;
 #[cfg(any(windows, test))]
 pub mod host_input;
 pub mod host_key;
+pub mod keyboard;
+pub mod program_status;
 pub mod pty;
 pub mod theme_probe;
+pub mod upload;
 pub mod vt;
