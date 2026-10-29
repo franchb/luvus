@@ -6221,6 +6221,9 @@ mod tests {
 
     #[test]
     fn keys_leaving_scroll_mode_or_prefix_stay_pane_owned() {
+        if crate::terminal::vt::unsupported_by_selected_engine("the kitty keyboard protocol") {
+            return;
+        }
         let _env = crate::persist::test_env("mode-exit-key-ownership");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
@@ -6434,6 +6437,9 @@ mod tests {
 
     #[test]
     fn app_never_leaks_text_or_luvus_shortcut_releases_to_the_pane() {
+        if crate::terminal::vt::unsupported_by_selected_engine("the kitty keyboard protocol") {
+            return;
+        }
         let _env = crate::persist::test_env("kitty-event-shortcut-release");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
@@ -6472,6 +6478,9 @@ mod tests {
 
     #[test]
     fn app_routes_function_key_phases_only_after_a_forwarded_press() {
+        if crate::terminal::vt::unsupported_by_selected_engine("the kitty keyboard protocol") {
+            return;
+        }
         let _env = crate::persist::test_env("kitty-event-routing");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
@@ -6515,6 +6524,9 @@ mod tests {
 
     #[test]
     fn app_swallows_repeats_while_an_overlay_owns_input_but_pairs_release() {
+        if crate::terminal::vt::unsupported_by_selected_engine("the kitty keyboard protocol") {
+            return;
+        }
         let _env = crate::persist::test_env("kitty-event-overlay-repeat");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
@@ -6565,6 +6577,9 @@ mod tests {
 
     #[test]
     fn concurrent_clients_keep_independent_key_release_ownership() {
+        if crate::terminal::vt::unsupported_by_selected_engine("the kitty keyboard protocol") {
+            return;
+        }
         let _env = crate::persist::test_env("kitty-event-client-ownership");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
@@ -6710,6 +6725,9 @@ mod tests {
 
     #[test]
     fn modifier_changes_before_release_keep_the_semantic_key_owned() {
+        if crate::terminal::vt::unsupported_by_selected_engine("the kitty keyboard protocol") {
+            return;
+        }
         let _env = crate::persist::test_env("modifier-release-ownership");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
@@ -6758,6 +6776,9 @@ mod tests {
 
     #[test]
     fn ctrl_enter_repeat_and_release_stay_with_the_original_pane() {
+        if crate::terminal::vt::unsupported_by_selected_engine("the kitty keyboard protocol") {
+            return;
+        }
         let _env = crate::persist::test_env("ctrl-enter-routing");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
@@ -6804,6 +6825,9 @@ mod tests {
 
     #[test]
     fn replacing_stale_ownership_releases_the_old_pane_before_the_new_press() {
+        if crate::terminal::vt::unsupported_by_selected_engine("the kitty keyboard protocol") {
+            return;
+        }
         let _env = crate::persist::test_env("kitty-stale-ownership-replacement");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
@@ -9869,6 +9893,9 @@ mod link_click_tests {
 
     #[test]
     fn osc8_file_target_overrides_a_domain_shaped_label() {
+        if crate::terminal::vt::unsupported_by_selected_engine("OSC 8 hyperlink reporting") {
+            return;
+        }
         let _env = crate::persist::test_env("link-osc8-file");
         let path = std::env::current_dir().unwrap().join("Cargo.toml");
         let uri = format!("file://{}", path.display());
@@ -9886,6 +9913,9 @@ mod link_click_tests {
 
     #[test]
     fn osc8_file_target_overrides_server_prefixed_mjs_label() {
+        if crate::terminal::vt::unsupported_by_selected_engine("OSC 8 hyperlink reporting") {
+            return;
+        }
         let _env = crate::persist::test_env("link-osc8-mjs");
         let path = std::env::current_dir().unwrap().join("Cargo.toml");
         let uri = format!("file://{}", path.display());
@@ -9907,6 +9937,9 @@ mod link_click_tests {
 
     #[test]
     fn osc8_file_label_preserves_a_visible_line_number() {
+        if crate::terminal::vt::unsupported_by_selected_engine("OSC 8 hyperlink reporting") {
+            return;
+        }
         let _env = crate::persist::test_env("link-osc8-line");
         let path = std::env::current_dir().unwrap().join("Cargo.toml");
         let uri = format!("file://{}", path.display());
@@ -9931,6 +9964,9 @@ mod link_click_tests {
 
     #[test]
     fn http_osc8_target_opens_even_when_its_label_looks_like_a_file() {
+        if crate::terminal::vt::unsupported_by_selected_engine("OSC 8 hyperlink reporting") {
+            return;
+        }
         let _env = crate::persist::test_env("link-osc8-http");
         let (app, _term, at) = fixture_showing_osc8("Cargo.toml", "https://example.com/actual", 2);
 

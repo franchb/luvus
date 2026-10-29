@@ -51,6 +51,10 @@ default = []
 # Opt-in benchmark and artifact generators. Keeping these out of the default
 # test registry avoids reporting deliberate developer commands as ignored tests.
 dev-tools = []
+# The shitty VT core as a second engine behind `VtEngineKind`. Off by default:
+# it links a C++ library that has to be present at build time (pkg-config
+# `shitty_vt`), which a plain `cargo install luvus` cannot assume.
+shitty-engine = ["dep:shitty-vt"]
 
 [dependencies]
 ratatui = "0.30"
@@ -59,6 +63,7 @@ portable-pty = "0.9"
 bitflags = "=2.13.0"
 alacritty_terminal = { package = "luvus-alacritty-terminal", version = "0.26" }
 casefold = "=0.1.0"
+shitty-vt = { version = "0.5", optional = true }
 unicode-segmentation = "=1.13.3"
 unicode-width = "0.2"
 # Explicit terminal-native document previews. The parser is pure Rust and only

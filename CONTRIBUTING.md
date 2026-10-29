@@ -118,6 +118,20 @@ turn count, and per-turn p95/p99/maximum lock-held work, not end-to-end
 input/scroll latency. Run separate live
 latency checks before changing maintenance scheduling, especially on Windows.
 
+To compare the VT engines themselves, through Luvus's own code paths rather
+than the parsers in isolation:
+
+```bash
+scripts/bench-engines.sh
+```
+
+It runs once per `VtEngine` implementation, in separate processes, and reports
+feed throughput, grid reads, captures, and memory per retained row. Build the
+shitty core first; the script's header says how. Numbers are comparable between
+engines and between commits on one machine, and not between machines.
+`src/terminal/vt/bench.rs` documents what each figure measures and what it is
+worth.
+
 To check CLI/UHP responsiveness while configuration storage is locked (Unix):
 
 ```bash

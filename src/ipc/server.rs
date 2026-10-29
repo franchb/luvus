@@ -2812,6 +2812,9 @@ mod tests {
 
     #[test]
     fn clients_removed_by_any_path_release_their_held_pane_keys() {
+        if crate::terminal::vt::unsupported_by_selected_engine("the kitty keyboard protocol") {
+            return;
+        }
         use ratatui::crossterm::event::KeyEventKind;
 
         let _env = crate::persist::test_env("broadcast-held-key-cleanup");
